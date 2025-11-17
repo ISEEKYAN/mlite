@@ -1003,17 +1003,17 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
 
             if self.microbatch_suspend:
-                assert header == Headers.PAUSE_ACK, (
-                    "Engine is waiting for PAUSE_ACK. No other messages allowed."
-                )
+                assert (
+                    header == Headers.PAUSE_ACK
+                ), "Engine is waiting for PAUSE_ACK. No other messages allowed."
             if self.microbatch_shutdown:
-                assert header == Headers.STOP_ACK, (
-                    "Engine is shutting down. No other messages allowed except STOP_ACK."
-                )
+                assert (
+                    header == Headers.STOP_ACK
+                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
             if self.paused.is_set():
-                assert header == Headers.UNPAUSE, (
-                    "Engine is paused. No other messages allowed except UNPAUSE."
-                )
+                assert (
+                    header == Headers.UNPAUSE
+                ), "Engine is paused. No other messages allowed except UNPAUSE."
 
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
@@ -1027,10 +1027,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.running.clear()
                 # Send PAUSE_ACK back to coordinator.
                 if rank == 0:
-                    payload = msgpack.packb(
-                        [Headers.PAUSE_ACK.value],
-                        use_bin_type=True,
-                    )
+                    payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
             elif header == Headers.STOP:
                 # Save the remaining messages from this microbatch.
@@ -1040,10 +1037,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.running.clear()
                 # Send STOP_ACK back to coordinator.
                 if rank == 0:
-                    payload = msgpack.packb(
-                        [Headers.STOP_ACK.value],
-                        use_bin_type=True,
-                    )
+                    payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
             elif header == Headers.PAUSE_ACK:
                 self.paused.set()
