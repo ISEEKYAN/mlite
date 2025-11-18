@@ -964,17 +964,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
         rank = parallel_state.get_tensor_model_parallel_rank()
         torch.cuda.nvtx.range_push("drain_zmq_socket")
-        # Retrieve any pending messages.
-        all_messages = list(self.pending_microbatch)
+
         if rank == 0:
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
+                    self.pending_microbatch.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
-            messages_to_dequeue = len(all_messages)
+            messages_to_dequeue = len(self.pending_microbatch)
             # First publish the number of messages to dequeue.
             # This is important because we want all tensor parallel ranks
             # to dequeue the same number of messages.
@@ -982,7 +981,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 struct.pack('!i', messages_to_dequeue)
             )
             # Now publish the actual messages to all tensor parallel ranks
-            for message in all_messages:
+            for message in self.pending_microbatch:
                 self.tensor_parallel_publisher_socket.send(message)
         else:
             # First, receive the number of messages to dequeue from tp-rank 0
@@ -993,12 +992,13 @@ class DynamicInferenceEngine(AbstractEngine):
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.
             for _ in range(messages_to_dequeue):
-                all_messages.append(self.tensor_parallel_subscriber_socket.recv())
+                self.pending_microbatch.append(self.tensor_parallel_subscriber_socket.recv())
 
         torch.cuda.nvtx.range_pop()
-        cnt = len(all_messages)
-        while len(all_messages) > 0:
-            message = all_messages.pop()
+        cnt = 0
+        while len(self.pending_microbatch) > 0:
+            cnt += 1
+            message = self.pending_microbatch.popleft()
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
 
@@ -1020,8 +1020,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
-                # Save the remaining messages from this microbatch.
-                self.pending_microbatch.extend(all_messages)
                 # Pause thyself.
                 self.microbatch_suspend = True
                 self.running.clear()
@@ -1029,9 +1027,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if rank == 0:
                     payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
+                break
             elif header == Headers.STOP:
-                # Save the remaining messages from this microbatch.
-                self.pending_microbatch.extend(all_messages)
                 # Stop thyself.
                 self.microbatch_shutdown = True
                 self.running.clear()
@@ -1039,8 +1036,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if rank == 0:
                     payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
+                break
             elif header == Headers.PAUSE_ACK:
                 self.paused.set()
+                self.microbatch_suspend = False
             elif header == Headers.STOP_ACK:
                 self.stopped.set()
                 self.stop()
@@ -1093,6 +1092,8 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
+                if self.stopped.is_set():
+                    break
 
                 # for the cases below (no active requests, or undergoing a state-change)
                 # do not use asyncio.sleep(0)

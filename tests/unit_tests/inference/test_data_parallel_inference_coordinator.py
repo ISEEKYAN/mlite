@@ -46,7 +46,6 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids = deque()
         self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
-        self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
@@ -81,6 +80,9 @@ class DummyEngine(DynamicInferenceEngine):
         to_remove = []
         for request_id, request in self.requests.items():
             if request.status == Status.ACTIVE_AND_GENERATING_TOKENS:
+                request.sampling_params.num_tokens_to_generate -= 1
+                if request.sampling_params.num_tokens_to_generate > 0:
+                    continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
                 finished_requests.append(request)
@@ -115,6 +117,7 @@ class CoordinatorTestConfig:
     num_requests: int = 10**1
     min_time_offset: float = 10 ** (-4)
     max_time_offset: float = 10 ** (-3)
+    num_steps_to_finish: int = 1
 
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -137,7 +140,10 @@ class TestCoordinator:
 
         for _ in range(test_config.num_requests):
             arrival_delta = random.uniform(test_config.min_time_offset, test_config.max_time_offset)
-            ret.append(("Hello world!", SamplingParams(), arrival_delta))
+            num_tokens = test_config.num_steps_to_finish
+            ret.append(
+                ("Hello world!", SamplingParams(num_tokens_to_generate=num_tokens), arrival_delta)
+            )
         return ret
 
     @classmethod
@@ -148,6 +154,7 @@ class TestCoordinator:
         )
         requests = cls._build_requests(test_config)
         engine = DummyEngine()
+        engine.num_steps_to_finish = test_config.num_steps_to_finish
         return CoordinatorTestEnv(config=test_config, requests=requests, engine=engine)
 
     @classmethod
@@ -160,21 +167,33 @@ class TestCoordinator:
             inference_coordinator_port=test_config.port, launch_inference_coordinator=True
         )
 
+        results_success = False
+        shutdown_success = False
+        try:
+            if dist.get_rank() == 0:
+                client = InferenceClient(test_config.port)
+                await client.start()
+                futures = []
+                for request in tqdm(env.requests, "add_requests"):
+                    prompt, sampling_params, arrival_delta = request
+                    await asyncio.sleep(arrival_delta)
+                    fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                    futures.append(fut)
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                results_success = True
+        finally:
+            try:
+                if dist.get_rank() == 0:
+                    client.stop_engines()
+                    client.stop()
+                await asyncio.wait_for(env.engine.engine_loop_task, timeout=5.0)
+                shutdown_success = True
+            except:
+                env.engine.engine_loop_task.cancel()
+
         if dist.get_rank() == 0:
-            client = InferenceClient(test_config.port)
-            await client.start()
-            futures = []
-            for request in tqdm(env.requests, "add_requests"):
-                prompt, sampling_params, arrival_delta = request
-                await asyncio.sleep(arrival_delta)
-                fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
-                futures.append(fut)
-            results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
-
-            client.stop_engines()
-            client.stop()
-
-        await env.engine.engine_loop_task
+            assert results_success, "Did not receive all results successfully."
+        assert shutdown_success, "Did not shutdown successfully."
 
         return env
 
@@ -211,61 +230,75 @@ class TestCoordinator:
             inference_coordinator_port=test_config.port, launch_inference_coordinator=True
         )
 
-        if dist.get_rank() == 0:
-            # Start client as usual.
-            client = InferenceClient(test_config.port)
-            await client.start()
+        success = False
+        try:
+            if dist.get_rank() == 0:
+                # Start client as usual.
+                client = InferenceClient(test_config.port)
+                await client.start()
 
-            ### TEST 1: Pause after all requests have finished.
-            futures = []
-            for i, request in enumerate(env.requests[:2]):
-                prompt, sampling_params, _ = request
-                fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
-                futures.append(fut)
-            # Wait a sufficient time for the requests to complete.
-            await asyncio.sleep(10**-3)
-            # Get a pause awaitable.
-            to_pause = client.pause_engines()
-            awaitables = futures + [to_pause]
-            # Gather all awaitables; assert that the requests actually complete.
+                ### TEST 1: Pause after all requests have finished.
+                futures = []
+                for i, request in enumerate(env.requests[:2]):
+                    prompt, sampling_params, _ = request
+                    fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                    futures.append(fut)
+                # Wait a sufficient time for the requests to complete.
+                await asyncio.sleep(0.1)
+                # Get a pause awaitable.
+                to_pause = client.pause_engines()
+                awaitables = futures + [to_pause]
+                # Gather all awaitables; assert that the requests actually complete.
+                try:
+                    await asyncio.wait_for(asyncio.gather(*awaitables), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pytest.fail("Simple pause did not succeed.")
+
+                ### TEST 2: Ensure that requests cannot be added while paused.
+                with pytest.raises(RuntimeError):
+                    prompt, sampling_params, _ = env.requests[2]
+                    await client.add_request(prompt=prompt, sampling_params=sampling_params)
+
+                ### TEST 3: Resume after pause.
+                client.unpause_engines()
+                futures = []
+                for i, request in enumerate(env.requests[2:4]):
+                    prompt, sampling_params, _ = request
+                    fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                    futures.append(fut)
+                # Wait a sufficient time for the requests to complete.
+                await asyncio.sleep(0.1)
+                # Gather all awaitables; assert that the requests actually complete.
+                try:
+                    await asyncio.wait_for(asyncio.gather(*futures), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pytest.fail("Simple resume did not succeed.")
+
+                ### TEST 4: Pause while requests are being processed.
+                ### Note: this situation cannot occur in a synchronous system.
+                if False:
+                    for request in env.engine.requests[4:6]:
+                        request.sampling_params.num_tokens_to_generate = 100
+                    futures = []
+                    for i, request in enumerate(env.requests[4:6]):
+                        prompt, sampling_params, _ = request
+                        fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                        futures.append(fut)
+                    # Do not wait for the requests to complete.
+                    await client.pause_engines()
+                    # Gather all awaitables; assert that the requests do not complete.
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(asyncio.gather(*futures), timeout=0.1)
+            success = True
+        finally:
+            if dist.get_rank() == 0:
+                client.stop_engines()
+                client.stop()
             try:
-                await asyncio.wait_for(asyncio.gather(*awaitables), timeout=10**-2)
+                await asyncio.wait_for(env.engine.engine_loop_task, timeout=5.0)
             except asyncio.TimeoutError:
-                pytest.fail("Simple pause did not succeed.")
-
-            ### TEST 2: Ensure that requests cannot be added while paused.
-            with pytest.raises(RuntimeError):
-                prompt, sampling_params, _ = env.requests[2]
-                await client.add_request(prompt=prompt, sampling_params=sampling_params)
-
-            ### TEST 3: Resume after pause.
-            client.unpause_engines()
-            futures = []
-            for i, request in enumerate(env.requests[2:4]):
-                prompt, sampling_params, _ = request
-                fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
-                futures.append(fut)
-            # Wait a sufficient time for the requests to complete.
-            await asyncio.sleep(10**-3)
-            # Gather all awaitables; assert that the requests actually complete.
-            try:
-                await asyncio.wait_for(asyncio.gather(*futures), timeout=10**-2)
-            except asyncio.TimeoutError:
-                pytest.fail("Simple resume did not succeed.")
-
-            ### TEST 4: Pause while requests are being processed.
-            futures = []
-            for i, request in enumerate(env.requests[4:6]):
-                prompt, sampling_params, _ = request
-                fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
-                futures.append(fut)
-            # Do not wait for the requests to complete.
-            # Get a pause awaitable.
-            to_pause = client.pause_engines()
-            awaitables = futures + [to_pause]
-            # Gather all awaitables; assert that the requests do not complete.
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.gather(*awaitables), timeout=10**-2)
+                env.engine.engine_loop_task.cancel()
+        assert success, "Pause/resume test did not complete successfully."
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
