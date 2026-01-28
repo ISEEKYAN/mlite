@@ -526,6 +526,8 @@ def wrap_iterator_helper(
             'empty_scheduler_no_packing': PackingScheduler.EMPTY_NO_PACKING,
             'naive_sequence_packing': PackingScheduler.NAIVE_SEQUENCE_PACKING,
         }
+        if config.sequence_packing_scheduler == "external":
+            return data_iterator, num_microbatches, None, None
         if config.sequence_packing_scheduler not in scheduler_type_map:
             raise ValueError(
                 f"Invalid sequence packing scheduler: \

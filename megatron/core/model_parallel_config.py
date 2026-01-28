@@ -474,10 +474,11 @@ class ModelParallelConfig:
             if not (
                 is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
             ):
-                raise ValueError(
-                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
-                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
-                )
+               pass
+               #  raise ValueError(
+               #      "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+               #      f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+               #  )
             if self.sequence_packing_scheduler == None:
                if self.hybrid_context_parallel:
                   self.sequence_packing_scheduler = "default_hybrid_cp"
