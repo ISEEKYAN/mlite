@@ -248,6 +248,7 @@ class TokenDispatcher:
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
         if self.use_deepep:

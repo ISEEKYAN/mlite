@@ -14,6 +14,7 @@ from megatron.lite.primitive.parallel.pp import PipelineChunkLayout, build_pipel
 from megatron.lite.primitive.parallel.sp import (
     gather_for_non_sp_head,
     gather_from_sequence_parallel,
+    reduce_scatter_to_sequence_parallel,
     scatter_to_sequence_parallel,
 )
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
@@ -63,6 +64,7 @@ __all__ = [
     "pad_vocab_for_tp",
     "pack_nested_thd",
     "reconstruct_packed_from_cp_parts",
+    "reduce_scatter_to_sequence_parallel",
     "roll_packed_thd_left",
     "scatter_to_sequence_parallel",
     "split_packed_to_cp_local",

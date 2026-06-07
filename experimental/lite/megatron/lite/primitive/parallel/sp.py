@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 
-from megatron.lite.primitive.ops.sp_ops import AllGatherDim0, AllGatherDim0ForNonSPConsumer, ScatterToSP
+from megatron.lite.primitive.ops.sp_ops import (
+    AllGatherDim0,
+    AllGatherDim0ForNonSPConsumer,
+    ReduceScatterDim0,
+    ScatterToSP,
+)
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -26,6 +31,13 @@ def gather_from_sequence_parallel(x: torch.Tensor, ps: ParallelState) -> torch.T
     return AllGatherDim0.apply(x, ps.tp_size, ps.tp_rank, ps.tp_group)
 
 
+def reduce_scatter_to_sequence_parallel(x: torch.Tensor, ps: ParallelState) -> torch.Tensor:
+    """ReduceScatter [S, B, H] → [S/tp, B, H] for sequence parallel."""
+    if ps.tp_size == 1:
+        return x
+    return ReduceScatterDim0.apply(x, ps.tp_size, ps.tp_rank, ps.tp_group)
+
+
 def gather_for_non_sp_head(x: torch.Tensor, ps: ParallelState) -> torch.Tensor:
     """AllGather for non-SP consumer (e.g. vocab parallel head)."""
     if ps.tp_size == 1:
@@ -36,5 +48,6 @@ def gather_for_non_sp_head(x: torch.Tensor, ps: ParallelState) -> torch.Tensor:
 __all__ = [
     "gather_for_non_sp_head",
     "gather_from_sequence_parallel",
+    "reduce_scatter_to_sequence_parallel",
     "scatter_to_sequence_parallel",
 ]

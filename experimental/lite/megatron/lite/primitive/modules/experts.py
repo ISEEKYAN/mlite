@@ -23,6 +23,19 @@ from megatron.lite.primitive.utils import ensure_divisible
 
 __all__ = ["Experts", "_AllReduceETP"]
 
+try:
+    from megatron.core.fusions.fused_bias_swiglu import (
+        bias_swiglu_impl as _mcore_bias_swiglu,
+    )
+    from megatron.core.fusions.fused_bias_swiglu import (
+        weighted_bias_swiglu_impl as _mcore_weighted_swiglu,
+    )
+    from megatron.core.transformer.moe import grouped_gemm_util as _mcore_gg
+except Exception:  # pragma: no cover - local static envs may not have grouped_gemm.
+    _mcore_bias_swiglu = None
+    _mcore_weighted_swiglu = None
+    _mcore_gg = None
+
 
 @contextmanager
 def _expert_nvtx_range(name: str):
@@ -104,7 +117,11 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
 def swiglu_with_probs(y: torch.Tensor, probs: torch.Tensor | None) -> torch.Tensor:
     """SwiGLU with optional expert probability scaling."""
     if probs is not None:
+        if _mcore_weighted_swiglu is not None and y.is_cuda:
+            return _mcore_weighted_swiglu(y, bias=None, weights=probs)
         return weighted_bias_swiglu_impl(y, bias=None, weights=probs)
+    if _mcore_bias_swiglu is not None and y.is_cuda:
+        return _mcore_bias_swiglu(y, bias=None)
     y1, y2 = torch.chunk(y, 2, -1)
     return F.silu(y1) * y2
 
@@ -133,11 +150,13 @@ class Experts(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        use_mcore_grouped_gemm: bool = False,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
+        self.use_mcore_grouped_gemm = use_mcore_grouped_gemm
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
 
         self.fc1 = te.GroupedLinear(
@@ -239,7 +258,16 @@ class Experts(nn.Module):
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
-            if self.moe_act_recompute and probs is not None:
+            if (
+                self.use_mcore_grouped_gemm
+                and self.fc1_lora is None
+                and self.fc2_lora is None
+                and _mcore_gg is not None
+                and _mcore_gg.ops is not None
+                and x.is_cuda
+            ):
+                out = self._mcore_grouped_gemm_forward(x, m_splits, probs)
+            elif self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
@@ -265,6 +293,25 @@ class Experts(nn.Module):
         if pad_mask is not None:
             out = out[pad_mask]
         return out
+
+    def _mcore_grouped_gemm_forward(
+        self,
+        x: torch.Tensor,
+        m_splits: list[int],
+        probs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        tokens_per_expert = torch.tensor(m_splits, device=x.device, dtype=torch.int64)
+        w1 = torch.stack(
+            [getattr(self.fc1, f"weight{i}").t() for i in range(self.num_local_experts)],
+            dim=0,
+        ).contiguous()
+        w2 = torch.stack(
+            [getattr(self.fc2, f"weight{i}").t() for i in range(self.num_local_experts)],
+            dim=0,
+        ).contiguous()
+        fc1_output = _mcore_gg.ops.gmm(x, w1, tokens_per_expert, trans_b=False)
+        hidden = swiglu_with_probs(fc1_output, probs)
+        return _mcore_gg.ops.gmm(hidden, w2, tokens_per_expert, trans_b=False)
 
     @staticmethod
     def _fp8_pad(x, permuted_probs, m_splits):
