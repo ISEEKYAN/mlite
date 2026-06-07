@@ -7,10 +7,15 @@ import math
 from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.primitive.parallel.cp import (
+    zigzag_reconstruct_from_cp_parts,
+    zigzag_slice_for_cp,
+)
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
@@ -170,6 +175,126 @@ def _clamped_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch
     return F.silu(gate) * up
 
 
+def _all_gather_cp_parts(tensor: torch.Tensor, ps: ParallelState) -> list[torch.Tensor]:
+    if ps.cp_size <= 1:
+        return [tensor]
+    if ps.cp_group is None:
+        raise RuntimeError("DeepSeek V4 CP requires ParallelState.cp_group.")
+    try:
+        from torch.distributed.nn.functional import all_gather
+
+        return list(all_gather(tensor.contiguous(), group=ps.cp_group))
+    except Exception:
+        parts = [torch.empty_like(tensor) for _ in range(ps.cp_size)]
+        dist.all_gather(parts, tensor.contiguous(), group=ps.cp_group)
+        return parts
+
+
+def _expand_batch_position_ids(position_ids: torch.Tensor, batch: int) -> torch.Tensor:
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    if position_ids.dim() != 2:
+        raise ValueError("DeepSeek V4 expects position_ids shape (S,) or (B,S).")
+    if position_ids.size(0) == 1 and batch > 1:
+        position_ids = position_ids.expand(batch, -1)
+    if position_ids.size(0) != batch:
+        raise ValueError(
+            f"position_ids batch={position_ids.size(0)} does not match input batch={batch}."
+        )
+    return position_ids
+
+
+def _full_position_ids_for_cp(
+    position_ids: torch.Tensor,
+    *,
+    batch: int,
+    local_seq_len: int,
+    ps: ParallelState,
+) -> torch.Tensor:
+    position_ids = _expand_batch_position_ids(position_ids, batch)
+    if ps.cp_size <= 1:
+        return position_ids
+
+    full_seq_len = local_seq_len * ps.cp_size
+    if position_ids.size(1) == full_seq_len:
+        return position_ids
+    if position_ids.size(1) != local_seq_len:
+        raise ValueError(
+            "DeepSeek V4 CP expects position_ids to be either CP-local or full-length; "
+            f"got {position_ids.size(1)} for local_seq_len={local_seq_len}, cp={ps.cp_size}."
+        )
+    parts = _all_gather_cp_parts(position_ids.contiguous(), ps)
+    return zigzag_reconstruct_from_cp_parts(parts, seq_dim=1)
+
+
+def _labels_for_local_logits(
+    labels: torch.Tensor,
+    *,
+    local_seq_len: int,
+    ps: ParallelState,
+) -> torch.Tensor:
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(0)
+    if ps.cp_size <= 1:
+        return labels
+    full_seq_len = local_seq_len * ps.cp_size
+    if labels.size(1) == full_seq_len:
+        return zigzag_slice_for_cp(labels, ps.cp_rank, ps.cp_size, seq_dim=1)
+    if labels.size(1) != local_seq_len:
+        raise ValueError(
+            "DeepSeek V4 CP expects labels to be either CP-local or full-length; "
+            f"got {labels.size(1)} for local_seq_len={local_seq_len}, cp={ps.cp_size}."
+        )
+    return labels
+
+
+def _full_input_ids_for_cp(
+    input_ids: torch.Tensor | None,
+    *,
+    local_seq_len: int,
+    full_seq_len: int,
+    ps: ParallelState,
+) -> torch.Tensor | None:
+    if input_ids is None or ps.cp_size <= 1:
+        return input_ids
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    if input_ids.size(1) == full_seq_len:
+        return input_ids
+    if input_ids.size(1) != local_seq_len:
+        raise ValueError(
+            "DeepSeek V4 CP expects input_ids to be either CP-local or full-length; "
+            f"got {input_ids.size(1)} for local_seq_len={local_seq_len}, cp={ps.cp_size}."
+        )
+    return zigzag_reconstruct_from_cp_parts(
+        _all_gather_cp_parts(input_ids.contiguous(), ps),
+        seq_dim=1,
+    )
+
+
+def _full_tensor_for_cp(
+    tensor: torch.Tensor,
+    *,
+    full_seq_len: int,
+    ps: ParallelState,
+) -> tuple[torch.Tensor, int | None]:
+    if ps.cp_size <= 1 or tensor.size(1) == full_seq_len:
+        return tensor, None
+    local_seq_len = tensor.size(1)
+    if local_seq_len * ps.cp_size != full_seq_len:
+        raise ValueError(
+            "DeepSeek V4 CP tensor length does not match the full sequence length; "
+            f"got local_seq_len={local_seq_len}, full_seq_len={full_seq_len}, cp={ps.cp_size}."
+        )
+    return (
+        zigzag_reconstruct_from_cp_parts(
+            _all_gather_cp_parts(tensor.contiguous(), ps),
+            seq_dim=1,
+        ),
+        local_seq_len,
+    )
+
+
 class DeepseekV4Compressor(nn.Module):
     def __init__(self, config: DeepseekV4Config, compress_ratio: int, head_dim: int):
         super().__init__()
@@ -271,9 +396,10 @@ class DeepseekV4DSAIndexer(nn.Module):
 
 
 class DeepseekV4Attention(nn.Module):
-    def __init__(self, config: DeepseekV4Config, *, layer_idx: int):
+    def __init__(self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState):
         super().__init__()
         self.config = config
+        self.ps = ps
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
@@ -307,13 +433,52 @@ class DeepseekV4Attention(nn.Module):
         k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
         return (k_pos <= q_pos) & (k_pos >= q_pos - self.config.sliding_window + 1)
 
+    def _cp_full_inputs(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        *,
+        already_full: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int | None]:
+        if self.ps.cp_size <= 1:
+            return x, _expand_batch_position_ids(position_ids, x.size(0)), attention_mask, None
+
+        local_seq_len = x.size(1)
+        position_ids = _expand_batch_position_ids(position_ids, x.size(0))
+        if already_full:
+            return x, position_ids, attention_mask, None
+
+        full_x = zigzag_reconstruct_from_cp_parts(
+            _all_gather_cp_parts(x, self.ps),
+            seq_dim=1,
+        )
+        full_position_ids = _full_position_ids_for_cp(
+            position_ids,
+            batch=x.size(0),
+            local_seq_len=local_seq_len,
+            ps=self.ps,
+        )
+        if attention_mask is not None:
+            full_seq_len = local_seq_len * self.ps.cp_size
+            if attention_mask.size(-1) != full_seq_len or attention_mask.size(-2) != full_seq_len:
+                raise ValueError("DeepSeek V4 CP requires a full-sequence attention_mask.")
+        return full_x, full_position_ids, attention_mask, local_seq_len
+
     def forward(
         self,
         x: torch.Tensor,
         *,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cp_already_full: bool = False,
     ) -> torch.Tensor:
+        x, position_ids, attention_mask, cp_local_seq_len = self._cp_full_inputs(
+            x,
+            position_ids,
+            attention_mask,
+            already_full=cp_already_full,
+        )
         batch, seq_len, _ = x.shape
         cos, sin = _build_cos_sin(
             position_ids,
@@ -381,7 +546,10 @@ class DeepseekV4Attention(nn.Module):
 
         context = context.transpose(1, 2)
         grouped = context.reshape(batch, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim)
-        return self.wo_b(self.wo_a(grouped).flatten(2))
+        out = self.wo_b(self.wo_a(grouped).flatten(2))
+        if cp_local_seq_len is not None:
+            out = zigzag_slice_for_cp(out, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
+        return out
 
 
 class DeepseekV4Router(nn.Module):
@@ -481,9 +649,10 @@ class DeepseekV4MoE(nn.Module):
 
 
 class DeepseekV4Layer(nn.Module):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int, ps: ParallelState):
         super().__init__()
-        self.self_attn = DeepseekV4Attention(config, layer_idx=layer_idx)
+        self.ps = ps
+        self.self_attn = DeepseekV4Attention(config, layer_idx=layer_idx, ps=ps)
         self.mlp = DeepseekV4MoE(config, layer_idx=layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -494,6 +663,38 @@ class DeepseekV4Layer(nn.Module):
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
         )
 
+    def _cp_full_layer_inputs(
+        self,
+        x: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, int | None]:
+        position_ids = _expand_batch_position_ids(position_ids, x.size(0))
+        if self.ps.cp_size <= 1:
+            return x, position_ids, attention_mask, input_ids, None
+
+        full_seq_len = position_ids.size(1)
+        x, cp_local_seq_len = _full_tensor_for_cp(
+            x,
+            full_seq_len=full_seq_len,
+            ps=self.ps,
+        )
+        if cp_local_seq_len is None:
+            return x, position_ids, attention_mask, input_ids, None
+
+        input_ids = _full_input_ids_for_cp(
+            input_ids,
+            local_seq_len=cp_local_seq_len,
+            full_seq_len=full_seq_len,
+            ps=self.ps,
+        )
+        if attention_mask is not None:
+            if attention_mask.size(-1) != full_seq_len or attention_mask.size(-2) != full_seq_len:
+                raise ValueError("DeepSeek V4 CP requires a full-sequence attention_mask.")
+        return x, position_ids, attention_mask, input_ids, cp_local_seq_len
+
     def forward(
         self,
         x: torch.Tensor,
@@ -502,24 +703,34 @@ class DeepseekV4Layer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        x, position_ids, attention_mask, input_ids, cp_local_seq_len = self._cp_full_layer_inputs(
+            x,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            input_ids=input_ids,
+        )
         residual = x
         attn_in, post, comb = self.attn_hc(x)
         attn_out = self.self_attn(
             self.input_layernorm(attn_in),
             position_ids=position_ids,
             attention_mask=attention_mask,
+            cp_already_full=self.ps.cp_size > 1,
         )
         x = DeepseekV4HyperConnection.post(attn_out, residual, post, comb)
 
         residual = x
         ffn_in, post, comb = self.ffn_hc(x)
         ffn_out = self.mlp(self.post_attention_layernorm(ffn_in), input_ids=input_ids)
-        return DeepseekV4HyperConnection.post(ffn_out, residual, post, comb)
+        out = DeepseekV4HyperConnection.post(ffn_out, residual, post, comb)
+        if cp_local_seq_len is not None:
+            out = zigzag_slice_for_cp(out, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
+        return out
 
 
 class DeepseekV4MTPBlock(DeepseekV4Layer):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
-        super().__init__(config, layer_idx=layer_idx)
+    def __init__(self, config: DeepseekV4Config, layer_idx: int, ps: ParallelState):
+        super().__init__(config, layer_idx=layer_idx, ps=ps)
         self.e_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.h_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -536,32 +747,52 @@ class DeepseekV4MTPBlock(DeepseekV4Layer):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        position_ids = _expand_batch_position_ids(position_ids, x.size(0))
+        cp_local_seq_len = None
+        if self.ps.cp_size > 1:
+            full_seq_len = position_ids.size(1)
+            x, cp_local_seq_len = _full_tensor_for_cp(
+                x,
+                full_seq_len=full_seq_len,
+                ps=self.ps,
+            )
+            if cp_local_seq_len is not None:
+                input_ids = _full_input_ids_for_cp(
+                    input_ids,
+                    local_seq_len=cp_local_seq_len,
+                    full_seq_len=full_seq_len,
+                    ps=self.ps,
+                )
         embedded = self.enorm(embed_tokens(input_ids))
         projected = self.e_proj(embedded).unsqueeze(2) + self.h_proj(self.hnorm(x))
-        return super().forward(
+        out = super().forward(
             projected,
             position_ids=position_ids,
             attention_mask=attention_mask,
             input_ids=input_ids,
         )
+        if cp_local_seq_len is not None:
+            out = zigzag_slice_for_cp(out, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
+        return out
 
     def contract(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.hc_head(x))
 
 
 class DeepseekV4Model(nn.Module):
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(self, config: DeepseekV4Config, ps: ParallelState):
         super().__init__()
         self.config = config
+        self.ps = ps
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [DeepseekV4Layer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+            [DeepseekV4Layer(config, layer_idx=i, ps=ps) for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = DeepseekV4HyperHead(config.hidden_size, config.hc_mult, config.hc_eps)
         self.mtp = nn.ModuleList(
             [
-                DeepseekV4MTPBlock(config, layer_idx=config.num_hidden_layers + i)
+                DeepseekV4MTPBlock(config, layer_idx=config.num_hidden_layers + i, ps=ps)
                 for i in range(config.num_nextn_predict_layers)
             ]
         )
@@ -579,9 +810,10 @@ class DeepseekV4Model(nn.Module):
         hidden = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         batch, seq_len = input_ids.shape
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch, -1)
-        elif position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0).expand(batch, -1)
+            full_seq_len = seq_len * self.ps.cp_size
+            position_ids = torch.arange(full_seq_len, device=input_ids.device).unsqueeze(0).expand(batch, -1)
+        else:
+            position_ids = _expand_batch_position_ids(position_ids, batch)
         for layer in self.layers:
             hidden = layer(
                 hidden,
@@ -589,7 +821,16 @@ class DeepseekV4Model(nn.Module):
                 attention_mask=attention_mask,
                 input_ids=input_ids,
             )
-        return self.norm(self.hc_head(hidden))
+        full_seq_len = position_ids.size(1)
+        hidden, cp_local_seq_len = _full_tensor_for_cp(
+            hidden,
+            full_seq_len=full_seq_len,
+            ps=self.ps,
+        )
+        hidden = self.norm(self.hc_head(hidden))
+        if cp_local_seq_len is not None:
+            hidden = zigzag_slice_for_cp(hidden, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
+        return hidden
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -603,7 +844,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.train_cfg = train_cfg or SimpleNamespace(fp8=False)
         self.ps = ps or ParallelState()
-        self.model = DeepseekV4Model(config)
+        self.model = DeepseekV4Model(config, self.ps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self._input_tensor: torch.Tensor | None = None
 
@@ -632,9 +873,28 @@ class DeepseekV4ForCausalLM(nn.Module):
                 position_ids=position_ids,
                 attention_mask=attention_mask,
             )
-            logits = self.lm_head(hidden)
+            full_seq_len = hidden.size(1)
+            if self.ps.cp_size > 1:
+                if position_ids is not None:
+                    pos = _expand_batch_position_ids(position_ids, hidden.size(0))
+                    full_seq_len = pos.size(1)
+                else:
+                    full_seq_len = input_ids.size(1) * self.ps.cp_size
+            hidden_for_head, cp_local_seq_len = _full_tensor_for_cp(
+                hidden,
+                full_seq_len=full_seq_len,
+                ps=self.ps,
+            )
+            logits = self.lm_head(hidden_for_head)
+            if cp_local_seq_len is not None:
+                logits = zigzag_slice_for_cp(logits, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
         output = {"hidden_states": hidden, "logits": logits}
         if labels is not None:
+            labels = _labels_for_local_logits(
+                labels,
+                local_seq_len=logits.size(1),
+                ps=self.ps,
+            )
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
                 labels.reshape(-1),

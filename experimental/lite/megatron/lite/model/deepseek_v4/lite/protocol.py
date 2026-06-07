@@ -60,9 +60,11 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
     etp = 1 if p.etp is None else p.etp
-    if (p.tp, etp, p.ep, p.cp, p.pp, p.vpp) != (1, 1, 1, 1, 1, 1):
+    if p.cp < 1:
+        raise ValueError(f"DeepSeek V4 native lite requires cp>=1, got {p.cp}.")
+    if (p.tp, etp, p.ep, p.pp, p.vpp) != (1, 1, 1, 1, 1):
         raise NotImplementedError(
-            "DeepSeek V4 native lite stage-1 currently supports only TP=EP=ETP=CP=PP=VPP=1."
+            "DeepSeek V4 native lite currently supports CP with TP=EP=ETP=PP=VPP=1."
         )
 
 

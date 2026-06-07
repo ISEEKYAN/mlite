@@ -560,17 +560,108 @@ def test_deepseek_v4_real_checkpoint_proxy_loader_bitwise():
     assert global_max == 0.0
 
 
-def test_deepseek_v4_protocol_rejects_cp_and_other_parallel_scope():
+def test_deepseek_v4_protocol_allows_cp_and_rejects_other_parallel_scope():
     import pytest
 
     from megatron.lite.model.deepseek_v4.lite.protocol import _validate_parallel_scope
     from megatron.lite.runtime.contracts import ParallelConfig
 
     _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=1, pp=1, vpp=1))
-    with pytest.raises(NotImplementedError):
-        _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=2, pp=1, vpp=1))
+    _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=2, pp=1, vpp=1))
+    with pytest.raises(ValueError):
+        _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=0, pp=1, vpp=1))
     with pytest.raises(NotImplementedError):
         _validate_parallel_scope(ParallelConfig(tp=2, ep=1, etp=1, cp=1, pp=1, vpp=1))
+
+
+def test_deepseek_v4_lite_cp2_forward_matches_cp1_bitwise(monkeypatch):
+    import torch
+
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    import megatron.lite.model.deepseek_v4.lite.model as deepseek_v4_model
+    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4ForCausalLM
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.primitive.parallel.cp import zigzag_reconstruct_from_cp_parts
+    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
+
+    torch.manual_seed(2026)
+    torch.set_num_threads(1)
+    cfg_kwargs = _tiny_config_kwargs()
+    cfg = DeepseekV4Config(**cfg_kwargs)
+    cp1_model = DeepseekV4ForCausalLM(cfg)
+    cp1_model.eval()
+
+    input_ids = (torch.arange(8, dtype=torch.long).unsqueeze(0) * 5 + 3) % cfg.vocab_size
+    labels = (torch.arange(8, dtype=torch.long).unsqueeze(0) * 7 + 11) % cfg.vocab_size
+    position_ids = torch.arange(input_ids.size(1), dtype=torch.long).unsqueeze(0)
+    with torch.no_grad():
+        cp1_out = cp1_model(input_ids=input_ids, position_ids=position_ids, labels=labels)
+
+    cp_models = []
+    for rank in range(2):
+        ps = ParallelState(
+            cp_group=object(),
+            cp_global_ranks=[0, 1],
+            cp_size=2,
+            cp_rank=rank,
+        )
+        cp_model = DeepseekV4ForCausalLM(DeepseekV4Config(**cfg_kwargs), ps=ps)
+        cp_model.load_state_dict(cp1_model.state_dict(), strict=True)
+        cp_model.eval()
+        cp_models.append(cp_model)
+
+    gathered_parts_by_dtype = {}
+
+    def fake_all_gather_cp_parts(tensor, ps):
+        parts = gathered_parts_by_dtype[tensor.dtype]
+        assert torch.equal(tensor, parts[ps.cp_rank])
+        return parts
+
+    monkeypatch.setattr(deepseek_v4_model, "_all_gather_cp_parts", fake_all_gather_cp_parts)
+
+    local_ids = [zigzag_slice_for_cp(input_ids, rank, 2, seq_dim=1) for rank in range(2)]
+    hidden = [
+        model.model.embed_tokens(local_ids[rank])
+        .unsqueeze(2)
+        .expand(-1, -1, cfg.hc_mult, -1)
+        .contiguous()
+        for rank, model in enumerate(cp_models)
+    ]
+
+    with torch.no_grad():
+        for layer_idx in range(cfg.num_hidden_layers):
+            layer_inputs = list(hidden)
+            gathered_parts_by_dtype = {
+                layer_inputs[0].dtype: layer_inputs,
+                local_ids[0].dtype: local_ids,
+            }
+            hidden = [
+                model.model.layers[layer_idx](
+                    layer_inputs[rank],
+                    position_ids=position_ids,
+                    input_ids=local_ids[rank],
+                )
+                for rank, model in enumerate(cp_models)
+            ]
+            gathered_parts_by_dtype = {}
+
+        full_hidden_for_norm = zigzag_reconstruct_from_cp_parts(hidden, seq_dim=1)
+        hidden_full = cp_models[0].model.norm(cp_models[0].model.hc_head(full_hidden_for_norm))
+        hidden = [zigzag_slice_for_cp(hidden_full, rank, 2, seq_dim=1) for rank in range(2)]
+        logits_full = cp_models[0].lm_head(hidden_full)
+        logits = [zigzag_slice_for_cp(logits_full, rank, 2, seq_dim=1) for rank in range(2)]
+
+    cp2_hidden = zigzag_reconstruct_from_cp_parts(
+        hidden,
+        seq_dim=1,
+    )
+    cp2_logits = zigzag_reconstruct_from_cp_parts(
+        logits,
+        seq_dim=1,
+    )
+
+    assert torch.equal(cp2_hidden, cp1_out["hidden_states"])
+    assert torch.equal(cp2_logits, cp1_out["logits"])
 
 
 def test_deepseek_v4_lite_tiny_cpu_forward_backward():

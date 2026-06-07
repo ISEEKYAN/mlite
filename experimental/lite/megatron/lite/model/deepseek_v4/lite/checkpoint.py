@@ -264,8 +264,8 @@ def expected_hf_names(
 
 
 def load_hf_weights(model: nn.Module, path: str, config: DeepseekV4Config, ps: ParallelState) -> None:
-    if (ps.tp_size, ps.ep_size, ps.etp_size, ps.cp_size, ps.pp_size) != (1, 1, 1, 1, 1):
-        raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=EP=ETP=CP=PP=1.")
+    if (ps.tp_size, ps.ep_size, ps.etp_size, ps.pp_size) != (1, 1, 1, 1):
+        raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=EP=ETP=PP=1.")
 
     del config
     reader = SafeTensorReader(path)
