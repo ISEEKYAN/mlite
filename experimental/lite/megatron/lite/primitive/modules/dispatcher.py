@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Hashable
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -28,9 +29,51 @@ def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
 
+_DEEPEP_BUFFER_CACHE: dict[tuple[int, int, int, Hashable], object] = {}
+
+
+def _env_enabled(name: str, default: str, *legacy_names: str) -> bool:
+    for key in (name, *legacy_names):
+        value = os.environ.get(key)
+        if value is not None:
+            return value not in {"0", "false", "False"}
+    return default not in {"0", "false", "False"}
+
+
+def _record_current_stream_event(obj):
+    tensor = None
+    if torch.is_tensor(obj) and obj.is_cuda:
+        tensor = obj
+    elif isinstance(obj, (tuple, list)):
+        for item in obj:
+            if torch.is_tensor(item) and item.is_cuda:
+                tensor = item
+                break
+    if not torch.cuda.is_available() or tensor is None:
+        return None
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(tensor.device))
+    return event
+
+
+def _event_current_stream_wait(event) -> None:
+    if event is None:
+        return
+    if hasattr(event, "current_stream_wait"):
+        event.current_stream_wait()
+        return
+    torch.cuda.current_stream().wait_event(event)
+
+
 def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
+
+    num_sms = os.environ.get("MEGATRON_LITE_DEEPEP_NUM_SMS") or os.environ.get(
+        "BUMBLEBEE_DEEPEP_NUM_SMS"
+    )
+    if num_sms:
+        deep_ep.Buffer.set_num_sms(int(num_sms))
 
     group_size = dist.get_world_size(group=group)
     hidden_bytes = _hidden_bytes(hidden_size)
@@ -57,8 +100,33 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
     )
 
 
+def _get_deepep_buffer(
+    group: dist.ProcessGroup,
+    hidden_size: int,
+    *,
+    buffer_slot: Hashable | None,
+):
+    cache_enabled = _env_enabled(
+        "MEGATRON_LITE_DEEPEP_BUFFER_CACHE",
+        "1",
+        "BUMBLEBEE_DEEPEP_BUFFER_CACHE",
+    )
+    if buffer_slot is None or not cache_enabled:
+        return _build_deepep_buffer(group, hidden_size)
+    group_size = dist.get_world_size(group=group)
+    key = (id(group), group_size, hidden_size, buffer_slot)
+    buffer = _DEEPEP_BUFFER_CACHE.get(key)
+    if buffer is None:
+        buffer = _build_deepep_buffer(group, hidden_size)
+        _DEEPEP_BUFFER_CACHE[key] = buffer
+    return buffer
+
+
 def _use_moe_permute_fusion() -> bool:
-    return os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0") == "1"
+    return (
+        os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION")
+        or os.environ.get("BUMBLEBEE_MOE_PERMUTE_FUSION", "0")
+    ) == "1"
 
 
 def _tensor_hidden_bytes(x: torch.Tensor) -> int:
@@ -215,6 +283,7 @@ class TokenDispatcher:
         ps: ParallelState,
         *,
         use_deepep: bool = True,
+        buffer_slot: Hashable | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
@@ -224,7 +293,11 @@ class TokenDispatcher:
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         if self.use_deepep:
             assert ps.tp_ep_group is not None
-            self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+            self.buffer = _get_deepep_buffer(
+                ps.tp_ep_group,
+                hidden_size,
+                buffer_slot=buffer_slot,
+            )
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -269,6 +342,7 @@ class TokenDispatcher:
         expert_output: torch.Tensor,
         *,
         allocate_on_comm_stream: bool = False,
+        async_finish: bool = True,
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_combine requires DeepEP combine.")
@@ -280,14 +354,14 @@ class TokenDispatcher:
         )
         previous_event = (
             EventOverlap(EventHandle())
-            if EventHandle is not None and EventOverlap is not None
+            if async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
         combined = self.buffer.combine(
             rank_grouped,
             self._handle,
             previous_event=previous_event,
-            async_finish=True,
+            async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
         event = None
@@ -295,9 +369,13 @@ class TokenDispatcher:
             if len(combined) >= 3:
                 event = combined[2]
             combined = combined[0]
+        if not async_finish:
+            event = _record_current_stream_event(combined)
         return {
             "combined": combined,
             "event": event,
+            "rank_grouped": rank_grouped,
+            "handle": self._handle,
         }
 
     def finish_deepep_combine(self, state):
@@ -305,12 +383,62 @@ class TokenDispatcher:
             raise RuntimeError("finish_deepep_combine requires DeepEP combine.")
         event = state.get("event")
         if event is not None:
-            event.current_stream_wait()
+            _event_current_stream_wait(event)
+        self.clear_deepep_combine_state()
+        return state["combined"]
+
+    def prepare_deepep_combine(self, expert_output: torch.Tensor):
+        if not self.use_deepep:
+            raise RuntimeError("prepare_deepep_combine requires DeepEP combine.")
+        rank_grouped = unpermute(
+            expert_output,
+            self._row_id_map,
+            restore_shape=self._restore_shape,
+            fused=_use_moe_permute_fusion(),
+        )
+        return rank_grouped, self._handle
+
+    def submit_deepep_combine_prepared(
+        self,
+        rank_grouped: torch.Tensor,
+        handle,
+        *,
+        allocate_on_comm_stream: bool = False,
+        async_finish: bool = True,
+    ):
+        if not self.use_deepep:
+            raise RuntimeError("submit_deepep_combine_prepared requires DeepEP combine.")
+        previous_event = (
+            EventOverlap(EventHandle())
+            if async_finish and EventHandle is not None and EventOverlap is not None
+            else None
+        )
+        combined = self.buffer.combine(
+            rank_grouped,
+            handle,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        event = None
+        if isinstance(combined, tuple):
+            if len(combined) >= 3:
+                event = combined[2]
+            combined = combined[0]
+        if not async_finish:
+            event = _record_current_stream_event(combined)
+        return {
+            "combined": combined,
+            "event": event,
+            "rank_grouped": rank_grouped,
+            "handle": handle,
+        }
+
+    def clear_deepep_combine_state(self):
         self._row_id_map = None
         self._restore_shape = None
         self._handle = None
         self._local_tpe_list = None
-        return state["combined"]
 
     def _dispatch_local(self, hidden_states, topk_scores, topk_indices):
         t, h = hidden_states.shape
@@ -440,12 +568,13 @@ class TokenDispatcher:
         topk_indices,
         *,
         allocate_on_comm_stream: bool = False,
+        async_finish: bool = True,
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
         previous_event = (
             EventOverlap(EventHandle())
-            if EventHandle is not None and EventOverlap is not None
+            if async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
         (
@@ -463,7 +592,14 @@ class TokenDispatcher:
         )
 
         topk_scores = topk_scores.float()
-        recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = self.buffer.dispatch(
+        (
+            recv_hidden,
+            recv_indices,
+            recv_probs,
+            recv_per_expert,
+            handle,
+            event,
+        ) = self.buffer.dispatch(
             hidden_states,
             topk_idx=topk_indices,
             topk_weights=topk_scores,
@@ -472,9 +608,11 @@ class TokenDispatcher:
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=event,
-            async_finish=True,
+            async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        if not async_finish:
+            event = _record_current_stream_event(recv_hidden)
         return {
             "recv_hidden": recv_hidden,
             "recv_indices": recv_indices,
@@ -591,7 +729,7 @@ class TokenDispatcher:
 
     def wait_dispatch_event(self):
         if self._deepep_event is not None:
-            self._deepep_event.current_stream_wait()
+            _event_current_stream_wait(self._deepep_event)
             self._deepep_event = None
 
     def _combine_deepep(self, expert_output):
@@ -613,10 +751,7 @@ class TokenDispatcher:
             combined = self.buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]
-        self._row_id_map = None
-        self._restore_shape = None
-        self._handle = None
-        self._local_tpe_list = None
+        self.clear_deepep_combine_state()
         return combined
 
 
