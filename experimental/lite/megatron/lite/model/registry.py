@@ -1,28 +1,30 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Model and implementation registry."""
+"""Model and protocol registry."""
 
 from __future__ import annotations
 
 import importlib
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
+# ---------------------------------------------------------------------------
+# Registry tables (populated by register_model)
+# ---------------------------------------------------------------------------
 
-@dataclass
-class ModelRegistration:
-    """Registry entry for one public model family."""
+# model_name → model package module path
+MODEL_PACKAGES: dict[str, str] = {}
 
-    package: str
-    hf_model_types: list[str] = field(default_factory=list)
-    impls: dict[str, str] = field(default_factory=dict)
+# HF model_type string → Megatron Lite model_name
+_HF_MODEL_TYPE_MAP: dict[str, str] = {}
 
+# (model_name, impl) → runtime_model_name
+_IMPL_TO_RUNTIME_MODEL: dict[tuple[str, str], str] = {}
 
-MODEL_REGISTRY: dict[str, ModelRegistration] = {}
-HF_MODEL_TYPE_MAP: dict[str, str] = {}
+# runtime_model_name → protocol module path
 TRAIN_RUNTIME_MODULES: dict[str, str] = {}
-IMPL_TO_RUNTIME_MODEL: dict[tuple[str, str], str] = {}
+
+# ---------------------------------------------------------------------------
+# Registration API
+# ---------------------------------------------------------------------------
 
 
 def register_model(
@@ -32,107 +34,135 @@ def register_model(
     hf_model_types: list[str] | None = None,
     impls: dict[str, str] | None = None,
 ) -> None:
-    """Register a model family and its runtime protocol modules."""
+    """Register a model and all its implementations in one call.
 
-    if not model_name:
-        raise ValueError("Model name must be non-empty.")
-    if not package:
-        raise ValueError("Model package must be non-empty.")
+    Args:
+        model_name: Megatron Lite model name (e.g. ``"qwen3"``).
+        package: Model package module path (e.g. ``"megatron.lite.model.qwen3_moe"``).
+        hf_model_types: HF ``model_type`` strings that map to this model.
+        impls: ``{impl_name: protocol_module_path}``.
+            The first impl is also registered as the bare ``model_name`` runtime key.
 
-    entry = ModelRegistration(
-        package=package,
-        hf_model_types=list(hf_model_types or []),
-        impls=dict(impls or {}),
-    )
-    MODEL_REGISTRY[model_name] = entry
+    Example::
 
-    for hf_model_type in entry.hf_model_types:
-        HF_MODEL_TYPE_MAP[hf_model_type] = model_name
+        register_model(
+            "qwen3",
+            package="megatron.lite.model.qwen3_moe",
+            hf_model_types=["qwen3_moe", "qwen2_moe"],
+            impls={
+                "lite": "megatron.lite.model.qwen3_moe.lite.protocol",
+            },
+        )
+    """
+    MODEL_PACKAGES[model_name] = package
 
-    for index, (impl_name, module_path) in enumerate(entry.impls.items()):
-        runtime_key = model_name if index == 0 else f"{model_name}_{impl_name}"
-        IMPL_TO_RUNTIME_MODEL[(model_name, impl_name)] = runtime_key
-        TRAIN_RUNTIME_MODULES[runtime_key] = module_path
+    if hf_model_types:
+        for hf_type in hf_model_types:
+            _HF_MODEL_TYPE_MAP[hf_type] = model_name
 
-
-def list_models() -> list[str]:
-    """Return registered model names."""
-
-    return sorted(MODEL_REGISTRY)
-
-
-def get_model_package(model_name: str):
-    """Import the package registered for ``model_name``."""
-
-    try:
-        package = MODEL_REGISTRY[model_name].package
-    except KeyError as exc:
-        raise ValueError(f"Unknown model {model_name!r}. Known: {list_models()}") from exc
-    return importlib.import_module(package)
+    if impls:
+        for i, (impl_name, proto_module) in enumerate(impls.items()):
+            runtime_key = model_name if i == 0 else f"{model_name}_{impl_name}"
+            _IMPL_TO_RUNTIME_MODEL[(model_name, impl_name)] = runtime_key
+            TRAIN_RUNTIME_MODULES[runtime_key] = proto_module
 
 
-def get_train_runtime_module(runtime_model_name: str):
-    """Import the protocol module registered for a runtime model key."""
+# ---------------------------------------------------------------------------
+# Built-in models
+# ---------------------------------------------------------------------------
 
-    try:
-        module_path = TRAIN_RUNTIME_MODULES[runtime_model_name]
-    except KeyError as exc:
-        raise ValueError(
-            f"Unknown runtime model {runtime_model_name!r}. "
-            f"Known: {sorted(TRAIN_RUNTIME_MODULES)}"
-        ) from exc
-    return importlib.import_module(module_path)
-
-
-def resolve_runtime_model_name(model_name: str, impl: str) -> str:
-    """Resolve ``(model_name, impl)`` to the runtime registry key."""
-
-    try:
-        return IMPL_TO_RUNTIME_MODEL[(model_name, impl)]
-    except KeyError as exc:
-        known = sorted(f"{model}:{implementation}" for model, implementation in IMPL_TO_RUNTIME_MODEL)
-        raise ValueError(f"No runtime registered for ({model_name!r}, {impl!r}). Known: {known}") from exc
-
-
-def resolve_model_type_from_hf(source: str | Path | dict[str, Any] | Any) -> str:
-    """Resolve a Lite model name from a HuggingFace-style config source."""
-
-    if isinstance(source, dict):
-        hf_config = source
-    elif hasattr(source, "model_type"):
-        hf_config = {"model_type": source.model_type}
-    else:
-        path = Path(source)
-        config_path = path if path.is_file() else path / "config.json"
-        with open(config_path, encoding="utf-8") as handle:
-            hf_config = json.load(handle)
-
-    hf_model_type = hf_config.get("model_type", "")
-    try:
-        return HF_MODEL_TYPE_MAP[hf_model_type]
-    except KeyError as exc:
-        raise ValueError(
-            f"Cannot resolve HF model_type {hf_model_type!r}. "
-            f"Known: {sorted(HF_MODEL_TYPE_MAP)}"
-        ) from exc
-
+_QWEN3_MOE_LITE = "megatron.lite.model.qwen3_moe.lite.protocol"
 
 register_model(
-    "toy_dense",
-    package="megatron.lite.model.toy_dense",
-    hf_model_types=["mlite_toy_dense"],
-    impls={"torch": "megatron.lite.model.toy_dense"},
+    "qwen3",
+    package="megatron.lite.model.qwen3_moe",
+    hf_model_types=["qwen3_moe", "qwen2_moe"],
+    impls={"lite": _QWEN3_MOE_LITE},
+)
+
+register_model(
+    "qwen3_moe",
+    package="megatron.lite.model.qwen3_moe",
+    impls={"lite": _QWEN3_MOE_LITE},
+)
+
+register_model(
+    "qwen3_5",
+    package="megatron.lite.model.qwen3_5",
+    hf_model_types=["qwen3_5_moe"],
+    impls={"lite": "megatron.lite.model.qwen3_5.lite.protocol"},
 )
 
 
+# ---------------------------------------------------------------------------
+# Lookup functions
+# ---------------------------------------------------------------------------
+
+
+def get_model_package(model_name: str):
+    if model_name not in MODEL_PACKAGES:
+        raise ValueError(
+            f"Unknown model: {model_name!r}. Available: {list(MODEL_PACKAGES)}"
+        )
+    return importlib.import_module(MODEL_PACKAGES[model_name])
+
+
+def get_train_runtime_module(model_name: str):
+    if model_name in TRAIN_RUNTIME_MODULES:
+        return importlib.import_module(TRAIN_RUNTIME_MODULES[model_name])
+    raise ValueError(f"No protocol module for: {model_name!r}")
+
+
+def resolve_runtime_model_name(model_name: str, impl: str) -> str:
+    key = (model_name, impl)
+    if key not in _IMPL_TO_RUNTIME_MODEL:
+        raise ValueError(
+            f"No runtime for ({model_name!r}, {impl!r}). "
+            f"Known: {list(_IMPL_TO_RUNTIME_MODEL)}"
+        )
+    return _IMPL_TO_RUNTIME_MODEL[key]
+
+
+def resolve_model_type_from_hf(source: str | Path | dict) -> str:
+    """Resolve Megatron Lite model_name from an HF source.
+
+    Args:
+        source: One of:
+            - Directory path (str/Path) containing ``config.json``
+            - Path to a ``config.json`` file directly
+            - A dict / HF config object with a ``model_type`` key
+    """
+    if isinstance(source, dict):
+        hf_config = source
+    elif hasattr(source, "model_type"):
+        # HF PretrainedConfig object
+        hf_config = {"model_type": source.model_type}
+    else:
+        p = Path(source)
+        if p.is_file():
+            config_path = p
+        elif p.is_dir():
+            config_path = p / "config.json"
+        else:
+            raise FileNotFoundError(f"Not a file or directory: {source}")
+        if not config_path.exists():
+            raise FileNotFoundError(f"No config.json found at {source}")
+        with open(config_path) as f:
+            hf_config = json.load(f)
+
+    hf_model_type = hf_config.get("model_type", "")
+    native_name = _HF_MODEL_TYPE_MAP.get(hf_model_type)
+    if native_name is not None:
+        return native_name
+    raise ValueError(
+        f"Cannot resolve model_type={hf_model_type!r}. "
+        f"Known: {list(_HF_MODEL_TYPE_MAP)}. Set model_name explicitly."
+    )
+
+
 __all__ = [
-    "HF_MODEL_TYPE_MAP",
-    "IMPL_TO_RUNTIME_MODEL",
-    "MODEL_REGISTRY",
-    "TRAIN_RUNTIME_MODULES",
     "get_model_package",
     "get_train_runtime_module",
-    "list_models",
     "register_model",
     "resolve_model_type_from_hf",
     "resolve_runtime_model_name",

@@ -1,16 +1,40 @@
-# Porting Guidance
+# Porting Notes
 
-Use this package as a staging area for small Megatron-native model ports.
+This tree is prepared as an experimental Megatron package. The package code
+lives under `experimental/lite/megatron/lite`, so users can add
+`experimental/lite` to `PYTHONPATH` and import `megatron.lite`.
 
-Recommended order:
+## Naming Rules
 
-1. Register the model and a single implementation in `model.registry`.
-2. Define a protocol module that returns a `ModelBundle`.
-3. Add only the primitive contracts needed by that model.
-4. Add CPU import and toy-level contract checks before GPU validation.
-5. Move distributed, checkpoint, and downstream framework integration into
-   separate PRs.
+- Use `Megatron Lite` for the component name in docs and comments.
+- Use `megatron.lite` for public and internal imports.
+- Do not introduce project-specific legacy branding.
+- Use `mlite` for the runtime backend key.
+- Use `lite` for model implementation names.
 
-Avoid mixing model bring-up with unrelated runtime features. The main review
-question for a model PR should be whether the model implementation follows the
-contract and whether its validation evidence covers the behavior it adds.
+## Included Surface
+
+Keep the PR focused on the lite model implementation path:
+
+- Runtime backend: `mlite`.
+- Models: Qwen3 MoE and Qwen3.5 MoE.
+- Model implementations: `lite` only.
+- Optimizer primitives: Megatron-Core optimizer wrapping and FSDP2.
+
+Keep these out of the first PR unless the scope changes:
+
+- Hybrid model implementation packages.
+- Bridge model/runtime implementation packages.
+- Benchmark scripts and experiment-specific entrypoints.
+
+## Package Integration
+
+No repository-level packaging changes are made in this experimental drop. The
+current layout is importable from source with:
+
+```bash
+export PYTHONPATH=/path/to/Megatron-LM/experimental/lite:$PYTHONPATH
+```
+
+A future integration step can decide whether to keep the experimental location
+or move the tree into the final package location.

@@ -1,31 +1,45 @@
-# Megatron Lite Architecture
+# Architecture
 
-Megatron Lite is organized around three narrow contracts:
+Megatron Lite source lives under `experimental/lite/megatron/lite` and is split
+into three layers:
 
-1. Runtime backends own execution.
-2. Model implementations own model construction.
-3. Primitive packages expose reusable building blocks through explicit
-   dataclasses and protocols.
+- `runtime`: lifecycle and training-step orchestration.
+- `model`: model registration plus model-specific build/load/export protocols.
+- `primitive`: reusable lower-level pieces such as parallel state, tensor-parallel
+  layers, checkpoint conversion, MoE utilities, and optimizer wrapping.
 
-The first PR keeps those layers intentionally small. The only executable backend
-is the local `mlite` backend, and the only model is `toy_dense`.
+The runtime does not know Qwen implementation details. It imports a model
+protocol from the model registry, builds the typed implementation config, then
+delegates model construction to that protocol.
 
-## Package Layers
+## Import Boundary
 
-`megatron.lite.runtime` provides `RuntimeConfig`, `create_runtime`, and
-`register_runtime`. A backend implements the `Runtime` abstract base class and
-returns `ModelHandle` objects from `build_model`.
+The source root for local use is `experimental/lite`; adding that directory to
+`PYTHONPATH` exposes the package as `megatron.lite`. Internal imports also use
+`megatron.lite` so user-facing code matches the final package path.
 
-`megatron.lite.model.registry` maps a public model name and implementation name
-to a protocol module. Runtime backends use the registry instead of importing
-model packages directly.
+## Runtime Boundary
 
-`megatron.lite.primitive` contains only interface-level objects in this slice:
-`ModelBundle`, primitive config dataclasses, and protocol type definitions.
-Concrete distributed primitives are deliberately out of scope.
+The runtime API owns:
 
-## Review Boundary
+- Distributed initialization.
+- Model protocol loading.
+- Model checkpoint save/load dispatch.
+- Forward/backward microbatch orchestration.
+- Optimizer and learning-rate scheduler stepping.
+- Optional model/optimizer offload hooks.
 
-The package lives under `experimental/lite` and is imported by adding that
-directory to `PYTHONPATH`. This keeps the experimental API isolated from the
-main Megatron package until the interface is stable enough to promote.
+The model protocol owns:
+
+- Architecture config creation.
+- Model chunk construction.
+- Model-specific recompute/offload wiring.
+- Model-specific optimizer construction.
+- HF checkpoint load/export mapping.
+
+## Current Deliberate Omissions
+
+This package currently includes only the lite model implementation path. It
+intentionally excludes non-lite model/runtime implementations and benchmark
+entrypoints. FSDP2 is included as an optimizer primitive and can be selected by
+model protocols that support it.

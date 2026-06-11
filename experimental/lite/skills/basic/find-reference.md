@@ -1,12 +1,51 @@
-# Find Reference
+# Find Reference Skill
 
-Before porting a model or primitive, identify the source implementation and the
-minimal behavior needed for the current PR.
+Find the strongest checkable reference for a Megatron Lite task.
 
-Record:
+## Schema
 
-- The upstream source file or paper section.
-- The expected tensor shapes.
-- The smallest local check that can catch a regression.
+<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+```python
+schema = Skill(
+    "basic.find_reference", kind="state_machine", purpose="select a checkable validation reference",
+    imports=[], calls=[],
+    inputs=["task", "layer", "candidates", "budget"],
+    outputs=["reference", "contract", "risks"], exits=["done", "blocked", "out_of_scope"],
+)
+```
+<!-- MLITE_SKILL_SCHEMA_END -->
 
-Do not copy large model stacks into Lite when a smaller contract check is enough.
+```python
+def find_reference(task, layer, candidates, budget):
+    if task.scope not in ["primitive", "model", "runtime", "application", "precision"]:
+        return out_of_scope("unknown validation surface")
+
+    ordered = [
+        megatron_reference(task, layer),
+        huggingface_reference(task, layer),
+        torch_reference(task, layer),
+        first_principles_formula_or_distributed_invariant(task, layer),
+        *candidates,
+    ]
+
+    risks = []
+    for ref in ordered[:budget.max_candidates]:
+        if ref is None or not ref.exists():
+            continue
+
+        contract = extract_contract(
+            ref,
+            fields=["inputs", "outputs", "shape", "dtype", "seed", "variables", "tolerance"],
+        )
+        if not contract.is_checkable():
+            risks.append((ref, "reference exists but contract is incomplete"))
+            continue
+        if ref.requires_unavailable_assets():
+            risks.append((ref, "reference requires unavailable assets"))
+            continue
+
+        variables = freeze_variables(contract.variables, except_=task.variable_under_test)
+        return done(reference=ref, contract=contract.with_variables(variables), risks=risks)
+
+    return blocked("no checkable reference", risks=risks)
+```

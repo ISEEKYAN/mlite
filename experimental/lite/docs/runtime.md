@@ -1,24 +1,63 @@
 # Runtime
 
-Runtime backends provide the execution surface for Megatron Lite. A runtime is
-created from `RuntimeConfig`:
+The public runtime entrypoint is `megatron.lite.runtime`.
 
 ```python
-from megatron.lite.runtime import RuntimeConfig, create_runtime
+from megatron.lite.runtime import MegatronLiteConfig, ParallelConfig, RuntimeConfig, create_runtime
 
-runtime = create_runtime(RuntimeConfig(backend="mlite"))
+cfg = RuntimeConfig(
+    backend="mlite",
+    hf_path="/path/to/hf-model",
+    backend_cfg=MegatronLiteConfig(
+        model_name="qwen3",
+        impl="lite",
+        parallel=ParallelConfig(tp=1, pp=1, cp=1, ep=1),
+    ),
+)
+runtime = create_runtime(cfg)
+handle = runtime.build_model()
 ```
 
-The minimal runtime interface is:
+## API Tiers
 
-- `build_model()`
-- `train_mode(handle)`
-- `eval_mode(handle)`
-- `forward_backward(handle, data, loss_fn=None, ...)`
-- `zero_grad(handle)`
-- `optimizer_step(handle)`
-- `lr_scheduler_step(handle)`
+All runtime backends implement the pretraining tier:
 
-Checkpointing, offload, distributed execution, and external training framework
-bridges are non-goals for this slice. They should extend the interface in later
-PRs only when the behavior is implemented and validated.
+- `build_model`
+- `save_checkpoint`
+- `load_checkpoint`
+- `train_mode`
+- `eval_mode`
+- `forward_backward`
+- `zero_grad`
+- `optimizer_step`
+- `lr_scheduler_step`
+
+The lite runtime also implements `export_weights` and `to` when the underlying
+model and optimizer support those operations.
+
+## Config Types
+
+`RuntimeConfig` selects the backend and carries the Hugging Face model path.
+
+`MegatronLiteConfig` carries `mlite` backend settings:
+
+- `model_name`: `qwen3`, `qwen3_moe`, or `qwen3_5`.
+- `impl`: currently only `lite`.
+- `parallel`: tensor, expert, pipeline, virtual pipeline, and context sizes.
+- `optimizer`: Megatron-Core optimizer settings.
+- `impl_cfg`: model-specific options consumed by each model protocol.
+
+## Backend Registry
+
+The only built-in backend key is `mlite`. Model implementations remain selected
+through `MegatronLiteConfig.impl`, which currently supports `impl="lite"`.
+
+Custom runtime backends can be registered with:
+
+```python
+from megatron.lite.runtime import register_runtime
+
+register_runtime("my_backend", "my_package.my_runtime")
+```
+
+The target module must expose `create(hf_path, cfg)`.

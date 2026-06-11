@@ -1,51 +1,82 @@
 # Megatron Lite
 
-Megatron Lite is an experimental package for building Megatron-native model
-implementations behind a small, explicit contract. It is intentionally staged:
-this first slice adds the public shape of the package, the runtime/model
-registries, primitive interface contracts, validation scaffolding, and a tiny
-pure PyTorch model that proves the contracts are importable and executable on a
-single CPU process.
+Megatron Lite is an experimental training runtime and model implementation layer
+for Megatron. The source lives under `experimental/lite/megatron/lite`, and the
+public import path is `megatron.lite`.
 
-## Motivation
+Do not import `experimental.lite` from user code. Examples and public APIs should
+refer to `megatron.lite`.
 
-Megatron model work often mixes several concerns at once: model composition,
-parallel runtime setup, primitive selection, checkpointing, and downstream
-training-framework integration. Megatron Lite separates those concerns so that a
-model implementation can declare what it needs, a runtime can consume the
-declaration through a stable API, and primitive work can be reviewed in small
-increments.
+## Scope
 
-This package is meant to make early model bring-up easier to review. Each later
-PR can add one capability at a time while keeping the import path and contracts
-stable.
+This initial drop contains:
 
-## Current Contents
+- A lightweight runtime API in `megatron.lite.runtime`.
+- Common training primitives in `megatron.lite.primitive`.
+- Lite-only model implementations for Qwen3 MoE and Qwen3.5 MoE.
+- Hugging Face safetensors load/export helpers for the included models.
+- Megatron-Core optimizer wrapping for the lite runtime.
+- FSDP2 optimizer primitives for supported lite model protocols.
 
-- `megatron.lite.runtime`: runtime creation, backend registration, and runtime
-  interface definitions.
-- `megatron.lite.model.registry`: model and implementation registry.
-- `megatron.lite.primitive`: protocol, config, and bundle dataclasses used by
-  model implementations.
-- `megatron.lite.model.toy_dense`: a two-layer dense model used only to validate
-  the contract.
-- `tests/run_primitive_validation.sh`: a local CPU validation entrypoint.
-- `skills/`: short operating notes for keeping future Lite changes scoped.
+This initial drop intentionally does not include:
 
-## Non-Goals For This Slice
+- Hybrid model implementations.
+- Bridge model/runtime implementations.
+- Benchmark entrypoints or experiment scripts.
 
-This PR does not add production model support, Qwen support, distributed
-parallelism, FSDP2, LoRA, checkpointing, VERL integration, custom kernels, or
-real primitive implementations. Those pieces should land in follow-up slices
-after this package boundary is reviewed.
+## Layout
 
-## Local Validation
-
-Run from the repository root:
-
-```bash
-experimental/lite/tests/run_primitive_validation.sh
+```text
+experimental/lite/
+  README.md
+  docs/                       Design and usage notes
+  skills/                     Agent-agnostic maintenance skills
+  megatron/
+    lite/
+      runtime/                Runtime API, config, and mlite backend registry
+      model/                  Model registry and Qwen model implementations
+      primitive/              Parallel, checkpoint, optimizer, module, and op primitives
 ```
 
-The script exports `experimental/lite` on `PYTHONPATH` and runs the local CPU
-tests. No GPU is required.
+For local source-tree use:
+
+```bash
+export PYTHONPATH=/path/to/Megatron-LM/experimental/lite:$PYTHONPATH
+```
+
+## Public API
+
+```python
+from megatron.lite.runtime import MegatronLiteConfig, RuntimeConfig, create_runtime
+
+cfg = RuntimeConfig(
+    backend="mlite",
+    hf_path="/path/to/hf-model",
+    backend_cfg=MegatronLiteConfig(model_name="qwen3", impl="lite"),
+)
+runtime = create_runtime(cfg)
+handle = runtime.build_model()
+```
+
+`backend="mlite"` selects the Megatron Lite runtime backend. `impl="lite"`
+selects the model implementation inside the registered model family.
+
+Model names currently registered by default:
+
+- `qwen3`: Qwen3 MoE lite implementation. HF `model_type` values
+  `qwen3_moe` and `qwen2_moe` resolve to this model name.
+- `qwen3_moe`: compatibility alias for the same Qwen3 MoE lite implementation.
+- `qwen3_5`: Qwen3.5 MoE lite implementation.
+
+## Docs
+
+- [Architecture](docs/architecture.md)
+- [Runtime](docs/runtime.md)
+- [Models](docs/models.md)
+- [Porting Notes](docs/porting.md)
+- [Skills](skills/README.md)
+
+## Acknowledgements
+
+The Qwen3 MoE LoRA adapter support follows Mind-Lab's PEFT/Mint-compatible
+adapter work. Thanks to Mind-Lab for the reference implementation and guidance.

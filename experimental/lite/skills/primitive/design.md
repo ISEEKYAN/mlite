@@ -1,14 +1,41 @@
-# Primitive Design
+# Primitive Design Skill
 
-Primitive implementations should be independent units that can be tested without
-bringing up a full model.
+Design a replaceable MLite primitive before implementation.
 
-Design rules:
+## Schema
 
-- Keep primitive configuration explicit.
-- Prefer pure PyTorch references for first validation.
-- Add optimized kernels only after the reference behavior is covered.
-- Avoid hidden dependencies on global distributed state.
+<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+```python
+schema = Skill(
+    "primitive.design", kind="state_machine", purpose="design a modular primitive",
+    imports=["basic.constitution"], calls=["primitive.principle", "primitive.contract", "basic.find_reference"],
+    inputs=["task", "primitive", "requirements", "budget"],
+    outputs=["design", "reference", "risks"], exits=["done", "blocked", "out_of_scope"],
+)
+```
+<!-- MLITE_SKILL_SCHEMA_END -->
 
-If a primitive needs process groups, pass them through config or bundle metadata
-instead of importing runtime internals.
+```python
+def design(task, primitive, requirements, budget):
+    ref = basic.find_reference(task, layer=primitive.layer, candidates=requirements.references, budget=budget.reference)
+    if not ref.done:
+        return blocked("no primitive reference", evidence=ref)
+
+    principle = primitive.principle(primitive, reference=ref.reference, constraints=requirements.constraints)
+    if not principle.done:
+        return blocked("primitive principle failed", evidence=principle)
+
+    contract = primitive.contract(primitive, scope=requirements.scope, reference=ref.reference)
+    if not contract.done:
+        return blocked("primitive contract failed", evidence=contract)
+
+    design = {
+        "principle": principle.principle,
+        "implementation_details": define_owned_modules_and_dataflow(primitive),
+        "api": define_inputs_outputs_config_keys(primitive),
+        "composition": declare_valid_and_invalid_combinations(primitive),
+        "selection": decide_when_to_use_or_not_use(primitive),
+        "replaceability": require_no_hidden_dependency(primitive),
+    }
+    return done(design=design, reference=ref, risks=contract.risks)
+```
