@@ -15,12 +15,13 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
     build_fsdp2_training_optimizer,
     fsdp2_available,
 )
-from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
 from megatron.lite.primitive.optimizers.mfsdp import build_mfsdp_training_optimizer
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+
+_MFSDP_SHARDING_STRATEGY = "optim_grads_params"
 
 
 class TinyUnit(nn.Module):
@@ -50,6 +51,8 @@ def _single_node_cuda_dist():
         pytest.skip("CUDA is required for M-FSDP parity smoke tests.")
     if not fsdp2_available():
         pytest.skip("Installed PyTorch does not expose FSDP2 fully_shard.")
+    if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+        pytest.skip("M-FSDP sharding parity smoke requires at least 2 distributed ranks.")
     if int(os.environ.get("WORLD_SIZE", "1")) > 8:
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
@@ -106,7 +109,7 @@ def _model_cfg() -> SimpleNamespace:
 
 
 def _optimizer_cfg() -> OptimizerConfig:
-    return OptimizerConfig(
+    cfg = OptimizerConfig(
         optimizer="adam",
         lr=1.0e-3,
         min_lr=0.0,
@@ -116,6 +119,8 @@ def _optimizer_cfg() -> OptimizerConfig:
         adam_beta2=0.999,
         adam_eps=1.0e-8,
     )
+    cfg.override_optimizer_config = {"mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY}
+    return cfg
 
 
 def _new_model(seed: int) -> nn.Module:
@@ -174,6 +179,13 @@ def _train_once(chunks, optimizer, finalize, x: torch.Tensor, target: torch.Tens
     return bool(success), float(loss.detach().cpu()), float(grad_norm)
 
 
+def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    full_tensor = getattr(tensor, "full_tensor", None)
+    if callable(full_tensor):
+        return full_tensor()
+    return tensor
+
+
 def _named_model_tensors(chunks) -> dict[str, torch.Tensor]:
     params: dict[str, torch.Tensor] = {}
     for chunk_idx, chunk in enumerate(chunks):
@@ -181,8 +193,8 @@ def _named_model_tensors(chunks) -> dict[str, torch.Tensor]:
             if not param.requires_grad:
                 continue
             canonical_name = name.replace("_orig_mod.", "").replace("module.", "")
-            local = to_local_tensor(param.detach())
-            params[f"{chunk_idx}.{canonical_name}"] = local.cpu().float().clone()
+            full = _full_tensor(param.detach())
+            params[f"{chunk_idx}.{canonical_name}"] = full.cpu().float().clone()
     return params
 
 
@@ -223,6 +235,8 @@ def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
     if dist.get_rank() == 0:
         print(
             "[MFSDP_PARITY] "
+            f"world_size={dist.get_world_size()} "
+            f"strategy={_MFSDP_SHARDING_STRATEGY} "
             f"loss_fsdp2={fsdp2_loss:.8f} "
             f"loss_mfsdp={mfsdp_loss:.8f} "
             f"grad_norm_fsdp2={fsdp2_grad_norm:.8f} "
