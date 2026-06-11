@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -65,7 +66,13 @@ def build_model(model_cfg: ToyDenseConfig, impl_cfg: ImplConfig | None = None) -
             output_dim=impl_cfg.output_dim,
         )
 
-    return ModelBundle(chunks=[ToyDenseModel(model_cfg)])
+    parallel_state = SimpleNamespace(
+        pp_size=1,
+        tp_rank=0,
+        cp_rank=0,
+        pp_rank=0,
+    )
+    return ModelBundle(chunks=[ToyDenseModel(model_cfg)], parallel_state=parallel_state)
 
 
 __all__ = ["ImplConfig", "ToyDenseConfig", "ToyDenseModel", "build_model", "build_model_config"]

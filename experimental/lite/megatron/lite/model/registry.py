@@ -124,6 +124,21 @@ register_model(
     impls={"torch": "megatron.lite.model.toy_dense"},
 )
 
+_QWEN3_MOE_LITE = "megatron.lite.model.qwen3_moe.lite.protocol"
+
+register_model(
+    "qwen3",
+    package="megatron.lite.model.qwen3_moe",
+    hf_model_types=["qwen3_moe", "qwen2_moe"],
+    impls={"lite": _QWEN3_MOE_LITE},
+)
+
+register_model(
+    "qwen3_moe",
+    package="megatron.lite.model.qwen3_moe",
+    impls={"lite": _QWEN3_MOE_LITE},
+)
+
 
 __all__ = [
     "HF_MODEL_TYPE_MAP",

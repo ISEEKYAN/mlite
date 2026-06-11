@@ -1,5 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Model bundle returned by Lite model protocol modules."""
+"""ModelBundle — return type of protocol.build_model()."""
 
 from __future__ import annotations
 
@@ -9,16 +8,21 @@ from typing import Any
 
 import torch.nn as nn
 
+from megatron.lite.primitive.parallel.state import ParallelState
+
 
 @dataclass
 class ModelBundle:
-    """Everything a runtime needs after model construction."""
+    """Everything runtime needs to run a training loop.
+
+    Returned by protocol.build_model(). Model owns the construction
+    of all fields — runtime just consumes them.
+    """
 
     chunks: list[nn.Module]
+    parallel_state: ParallelState
     optimizer: Any | None = None
     finalize_grads: Callable[[], None] | None = None
-    forward_step: Callable[[nn.Module, dict[str, Any]], Any] | None = None
+    forward_step: Callable[[nn.Module, dict], dict] | None = None
+    # extra metadata (expert_classifier, model_cfg, etc.)
     extras: dict[str, Any] = field(default_factory=dict)
-
-
-__all__ = ["ModelBundle"]
