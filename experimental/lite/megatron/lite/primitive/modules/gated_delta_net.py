@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
-from megatron.core.jit import jit_fuser
 from megatron.lite.primitive.ops.gated_delta_rule import (
     l2norm,
     torch_chunk_gated_delta_rule,
@@ -23,6 +22,11 @@ from megatron.lite.primitive.parallel.cp import (
     zigzag_to_contiguous_chunks,
 )
 from megatron.lite.primitive.utils import ensure_divisible
+
+
+def jit_fuser(fn):
+    return fn
+
 
 try:
     from fla.modules.convolution import (
