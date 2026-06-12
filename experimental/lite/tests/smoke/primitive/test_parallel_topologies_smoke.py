@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.lite.primitive.parallel import (
+    PackedSeqParams,
     contiguous_to_zigzag_chunks,
     init_parallel,
     zigzag_split_for_cp,
@@ -118,3 +119,33 @@ def test_cp_zigzag_contiguous_chunk_swap_roundtrip():
 
     restored = contiguous_to_zigzag_chunks(local_contiguous, ps.cp_group, seq_dim=1)
     assert torch.equal(restored, local_zigzag)
+
+
+def test_gdn_rejects_thd_context_parallel_until_validated():
+    if dist.get_world_size() < 2:
+        pytest.skip("GDN THD+CP guard smoke requires at least 2 ranks.")
+
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
+
+    ps = init_parallel(SimpleNamespace(tp=1, ep=1, etp=1, cp=2, pp=1))
+    gdn = (
+        GatedDeltaNet(
+            hidden_size=16,
+            linear_num_key_heads=2,
+            linear_key_head_dim=4,
+            linear_num_value_heads=2,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=2,
+            rms_norm_eps=1e-6,
+            ps=ps,
+        )
+        .cuda()
+        .to(torch.bfloat16)
+    )
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    packed_seq_params = PackedSeqParams.from_cu_seqlens(cu_seqlens, max_seqlen=8)
+    local_hidden = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="packed THD with all-gather CP"):
+        gdn(local_hidden, packed_seq_params=packed_seq_params)

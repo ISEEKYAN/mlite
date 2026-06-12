@@ -108,8 +108,13 @@ class GatedDeltaNet(nn.Module):
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         del position_ids
-        qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
         is_packed = packed_seq_params is not None
+        if self.ps.cp_size > 1 and is_packed:
+            raise NotImplementedError(
+                "GatedDeltaNet packed THD with all-gather CP is not validated yet."
+            )
+
+        qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
         cp_context = None
         if self.ps.cp_size > 1:
