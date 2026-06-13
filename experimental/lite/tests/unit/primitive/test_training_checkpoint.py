@@ -4,8 +4,11 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.distributed.tensor import Replicate, Shard
+
+pytest.importorskip("megatron.core.dist_checkpointing")
 
 from megatron.core.dist_checkpointing.strategies.torch import (
     _replace_state_dict_keys_with_sharded_keys,

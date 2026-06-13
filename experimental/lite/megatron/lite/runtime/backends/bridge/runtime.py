@@ -92,7 +92,12 @@ def _bridge_hf_config(bridge):
 
 def _lower_provider_value(key: str, value: Any) -> Any:
     if key == "attention_backend" and isinstance(value, str):
-        from megatron.core.transformer.enums import AttnBackend
+        try:
+            from megatron.core.transformer.enums import AttnBackend
+        except ModuleNotFoundError as exc:
+            if exc.name != "megatron.core":
+                raise
+            return value
 
         return AttnBackend[value]
     return value

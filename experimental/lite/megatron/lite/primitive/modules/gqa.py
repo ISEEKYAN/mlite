@@ -1,15 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Grouped Query Attention + Rotary Embedding (MC-atoms).
+"""Grouped Query Attention + Rotary Embedding.
 
 Model-agnostic: takes explicit params instead of model-specific config.
 Supports sequence parallel, context parallel, and THD (packed sequences).
-
-RoPE internals call Megatron-Core's atomic
-`megatron.core.models.common.embeddings.rotary_pos_embedding.RotaryEmbedding`
-and `rope_utils._apply_rotary_pos_emb_bshd / _apply_rotary_pos_emb_thd` — this
-matches Megatron-Core's unfused rotate-half path because
-``config.apply_rope_fusion`` defaults to ``False``. See
-`docs/gqa_mc_atoms_plan.md` section 4 (Option A).
 """
 
 from __future__ import annotations
@@ -20,23 +13,17 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
-from megatron.core.models.common.embeddings.rope_utils import (  # pyright: ignore[reportMissingImports]
-    _apply_rotary_pos_emb_bshd,
-    _apply_rotary_pos_emb_thd,
-)
-from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-    RotaryEmbedding as MCoreRotaryEmbedding,  # pyright: ignore[reportMissingImports]
-)
 from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
 from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
+from megatron.lite.primitive.utils.rotary import RotaryEmbedding
 
 # Whitelist of MC PackedSeqParams fields accepted by TE DotProductAttention.forward().
 # MC-only fields (local_cp_size, cp_group, total_tokens, seq_idx) are excluded.
-# Mirror MC TEDotProductAttention.kept_packed_seq_params pattern
-# (Megatron-LM/megatron/core/extensions/transformer_engine.py:1501-1593).
+# Mirror the TE DotProductAttention packed-sequence argument whitelist.
 _KEPT_PSP_FIELDS = (
     "qkv_format",
     "cu_seqlens_q",
@@ -160,10 +147,7 @@ class GQAttention(nn.Module):
             )
 
         if self._mrope_section is None:
-            # MC's RotaryEmbedding is atomic (flat kwargs, no TransformerConfig).
-            # cp_group is read from self.cp_group inside forward() when not passed
-            # — no manual CP shard needed on our side.
-            self.rotary = MCoreRotaryEmbedding(
+            self.rotary = RotaryEmbedding(
                 kv_channels=head_dim,
                 rotary_percent=rotary_percent,
                 rotary_interleaved=False,
@@ -217,10 +201,7 @@ class GQAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # RoPE — unfused bshd/thd to match MC's default apply_rope_fusion=False.
-        # MC's RotaryEmbedding.forward takes only `max_seq_len` + optional
-        # `offset`; position_ids is NOT consumed here (MC handles position via
-        # offset for inference / mRoPE via a separate class).
+        # RoPE uses the local unfused rotate-half helpers.
         if self._use_fp32_rope:
             orig_dtype = q.dtype
             q, k = q.float(), k.float()
@@ -244,16 +225,8 @@ class GQAttention(nn.Module):
                 seq_len_for_rope = int(packed_seq_params.cu_seqlens_q[-1])
             else:
                 seq_len_for_rope = int(max(max_q, max_kv))
-            # Match MC RotaryEmbedding.get_rotary_seq_len for packed THD: the
-            # rotary length is the max per-sequence padded length, not total
-            # packed tokens. Using total tokens makes rope_utils switch to
-            # offset mapping, so later packed sequences do not restart at pos 0.
-            #
-            # MC contract (gpt_model.py:380-381): THD path passes packed_seq=True so the
-            # rotary skips its internal cp-slice; _apply_rotary_pos_emb_thd does the
-            # cp-zigzag slice itself via _get_thd_freqs_on_this_cp_rank. Older MC
-            # runtimes do not expose this kwarg; callers without context
-            # parallelism can use the legacy call shape.
+            # Packed THD uses max per-sequence padded length, not total packed tokens.
+            # The THD apply helper handles CP-zigzag frequency slicing per sequence.
             if self._rotary_accepts_packed_seq:
                 freqs = self.rotary(seq_len_for_rope, packed_seq=True)
             else:
