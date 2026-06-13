@@ -15,6 +15,7 @@ from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
@@ -28,6 +29,7 @@ __all__ = [
     "build_model_config",
     "export_hf_weights",
     "load_hf_weights",
+    "save_hf_weights",
     "vocab_size",
 ]
 
@@ -39,7 +41,7 @@ def is_expert_param(name: str) -> bool:
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "mc_full"
+    optimizer: str | None = "distopt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -111,10 +113,12 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
-    from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
+def _build_distopt_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_distopt_training_optimizer,
+    )
 
-    return build_mc_training_optimizer(
+    return build_distopt_training_optimizer(
         chunks,
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
@@ -199,8 +203,8 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     finalize_grads = None
     post_model_load_hook = None
     optimizer_backend = "none"
-    if impl_cfg.optimizer in {"mc", "mc_full"}:
-        optimizer, finalize_grads = _build_mc_optimizer(chunks, model_cfg, impl_cfg, ps)
+    if impl_cfg.optimizer == "distopt":
+        optimizer, finalize_grads = _build_distopt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -260,6 +264,12 @@ def export_hf_weights(
     chunks: list[nn.Module], model_cfg: Qwen35Config, ps: ParallelState, **kwargs
 ):
     yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_hf_weights(
+    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState
+) -> None:
+    _save_hf_weights_impl(chunks, path, model_cfg, ps)
 
 
 def vocab_size(model_cfg) -> int | None:

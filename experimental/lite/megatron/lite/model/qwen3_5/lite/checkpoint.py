@@ -760,10 +760,19 @@ def export_hf_weights(
     )
 
 
+def save_hf_weights(
+    model: nn.Module | list[nn.Module], path: str, config: Qwen35Config, ps: ParallelState
+) -> None:
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
+
+    _save(model, path, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size)
+
+
 __all__ = [
     "EXPERT_CLASSIFIER",
     "PLACEMENT_FN",
     "Qwen35WeightSpec",
     "export_hf_weights",
     "load_hf_weights",
+    "save_hf_weights",
 ]

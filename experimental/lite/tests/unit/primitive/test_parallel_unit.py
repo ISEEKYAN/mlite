@@ -60,6 +60,16 @@ def test_pp_layout_marks_stage_boundaries_and_vpp_chunks():
     assert vpp_rank1_chunk1.has_head is True
 
 
+def test_pp_layout_rejects_non_divisible_vpp_layer_counts():
+    ps = ParallelState(pp_size=2, pp_rank=0, pp_is_first=True, pp_is_last=False)
+
+    with pytest.raises(ValueError, match="10 is not divisible by 6"):
+        build_pipeline_chunk_layout(10, ps, vpp=3)
+
+    with pytest.raises(ValueError, match="10 is not divisible by 6"):
+        build_pipeline_chunk_layout(10, ps, vpp=3, vpp_chunk_id=0)
+
+
 def test_thd_roll_keeps_sequence_boundaries():
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
     rolled, token_sum = roll_packed_thd_left(torch.arange(8), cu_seqlens_padded=cu_seqlens, dims=0)

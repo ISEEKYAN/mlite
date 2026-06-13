@@ -243,6 +243,12 @@ def build_mc_training_optimizer(
     return optimizer, finalize_grads
 
 
+def build_distopt_training_optimizer(*args, **kwargs):
+    """Build the distopt DDP+optimizer stack from a Megatron Lite model ImplConfig."""
+
+    return build_mc_training_optimizer(*args, **kwargs)
+
+
 def finalize_mc_grads(model_chunks: list[nn.Module], optimizer) -> None:
     """Run MC gradient finalization to match the optimizer's expected contract."""
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
@@ -436,6 +442,7 @@ BACKEND = MCBackend()
 __all__ = [
     "BACKEND",
     "MCBackend",
+    "build_distopt_training_optimizer",
     "build_mc_stack",
     "build_mc_training_optimizer",
     "finalize_mc_grads",

@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 from megatron.lite.primitive.parallel.cp import (
+    contiguous_to_zigzag_chunks,
     split_packed_for_cp,
     zigzag_position_ids_for_cp,
     zigzag_reconstruct_from_cp_parts,
     zigzag_slice_for_cp,
     zigzag_split_for_cp,
+    zigzag_to_contiguous_chunks,
 )
 from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
-from megatron.lite.primitive.parallel.pp import PipelineChunkLayout, build_pipeline_chunk_layout
+from megatron.lite.primitive.parallel.pp import (
+    PipelineChunkLayout,
+    build_pipeline_chunk_layout,
+)
 from megatron.lite.primitive.parallel.sp import (
     gather_for_non_sp_head,
     gather_from_sequence_parallel,
@@ -48,6 +53,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "ColumnParallelLinear",
+    "contiguous_to_zigzag_chunks",
     "PackedSeqParams",
     "PackedTHDBatch",
     "PipelineChunkLayout",
@@ -73,4 +79,5 @@ __all__ = [
     "zigzag_reconstruct_from_cp_parts",
     "zigzag_slice_for_cp",
     "zigzag_split_for_cp",
+    "zigzag_to_contiguous_chunks",
 ]

@@ -4,23 +4,29 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
-from megatron.core.jit import jit_fuser
-from megatron.lite.primitive.ops.gated_delta_rule import l2norm, torch_chunk_gated_delta_rule
-from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
-from megatron.lite.primitive.parallel.cp import (
-    zigzag_reconstruct_from_cp_parts,
-    zigzag_slice_for_cp,
+from megatron.lite.primitive.ops.gated_delta_rule import (
+    l2norm,
+    torch_chunk_gated_delta_rule,
 )
-from megatron.lite.primitive.parallel.thd import (
-    reconstruct_packed_from_cp_parts,
-    split_packed_to_cp_local,
+from megatron.lite.primitive.parallel import (
+    ColumnParallelLinear,
+    ParallelState,
+    RowParallelLinear,
+)
+from megatron.lite.primitive.parallel.cp import (
+    contiguous_to_zigzag_chunks,
+    zigzag_to_contiguous_chunks,
 )
 from megatron.lite.primitive.utils import ensure_divisible
+
+
+def jit_fuser(fn):
+    return fn
+
 
 try:
     from fla.modules.convolution import (
@@ -34,9 +40,14 @@ try:
 except ImportError:
     _HAS_FLA = False
 
+try:
+    from fla.ops.cp import build_cp_context as _fla_build_cp_context  # pyright: ignore[reportMissingImports]
+except ImportError:
+    _fla_build_cp_context = None
+
 
 class GatedDeltaNet(nn.Module):
-    """Native Gated DeltaNet with dense/packed CP reconstruction."""
+    """Native Gated DeltaNet with dense/packed all-gather CP support."""
 
     def __init__(
         self,
@@ -85,19 +96,49 @@ class GatedDeltaNet(nn.Module):
             bias=False,
             padding=linear_conv_kernel_dim - 1,
         )
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads_local, dtype=torch.float32))
-        self.A_log = nn.Parameter(torch.zeros(self.num_v_heads_local, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(
+            torch.ones(self.num_v_heads_local, dtype=torch.float32)
+        )
+        self.A_log = nn.Parameter(
+            torch.zeros(self.num_v_heads_local, dtype=torch.float32)
+        )
         self.norm = te.RMSNorm(self.dv, eps=rms_norm_eps, zero_centered_gamma=True)
         self.o_proj = RowParallelLinear(self.v_dim, hidden_size, ps, bias=False)
+        self._cp_context_cache: dict[
+            tuple[int, int, torch.device], tuple[torch.Tensor, object]
+        ] = {}
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         del position_ids
+        is_packed = packed_seq_params is not None
+        if self.ps.cp_size > 1 and is_packed:
+            raise NotImplementedError(
+                "GatedDeltaNet packed THD with all-gather CP is not validated yet."
+            )
+
         qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
-        cp_restore = None
+        cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
+        cp_context = None
         if self.ps.cp_size > 1:
-            qkvzba, cp_restore = self._gather_cp_qkvzba(qkvzba, packed_seq_params)
+            if self.ps.cp_group is None:
+                raise RuntimeError("CP>1 requires ParallelState.cp_group.")
+            if not _HAS_FLA or _fla_build_cp_context is None:
+                raise NotImplementedError(
+                    "GatedDeltaNet all-gather CP requires FLA kernels."
+                )
+            if not is_packed and qkvzba.shape[0] > 1:
+                raise ValueError(
+                    "GatedDeltaNet all-gather CP with SBHD inputs currently requires "
+                    "micro_batch_size == 1. Use packed THD input or micro_batch_size=1."
+                )
+            qkvzba = self._cp_swap_qkvzba(
+                qkvzba,
+                cu_seqlens if is_packed else None,
+                to_contiguous=True,
+            )
+            cu_seqlens, cp_context = self._build_cp_context(qkvzba, cu_seqlens)
         batch, seq_len = qkvzba.shape[:2]
         query, key, value, gate, beta, alpha = self._split_proj(qkvzba)
         qkv = torch.cat(
@@ -109,17 +150,9 @@ class GatedDeltaNet(nn.Module):
             dim=-1,
         )
 
-        cu_seqlens = None
-        if packed_seq_params is not None:
-            cu_seqlens = (
-                packed_seq_params.cu_seqlens_q_padded
-                if getattr(packed_seq_params, "cu_seqlens_q_padded", None) is not None
-                else packed_seq_params.cu_seqlens_q
-            )
-            if not _HAS_FLA:
-                raise NotImplementedError("GatedDeltaNet packed THD requires FLA kernels.")
-
-        qkv = self._causal_conv1d(qkv, seq_len, cu_seqlens=cu_seqlens)
+        qkv = self._causal_conv1d(
+            qkv, seq_len, cu_seqlens=cu_seqlens, cp_context=cp_context
+        )
         query, key, value, gate, beta, alpha = self._prepare_qkv(
             qkv, gate, beta, alpha, batch, seq_len
         )
@@ -133,66 +166,118 @@ class GatedDeltaNet(nn.Module):
             initial_state=None,
             output_final_state=False,
             cu_seqlens=cu_seqlens,
+            cp_context=cp_context,
         )
 
-        if cp_restore is not None:
-            out = self._slice_cp_output(out, cp_restore)
-            gate = self._slice_cp_output(gate, cp_restore)
-            batch, seq_len = out.shape[:2]
         out = self._apply_gated_norm(out, gate)
-        out = out.reshape(batch, seq_len, self.v_dim_local).transpose(0, 1).contiguous()
+        out = out.reshape(batch, seq_len, self.v_dim_local)
+        if self.ps.cp_size > 1:
+            out = self._cp_swap_qkvzba(
+                out,
+                cu_seqlens if is_packed else None,
+                to_contiguous=False,
+            )
+            batch, seq_len = out.shape[:2]
+        out = out.transpose(0, 1).contiguous()
         return self.o_proj(out)
 
-    def _all_gather_cp(self, tensor: torch.Tensor) -> list[torch.Tensor]:
-        if self.ps.cp_group is None:
-            raise RuntimeError("CP>1 requires ParallelState.cp_group.")
-        try:
-            from torch.distributed.nn.functional import all_gather
-
-            return list(all_gather(tensor, group=self.ps.cp_group))
-        except Exception:
-            parts = [torch.empty_like(tensor) for _ in range(self.ps.cp_size)]
-            dist.all_gather(parts, tensor, group=self.ps.cp_group)
-            return parts
-
-    def _gather_cp_qkvzba(self, qkvzba: torch.Tensor, packed_seq_params):
-        parts = self._all_gather_cp(qkvzba)
-        if packed_seq_params is not None:
-            cu_seqlens = self._packed_cu_seqlens(packed_seq_params)
-            full = reconstruct_packed_from_cp_parts(
-                parts, cu_seqlens_padded=cu_seqlens, cp_size=self.ps.cp_size, dim=1
-            )
-            return full, ("packed", cu_seqlens)
-        full = zigzag_reconstruct_from_cp_parts(parts, seq_dim=1)
-        return full, ("dense",)
-
-    def _slice_cp_output(self, out: torch.Tensor, cp_restore) -> torch.Tensor:
-        kind = cp_restore[0]
-        if kind == "packed":
-            return split_packed_to_cp_local(
-                out,
-                cu_seqlens_padded=cp_restore[1],
-                cp_size=self.ps.cp_size,
-                cp_rank=self.ps.cp_rank,
-                dim=1,
-            )
-        if kind == "dense":
-            return zigzag_slice_for_cp(out, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
-        raise RuntimeError(f"Unknown CP restore kind: {kind!r}")
-
-    def _causal_conv1d(
-        self, qkv: torch.Tensor, seq_len: int, *, cu_seqlens: torch.Tensor | None
+    def _cp_swap_qkvzba(
+        self,
+        tensor: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        *,
+        to_contiguous: bool,
     ) -> torch.Tensor:
         if cu_seqlens is None:
-            qkv_t = qkv.transpose(1, 2).contiguous()
-            return F.silu(self.conv1d(qkv_t)[:, :, :seq_len].transpose(1, 2))
+            swap = (
+                zigzag_to_contiguous_chunks
+                if to_contiguous
+                else contiguous_to_zigzag_chunks
+            )
+            return swap(tensor, self.ps.cp_group, seq_dim=1)
+        if tensor.shape[0] != 1:
+            raise ValueError(
+                "Packed THD GatedDeltaNet expects a single packed batch row."
+            )
+        local_cu_seqlens = cu_seqlens // self.ps.cp_size
+        pieces = []
+        swap = (
+            zigzag_to_contiguous_chunks
+            if to_contiguous
+            else contiguous_to_zigzag_chunks
+        )
+        for idx in range(int(local_cu_seqlens.numel()) - 1):
+            start = int(local_cu_seqlens[idx].item())
+            end = int(local_cu_seqlens[idx + 1].item())
+            if end <= start:
+                continue
+            pieces.append(swap(tensor[:, start:end, :], self.ps.cp_group, seq_dim=1))
+        if not pieces:
+            return tensor
+        return torch.cat(pieces, dim=1).contiguous()
+
+    def _build_cp_context(
+        self,
+        qkvzba: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, object]:
+        if _fla_build_cp_context is None:
+            raise NotImplementedError(
+                "GatedDeltaNet all-gather CP requires FLA cp context."
+            )
+        if cu_seqlens is not None:
+            return (
+                cu_seqlens,
+                _fla_build_cp_context(
+                    cu_seqlens=cu_seqlens,
+                    group=self.ps.cp_group,
+                    conv1d_kernel_size=self.conv1d.kernel_size[0],
+                ),
+            )
+
+        batch, local_seq_len = qkvzba.shape[:2]
+        global_seq_len = local_seq_len * self.ps.cp_size
+        cache_key = (global_seq_len, batch, qkvzba.device)
+        cached = self._cp_context_cache.get(cache_key)
+        if cached is None:
+            dense_cu_seqlens = (
+                torch.arange(batch + 1, device=qkvzba.device, dtype=torch.long)
+                * global_seq_len
+            )
+            cached = (
+                dense_cu_seqlens,
+                _fla_build_cp_context(
+                    cu_seqlens=dense_cu_seqlens,
+                    group=self.ps.cp_group,
+                    conv1d_kernel_size=self.conv1d.kernel_size[0],
+                ),
+            )
+            self._cp_context_cache[cache_key] = cached
+        return cached
+
+    def _causal_conv1d(
+        self,
+        qkv: torch.Tensor,
+        seq_len: int,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        cp_context,
+    ) -> torch.Tensor:
+        if cu_seqlens is None and cp_context is None:
+            return F.silu(
+                self.conv1d(qkv.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+            )
         if _HAS_FLA:
+            kwargs = {}
+            if cp_context is not None:
+                kwargs["cp_context"] = cp_context
             qkv, _ = _fla_causal_conv1d(
                 x=qkv,
                 weight=self.conv1d.weight.squeeze(1),
                 bias=None,
                 activation="silu",
                 cu_seqlens=cu_seqlens,
+                **kwargs,
             )
             return qkv
         raise NotImplementedError("GatedDeltaNet packed THD requires FLA causal conv.")
@@ -208,8 +293,12 @@ class GatedDeltaNet(nn.Module):
         initial_state: torch.Tensor | None,
         output_final_state: bool,
         cu_seqlens: torch.Tensor | None,
+        cp_context,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _HAS_FLA and not self.deterministic:
+        if _HAS_FLA and (cp_context is not None or not self.deterministic):
+            kwargs = {}
+            if cp_context is not None:
+                kwargs["cp_context"] = cp_context
             return _fla_chunk_gated_delta_rule(
                 query,
                 key,
@@ -220,6 +309,11 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=False,
                 cu_seqlens=cu_seqlens,
+                **kwargs,
+            )
+        if cp_context is not None:
+            raise NotImplementedError(
+                "GatedDeltaNet all-gather CP requires FLA gated delta rule."
             )
         return torch_chunk_gated_delta_rule(
             query,
@@ -239,7 +333,9 @@ class GatedDeltaNet(nn.Module):
             else packed_seq_params.cu_seqlens_q
         )
         if cu_seqlens is None:
-            raise ValueError("packed_seq_params must carry cu_seqlens_q for CP GatedDeltaNet.")
+            raise ValueError(
+                "packed_seq_params must carry cu_seqlens_q for CP GatedDeltaNet."
+            )
         return cu_seqlens
 
     def _split_proj(self, qkvzba: torch.Tensor):
@@ -264,9 +360,13 @@ class GatedDeltaNet(nn.Module):
             a.reshape(batch, seq_len, self.num_v_heads_local),
         )
 
-    def _prepare_qkv(self, qkv: torch.Tensor, gate, beta, alpha, batch: int, seq_len: int):
+    def _prepare_qkv(
+        self, qkv: torch.Tensor, gate, beta, alpha, batch: int, seq_len: int
+    ):
         query_key, value = qkv.split([2 * self.qk_dim_local, self.v_dim_local], dim=-1)
-        query_key = query_key.reshape(batch, seq_len, 2 * self.num_k_heads_local, self.dk)
+        query_key = query_key.reshape(
+            batch, seq_len, 2 * self.num_k_heads_local, self.dk
+        )
         value = value.reshape(batch, seq_len, self.num_v_heads_local, self.dv)
         query, key = query_key.split(self.num_k_heads_local, dim=2)
         query = self._l2norm(query.contiguous())
