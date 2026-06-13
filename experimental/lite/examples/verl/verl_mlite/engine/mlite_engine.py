@@ -14,8 +14,6 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
-from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
@@ -27,6 +25,84 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLi
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 
 from .config import MegatronLiteEngineConfig
+
+
+def _raise_missing_verl_engine_utils(*args, **kwargs):
+    raise RuntimeError(
+        "VERL engine utilities are unavailable because the installed VERL package imports "
+        "Megatron-Core engine modules at package import time."
+    )
+
+
+try:
+    from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
+except ModuleNotFoundError as exc:
+    if exc.name != "megatron.core":
+        raise
+    postprocess_batch_func = _raise_missing_verl_engine_utils
+    prepare_micro_batches = _raise_missing_verl_engine_utils
+
+try:
+    from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
+except ModuleNotFoundError as exc:
+    if exc.name != "megatron.core":
+        raise
+
+    class BaseEngine:
+        pass
+
+    class BaseEngineCtx:
+        def __init__(self, engine: BaseEngine, mode: str, **kwargs):
+            self.engine = engine
+            self.mode = mode
+            assert self.mode in ("train", "eval")
+            self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
+
+        def _context_switch(self, device):
+            if self.disable_auto_offload:
+                return
+            if self.mode == "eval":
+                self.engine.to(
+                    device=device,
+                    model=self.engine.is_param_offload_enabled,
+                    optimizer=False,
+                    grad=False,
+                )
+            elif self.mode == "train":
+                self.engine.to(
+                    device=device,
+                    model=self.engine.is_param_offload_enabled,
+                    optimizer=self.engine.is_optimizer_offload_enabled,
+                    grad=self.engine.is_param_offload_enabled,
+                )
+
+        def __enter__(self):
+            self._context_switch(get_device_name())
+            self.engine.mode = self.mode
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self._context_switch("cpu")
+            self.engine.mode = None
+
+    class EngineRegistry:
+        _engines = {}
+
+        @classmethod
+        def register(
+            cls, model_type: str, backend: list[str] | str, device: list[str] | str = "cuda"
+        ):
+            def decorator(engine_class):
+                cls._engines.setdefault(model_type, {})
+                backends = backend if isinstance(backend, list) else [backend]
+                devices = device if isinstance(device, list) else [device]
+                for current_backend in backends:
+                    cls._engines[model_type].setdefault(current_backend, {})
+                    for current_device in devices:
+                        cls._engines[model_type][current_backend][current_device] = engine_class
+                return engine_class
+
+            return decorator
+
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
 

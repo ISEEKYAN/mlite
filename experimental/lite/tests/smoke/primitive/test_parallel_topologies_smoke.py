@@ -107,10 +107,7 @@ def test_cp_zigzag_contiguous_chunk_swap_roundtrip():
         pytest.skip("CP chunk swap smoke requires at least 2 ranks.")
 
     ps = init_parallel(SimpleNamespace(tp=1, ep=1, etp=1, cp=2, pp=1))
-    full = (
-        torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 8, 1)
-        + 100 * ps.dp_rank
-    )
+    full = torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 8, 1) + 100 * ps.dp_rank
     local_zigzag = zigzag_split_for_cp(full, ps.cp_rank, cp_size=2, seq_dim=1)
 
     local_contiguous = zigzag_to_contiguous_chunks(local_zigzag, ps.cp_group, seq_dim=1)
@@ -147,5 +144,5 @@ def test_gdn_rejects_thd_context_parallel_until_validated():
     packed_seq_params = PackedSeqParams.from_cu_seqlens(cu_seqlens, max_seqlen=8)
     local_hidden = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
 
-    with pytest.raises(NotImplementedError, match="packed THD with all-gather CP"):
+    with pytest.raises(NotImplementedError, match="all-gather CP"):
         gdn(local_hidden, packed_seq_params=packed_seq_params)

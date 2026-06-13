@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any
 
@@ -278,7 +278,7 @@ def _build_transformer_config(model_cfg, engine_cfg):
     )
     if hasattr(model_cfg, "add_bias_linear"):
         kwargs["add_bias_linear"] = bool(model_cfg.add_bias_linear)
-    elif kwargs["num_moe_experts"] is not None and kwargs["expert_tensor_parallel_size"] > 1:
+    elif kwargs["num_moe_experts"] is not None:
         kwargs["add_bias_linear"] = False
     if p.pp > 1:
         kwargs["pipeline_dtype"] = torch.bfloat16
@@ -379,7 +379,7 @@ def _build_pg_collection(ps, engine_cfg):
         if mp_group is None or tp_ep_pp_group is None:
             raise RuntimeError("Failed to construct mc pipeline-aware process groups.")
 
-    return ProcessGroupCollection(
+    pg_kwargs = dict(
         tp=ps.tp_group,
         cp=ps.cp_group,
         pp=ps.pp_group,
@@ -399,6 +399,10 @@ def _build_pg_collection(ps, engine_cfg):
         # without falling back to the global MCore embedding group.
         embd=singleton_group,
         pos_embd=singleton_group,
+    )
+    supported_fields = {field.name for field in fields(ProcessGroupCollection)}
+    return ProcessGroupCollection(
+        **{key: value for key, value in pg_kwargs.items() if key in supported_fields}
     )
 
 

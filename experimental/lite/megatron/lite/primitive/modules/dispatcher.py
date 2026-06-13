@@ -8,13 +8,10 @@ import os
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
-from megatron.core.transformer.moe.moe_utils import (  # pyright: ignore[reportMissingImports]
-    permute,
-    unpermute,
-)
 from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils.moe import permute, unpermute
 
 try:
     import deep_ep  # pyright: ignore[reportMissingImports]
