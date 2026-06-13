@@ -2,9 +2,7 @@
 """Qwen3.5 lite native model.
 
 This implementation keeps the lightweight qwen3_moe/lite composition style
-and does not wrap Megatron-Core layer modules. It still reuses Megatron Lite
-parallel/TE primitives and small Megatron atomic RoPE helpers where those are
-already used by other native Megatron Lite modules.
+and uses Megatron Lite parallel, TE, RoPE, and MoE primitives directly.
 """
 
 from __future__ import annotations
@@ -16,15 +14,19 @@ import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
 from megatron.lite.primitive.modules.gqa import split_grouped_qkvg as _split_grouped_qkvg
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding as Qwen35MRoPE
-from megatron.lite.primitive.modules.mtp import MTPBlock, MTPDecoderLayer, MTPLossAutoScaler
+from megatron.lite.primitive.modules.mtp import (
+    MTPBlock,
+    MTPDecoderLayer,
+    MTPLossAutoScaler,
+    roll_mtp_tensor_left,
+)
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -37,7 +39,6 @@ from megatron.lite.primitive.parallel import (
     VocabParallelOutput,
     build_pipeline_chunk_layout,
     gather_from_sequence_parallel,
-    roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
@@ -66,7 +67,7 @@ def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
 
 
 def _swiglu(x: torch.Tensor) -> torch.Tensor:
-    return bias_swiglu_impl(x, bias=None)
+    return swiglu_with_probs(x, probs=None)
 
 
 def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
@@ -231,6 +232,7 @@ class Qwen35Layer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         deterministic: bool = False,
+        gdn_cp_mode: str = "fla_allgather",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -264,6 +266,7 @@ class Qwen35Layer(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 ps=ps,
                 deterministic=deterministic,
+                cp_mode=gdn_cp_mode,
             )
         self.mlp_norm = te.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
@@ -332,6 +335,7 @@ class Qwen35Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
+        gdn_cp_mode: str = "fla_allgather",
     ):
         super().__init__()
         del attention_backend_override
@@ -373,6 +377,7 @@ class Qwen35Model(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     deterministic=getattr(train_config, "deterministic", False),
+                    gdn_cp_mode=gdn_cp_mode,
                 )
                 for idx in self.layer_indices
             ]
@@ -410,6 +415,7 @@ class Qwen35Model(nn.Module):
                         moe_act_recompute=moe_act_recompute,
                         use_thd=use_thd,
                         deterministic=getattr(train_config, "deterministic", False),
+                        gdn_cp_mode=gdn_cp_mode,
                     ),
                     detach_encoder=mtp_detach_encoder,
                 )
@@ -552,10 +558,10 @@ class Qwen35Model(nn.Module):
         mtp_loss_mask = loss_mask.clone()
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
-            mtp_labels, _ = roll_packed_thd_left(
+            mtp_labels, _ = roll_mtp_tensor_left(
                 mtp_labels, packed_seq_params=packed_seq_params, dims=-1
             )
-            mtp_loss_mask, num_tokens = roll_packed_thd_left(
+            mtp_loss_mask, num_tokens = roll_mtp_tensor_left(
                 mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1
             )
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
