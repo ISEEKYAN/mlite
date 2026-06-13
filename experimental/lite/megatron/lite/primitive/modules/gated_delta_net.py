@@ -19,7 +19,13 @@ from megatron.lite.primitive.parallel import (
 )
 from megatron.lite.primitive.parallel.cp import (
     contiguous_to_zigzag_chunks,
+    zigzag_reconstruct_from_cp_parts,
+    zigzag_slice_for_cp,
     zigzag_to_contiguous_chunks,
+)
+from megatron.lite.primitive.parallel.thd import (
+    reconstruct_packed_from_cp_parts,
+    split_packed_to_cp_local,
 )
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -63,10 +69,14 @@ class GatedDeltaNet(nn.Module):
         rms_norm_eps: float,
         ps: ParallelState,
         deterministic: bool = False,
+        cp_mode: str = "fla_allgather",
     ):
         super().__init__()
+        if cp_mode not in {"fla_allgather", "legacy_full_gather"}:
+            raise ValueError(f"Unsupported GatedDeltaNet CP mode: {cp_mode!r}.")
         self.ps = ps
         self.deterministic = bool(deterministic)
+        self.cp_mode = cp_mode
         self.num_k_heads = linear_num_key_heads
         self.num_v_heads = linear_num_value_heads
         self.dk = linear_key_head_dim
@@ -115,32 +125,32 @@ class GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         del position_ids
         is_packed = packed_seq_params is not None
-        if self.ps.cp_size > 1 and is_packed:
-            raise NotImplementedError(
-                "GatedDeltaNet packed THD with all-gather CP is not validated yet."
-            )
-
         qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
         cp_context = None
+        legacy_full_gather = False
         if self.ps.cp_size > 1:
             if self.ps.cp_group is None:
                 raise RuntimeError("CP>1 requires ParallelState.cp_group.")
-            if not _HAS_FLA or _fla_build_cp_context is None:
-                raise NotImplementedError(
-                    "GatedDeltaNet all-gather CP requires FLA kernels."
+            if self.cp_mode == "legacy_full_gather":
+                qkvzba, cu_seqlens = self._legacy_full_gather_qkvzba(qkvzba, cu_seqlens)
+                legacy_full_gather = True
+            else:
+                if not _HAS_FLA or _fla_build_cp_context is None:
+                    raise NotImplementedError(
+                        "GatedDeltaNet all-gather CP requires FLA kernels."
+                    )
+                if not is_packed and qkvzba.shape[0] > 1:
+                    raise ValueError(
+                        "GatedDeltaNet all-gather CP with SBHD inputs currently requires "
+                        "micro_batch_size == 1. Use packed THD input or micro_batch_size=1."
+                    )
+                qkvzba = self._cp_swap_qkvzba(
+                    qkvzba,
+                    cu_seqlens if is_packed else None,
+                    to_contiguous=True,
                 )
-            if not is_packed and qkvzba.shape[0] > 1:
-                raise ValueError(
-                    "GatedDeltaNet all-gather CP with SBHD inputs currently requires "
-                    "micro_batch_size == 1. Use packed THD input or micro_batch_size=1."
-                )
-            qkvzba = self._cp_swap_qkvzba(
-                qkvzba,
-                cu_seqlens if is_packed else None,
-                to_contiguous=True,
-            )
-            cu_seqlens, cp_context = self._build_cp_context(qkvzba, cu_seqlens)
+                cu_seqlens, cp_context = self._build_cp_context(qkvzba, cu_seqlens)
         batch, seq_len = qkvzba.shape[:2]
         query, key, value, gate, beta, alpha = self._split_proj(qkvzba)
         qkv = torch.cat(
@@ -174,14 +184,66 @@ class GatedDeltaNet(nn.Module):
         out = self._apply_gated_norm(out, gate)
         out = out.reshape(batch, seq_len, self.v_dim_local)
         if self.ps.cp_size > 1:
-            out = self._cp_swap_qkvzba(
-                out,
-                cu_seqlens if is_packed else None,
-                to_contiguous=False,
-            )
+            if legacy_full_gather:
+                out = self._legacy_slice_output(out, cu_seqlens)
+            else:
+                out = self._cp_swap_qkvzba(
+                    out,
+                    cu_seqlens if is_packed else None,
+                    to_contiguous=False,
+                )
             batch, seq_len = out.shape[:2]
         out = out.transpose(0, 1).contiguous()
         return self.o_proj(out)
+
+    def _all_gather_cp_tensor(self, tensor: torch.Tensor) -> list[torch.Tensor]:
+        if self.ps.cp_size <= 1:
+            return [tensor]
+        try:
+            from torch.distributed.nn.functional import all_gather
+
+            return list(all_gather(tensor, group=self.ps.cp_group))
+        except Exception:
+            parts = [torch.empty_like(tensor) for _ in range(self.ps.cp_size)]
+            torch.distributed.all_gather(parts, tensor, group=self.ps.cp_group)
+            return parts
+
+    def _legacy_full_gather_qkvzba(
+        self,
+        qkvzba: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if cu_seqlens is None:
+            parts = self._all_gather_cp_tensor(qkvzba)
+            return zigzag_reconstruct_from_cp_parts(parts, seq_dim=1), None
+        if qkvzba.shape[0] != 1:
+            raise ValueError("Packed THD GatedDeltaNet expects a single packed batch row.")
+        parts = self._all_gather_cp_tensor(qkvzba[0].contiguous())
+        full = reconstruct_packed_from_cp_parts(
+            parts,
+            cu_seqlens_padded=cu_seqlens,
+            cp_size=self.ps.cp_size,
+            dim=0,
+        )
+        return full.unsqueeze(0).contiguous(), cu_seqlens
+
+    def _legacy_slice_output(
+        self,
+        out: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if cu_seqlens is None:
+            return zigzag_slice_for_cp(out, self.ps.cp_rank, self.ps.cp_size, seq_dim=1)
+        if out.shape[0] != 1:
+            raise ValueError("Packed THD GatedDeltaNet expects a single packed batch row.")
+        local = split_packed_to_cp_local(
+            out[0].contiguous(),
+            cu_seqlens_padded=cu_seqlens,
+            cp_size=self.ps.cp_size,
+            cp_rank=self.ps.cp_rank,
+            dim=0,
+        )
+        return local.unsqueeze(0).contiguous()
 
     def _cp_swap_qkvzba(
         self,

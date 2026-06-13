@@ -58,6 +58,7 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
+    gdn_cp_mode: str = "fla_allgather"
 
 
 def _full_attn_module(layer, name: str):
@@ -177,6 +178,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         mount_vision_model=impl_cfg.mount_vision_model,
+        gdn_cp_mode=impl_cfg.gdn_cp_mode,
     )
 
     if vpp is None:

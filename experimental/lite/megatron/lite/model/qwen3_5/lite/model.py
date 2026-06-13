@@ -232,6 +232,7 @@ class Qwen35Layer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         deterministic: bool = False,
+        gdn_cp_mode: str = "fla_allgather",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -265,6 +266,7 @@ class Qwen35Layer(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 ps=ps,
                 deterministic=deterministic,
+                cp_mode=gdn_cp_mode,
             )
         self.mlp_norm = te.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
@@ -333,6 +335,7 @@ class Qwen35Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
+        gdn_cp_mode: str = "fla_allgather",
     ):
         super().__init__()
         del attention_backend_override
@@ -374,6 +377,7 @@ class Qwen35Model(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     deterministic=getattr(train_config, "deterministic", False),
+                    gdn_cp_mode=gdn_cp_mode,
                 )
                 for idx in self.layer_indices
             ]
@@ -411,6 +415,7 @@ class Qwen35Model(nn.Module):
                         moe_act_recompute=moe_act_recompute,
                         use_thd=use_thd,
                         deterministic=getattr(train_config, "deterministic", False),
+                        gdn_cp_mode=gdn_cp_mode,
                     ),
                     detach_encoder=mtp_detach_encoder,
                 )
