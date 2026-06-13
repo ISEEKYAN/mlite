@@ -45,6 +45,8 @@ try:
 except ImportError:
     _fla_build_cp_context = None
 
+_CONV_PAD_ALIGNMENT = 4096
+
 
 class GatedDeltaNet(nn.Module):
     """Native Gated DeltaNet with dense/packed all-gather CP support."""
@@ -263,23 +265,34 @@ class GatedDeltaNet(nn.Module):
         cu_seqlens: torch.Tensor | None,
         cp_context,
     ) -> torch.Tensor:
-        if cu_seqlens is None and cp_context is None:
-            return F.silu(
-                self.conv1d(qkv.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
-            )
-        if _HAS_FLA:
+        if _HAS_FLA and (cp_context is not None or cu_seqlens is not None or not self.deterministic):
+            orig_seq_len = qkv.shape[1]
+            pad_n = 0 if cp_context is not None else (-orig_seq_len % _CONV_PAD_ALIGNMENT)
+            conv_input = qkv
+            conv_cu_seqlens = cu_seqlens
+            if pad_n > 0:
+                conv_input = F.pad(qkv, (0, 0, 0, pad_n))
+                if conv_cu_seqlens is not None:
+                    conv_cu_seqlens = conv_cu_seqlens.clone()
+                    conv_cu_seqlens[-1] += pad_n
             kwargs = {}
             if cp_context is not None:
                 kwargs["cp_context"] = cp_context
             qkv, _ = _fla_causal_conv1d(
-                x=qkv,
+                x=conv_input,
                 weight=self.conv1d.weight.squeeze(1),
                 bias=None,
                 activation="silu",
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=conv_cu_seqlens,
                 **kwargs,
             )
+            if pad_n > 0:
+                qkv = qkv[:, :orig_seq_len, :]
             return qkv
+        if cu_seqlens is None and cp_context is None:
+            return F.silu(
+                self.conv1d(qkv.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+            )
         raise NotImplementedError("GatedDeltaNet packed THD requires FLA causal conv.")
 
     def _gated_delta_rule(
