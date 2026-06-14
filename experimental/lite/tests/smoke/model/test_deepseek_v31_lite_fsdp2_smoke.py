@@ -13,11 +13,11 @@ def _init_dist_or_skip():
     import torch.distributed as dist
 
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for GLM5 FSDP2 smoke.")
+        pytest.skip("CUDA is required for DeepSeek-V3.1 FSDP2 smoke.")
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Run with torchrun so FSDP2 ranks are available.")
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-        pytest.skip("GLM5 FSDP2 smoke requires at least 2 ranks.")
+        pytest.skip("DeepSeek-V3.1 FSDP2 smoke requires at least 2 ranks.")
     if int(os.environ.get("WORLD_SIZE", "1")) > 8:
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
@@ -65,11 +65,11 @@ def _tiny_config_kwargs():
     )
 
 
-def test_glm5_tiny_model_builds_and_steps_with_fsdp2_backend(cuda_dist):
+def test_deepseek_v31_tiny_model_builds_and_steps_with_fsdp2_backend(cuda_dist):
     import torch
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite import protocol
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite import protocol
     from megatron.lite.primitive.optimizers.fsdp2 import FSDP2Optimizer, fsdp2_available
     from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
@@ -77,7 +77,7 @@ def test_glm5_tiny_model_builds_and_steps_with_fsdp2_backend(cuda_dist):
         pytest.skip("Installed PyTorch does not expose FSDP2 fully_shard.")
 
     device = cuda_dist
-    cfg = Glm5Config(**_tiny_config_kwargs())
+    cfg = DeepSeekV31Config(**_tiny_config_kwargs())
     impl_cfg = protocol.ImplConfig(
         parallel=ParallelConfig(),
         optimizer="fsdp2",

@@ -7,6 +7,8 @@ import importlib
 import json
 from pathlib import Path
 
+from megatron.lite.model.deepseek_v31.config import DEEPSEEK_V31_HF_MODEL_TYPES
+
 # ---------------------------------------------------------------------------
 # Registry tables (populated by register_model)
 # ---------------------------------------------------------------------------
@@ -100,10 +102,10 @@ register_model(
 )
 
 register_model(
-    "glm5",
-    package="megatron.lite.model.glm5",
-    hf_model_types=["glm_moe_dsa"],
-    impls={"lite": "megatron.lite.model.glm5.lite.protocol"},
+    "deepseek_v31",
+    package="megatron.lite.model.deepseek_v31",
+    hf_model_types=list(DEEPSEEK_V31_HF_MODEL_TYPES),
+    impls={"lite": "megatron.lite.model.deepseek_v31.lite.protocol"},
 )
 
 

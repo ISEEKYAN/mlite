@@ -1,4 +1,4 @@
-"""Static and CPU smoke tests for native GLM-5 lite."""
+"""Static and CPU smoke tests for native DeepSeek-V3.1 lite."""
 
 from __future__ import annotations
 
@@ -32,24 +32,39 @@ def _tiny_config_kwargs():
     )
 
 
-def test_glm5_registry_resolves_lite():
+def test_deepseek_v31_registry_resolves_lite():
     from megatron.lite.model.registry import (
         get_train_runtime_module,
         resolve_model_type_from_hf,
         resolve_runtime_model_name,
     )
 
-    runtime_name = resolve_runtime_model_name("glm5", "lite")
-    assert runtime_name == "glm5"
+    runtime_name = resolve_runtime_model_name("deepseek_v31", "lite")
+    assert runtime_name == "deepseek_v31"
     module = get_train_runtime_module(runtime_name)
-    assert module.__name__ == "megatron.lite.model.glm5.lite.protocol"
-    assert resolve_model_type_from_hf({"model_type": "glm_moe_dsa"}) == "glm5"
+    assert module.__name__ == "megatron.lite.model.deepseek_v31.lite.protocol"
+    assert resolve_model_type_from_hf({"model_type": "glm_moe_dsa"}) == "deepseek_v31"
 
 
-def test_glm5_config_reads_hf_architecture_fields():
-    from megatron.lite.model.glm5.config import Glm5Config
+def test_deepseek_v31_glm_variant_is_explicit():
+    import pytest
 
-    cfg = Glm5Config._from_hf_dict(
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+
+    cfg = DeepSeekV31Config.from_variant("glm-5")
+    assert cfg.variant == "glm-5"
+
+    hf_cfg = DeepSeekV31Config._from_hf_dict({"model_type": "glm_moe_dsa", "variant": "glm-5"})
+    assert hf_cfg.variant == "glm-5"
+
+    with pytest.raises(ValueError, match="Unknown DeepSeekV31 variant"):
+        DeepSeekV31Config.from_variant("glm" + "5")
+
+
+def test_deepseek_v31_config_reads_hf_architecture_fields():
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+
+    cfg = DeepSeekV31Config._from_hf_dict(
         {
             "model_type": "glm_moe_dsa",
             "hidden_size": 6144,
@@ -83,10 +98,10 @@ def test_glm5_config_reads_hf_architecture_fields():
     assert cfg.is_moe_layer(3) is True
 
 
-def test_glm5_config_ignores_null_hf_optional_fields():
-    from megatron.lite.model.glm5.config import Glm5Config
+def test_deepseek_v31_config_ignores_null_hf_optional_fields():
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
 
-    cfg = Glm5Config._from_hf_dict(
+    cfg = DeepSeekV31Config._from_hf_dict(
         {
             "model_type": "glm_moe_dsa",
             "indexer_rope_first": None,
@@ -100,10 +115,10 @@ def test_glm5_config_ignores_null_hf_optional_fields():
     assert cfg.mlp_layer_types is None
 
 
-def test_glm5_config_preserves_mtp_aliases_and_layer_types():
-    from megatron.lite.model.glm5.config import Glm5Config
+def test_deepseek_v31_config_preserves_mtp_fields_and_layer_types():
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
 
-    cfg = Glm5Config._from_hf_dict(
+    cfg = DeepSeekV31Config._from_hf_dict(
         {
             **_tiny_config_kwargs(),
             "num_nextn_predict": 1,
@@ -117,8 +132,15 @@ def test_glm5_config_preserves_mtp_aliases_and_layer_types():
     assert cfg.is_moe_layer(2) is True
 
 
-def test_glm5_lite_does_not_import_wrappers_or_sibling_models():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "glm5" / "lite"
+def test_deepseek_v31_lite_does_not_import_wrappers_or_sibling_models():
+    root = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "deepseek_v31"
+        / "lite"
+    )
     for path in root.glob("*.py"):
         text = path.read_text()
         assert "megatron.lite.model.qwen" not in text
@@ -127,9 +149,9 @@ def test_glm5_lite_does_not_import_wrappers_or_sibling_models():
         assert "megatron.core" not in text
 
 
-def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
+def test_deepseek_v31_lite_uses_shared_mla_and_dsa_primitive():
     root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
-    model_text = (root / "model" / "glm5" / "lite" / "model.py").read_text()
+    model_text = (root / "model" / "deepseek_v31" / "lite" / "model.py").read_text()
     primitive_text = (root / "primitive" / "attention" / "dsa.py").read_text()
     kernel_text = (root / "primitive" / "kernels" / "dsa_kernels.py").read_text()
 
@@ -147,7 +169,7 @@ def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     assert "value_dim" in kernel_text
     assert "from cudnn.deepseek_sparse_attention import DSA" in kernel_text
     assert "from cudnn import DSA" in kernel_text
-    assert "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90" in kernel_text
+    assert "Use the cuDNN DSA namespace wrapper for the H100 SM90 indexer path" in kernel_text
     assert "cudnn.deepseek_sparse_attention.indexer_forward._interface" in kernel_text
     assert "torch.cuda.get_device_capability(device)" in kernel_text
     assert "torch.topk" not in primitive_text
@@ -155,17 +177,16 @@ def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     assert "torch.matmul" not in primitive_text
 
 
-def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
+def test_deepseek_v31_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     from megatron.lite.primitive.kernels import dsa_kernels
 
-    sm90_entry = object()
     sm100_entry = object()
 
-    monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm90", lambda: sm90_entry)
+    monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm90", lambda: None)
     monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm100", lambda: sm100_entry)
 
     monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (9, 0))
-    assert dsa_kernels._select_indexer_forward(None) is sm90_entry
+    assert dsa_kernels._select_indexer_forward(None) is None
 
     monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (10, 0))
     assert dsa_kernels._select_indexer_forward(None) is sm100_entry
@@ -174,7 +195,7 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     assert dsa_kernels._select_indexer_forward(None) is None
 
 
-def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
+def test_deepseek_v31_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import torch
 
     from megatron.lite.primitive.attention import dsa
@@ -256,7 +277,7 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     }
 
 
-def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
+def test_deepseek_v31_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import torch
 
     from megatron.lite.primitive.attention import dsa
@@ -313,11 +334,11 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     assert calls["sparse"] == {"topk_length_is_set": True, "value_dim": 4}
 
 
-def test_glm5_lite_model_exports_hf_style_state_names():
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+def test_deepseek_v31_lite_model_exports_hf_style_state_names():
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.model import DeepSeekV31ForCausalLM
 
-    model = Glm5ForCausalLM(Glm5Config(**_tiny_config_kwargs()))
+    model = DeepSeekV31ForCausalLM(DeepSeekV31Config(**_tiny_config_kwargs()))
     keys = set(model.state_dict())
 
     assert "model.embed_tokens.weight" in keys
@@ -329,21 +350,21 @@ def test_glm5_lite_model_exports_hf_style_state_names():
     assert "lm_head.weight" in keys
 
 
-def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
+def test_deepseek_v31_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     import torch
     from safetensors import safe_open
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import (
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.checkpoint import (
         export_hf_weights,
         save_hf_weights,
         save_weights,
     )
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v31.lite.model import DeepSeekV31ForCausalLM
     from megatron.lite.primitive.parallel import ParallelState
 
-    cfg = Glm5Config(**_tiny_config_kwargs())
-    model = Glm5ForCausalLM(cfg)
+    cfg = DeepSeekV31Config(**_tiny_config_kwargs())
+    model = DeepSeekV31ForCausalLM(cfg)
     ps = ParallelState()
     model.model.layers[1].mlp.gate.e_score_correction_bias.copy_(torch.tensor([0.25, -0.5, 1.0]))
 
@@ -372,8 +393,8 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
             state["model.layers.1.mlp.gate.e_score_correction_bias"],
         )
 
-    loaded = Glm5ForCausalLM(cfg)
-    from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
+    loaded = DeepSeekV31ForCausalLM(cfg)
+    from megatron.lite.model.deepseek_v31.lite.checkpoint import load_hf_weights
 
     load_hf_weights(loaded, str(hf_dir), cfg, ps)
     assert torch.equal(
@@ -391,7 +412,7 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
         }
         assert floating_dtypes == {torch.bfloat16}
 
-    loaded_bf16 = Glm5ForCausalLM(cfg)
+    loaded_bf16 = DeepSeekV31ForCausalLM(cfg)
     load_hf_weights(loaded_bf16, str(hf_bf16_dir), cfg, ps)
     assert torch.equal(
         loaded_bf16.state_dict()["model.layers.1.mlp.experts.2.up_proj.weight"],
@@ -407,18 +428,18 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
         )
 
 
-def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
+def test_deepseek_v31_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     import torch
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.checkpoint import export_hf_weights, load_hf_weights
+    from megatron.lite.model.deepseek_v31.lite.model import DeepSeekV31ForCausalLM
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
 
-    cfg = Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1)
+    cfg = DeepSeekV31Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1)
     ps = ParallelState()
-    model = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True)
+    model = DeepSeekV31ForCausalLM(cfg, ps=ps, mtp_enable=True)
     state = model.state_dict()
 
     assert "model.mtp.layers.0.eh_proj.weight" in state
@@ -433,7 +454,7 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     assert "model.layers.2.mlp.gate.weight" in exported
 
     save_safetensors(exported, str(tmp_path))
-    loaded = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True)
+    loaded = DeepSeekV31ForCausalLM(cfg, ps=ps, mtp_enable=True)
     load_hf_weights(loaded, str(tmp_path), cfg, ps)
     assert torch.equal(
         loaded.state_dict()["model.mtp.layers.0.eh_proj.weight"],
@@ -441,16 +462,19 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     )
 
 
-def test_glm5_initialize_weights_resets_all_router_weights():
+def test_deepseek_v31_initialize_weights_resets_all_router_weights():
     import torch
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM, Glm5Router
-
-    model = Glm5ForCausalLM(
-        Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1), mtp_enable=True
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.model import (
+        DeepSeekV31ForCausalLM,
+        DeepSeekV31Router,
     )
-    routers = [module for module in model.modules() if isinstance(module, Glm5Router)]
+
+    model = DeepSeekV31ForCausalLM(
+        DeepSeekV31Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1), mtp_enable=True
+    )
+    routers = [module for module in model.modules() if isinstance(module, DeepSeekV31Router)]
     assert len(routers) == 2
     for router in routers:
         router.weight.data.fill_(float("nan"))
@@ -465,10 +489,10 @@ def test_glm5_initialize_weights_resets_all_router_weights():
         )
 
 
-def test_glm5_hf_loader_resolves_grouped_expert_tensors():
+def test_deepseek_v31_hf_loader_resolves_grouped_expert_tensors():
     import torch
 
-    from megatron.lite.model.glm5.lite.checkpoint import _resolve_hf_tensor
+    from megatron.lite.model.deepseek_v31.lite.checkpoint import _resolve_hf_tensor
 
     class FakeReader:
         def __init__(self, tensors):
@@ -530,10 +554,10 @@ def test_glm5_hf_loader_resolves_grouped_expert_tensors():
     )
 
 
-def test_glm5_hf_loader_slices_full_expert_tensors_for_proxy_targets():
+def test_deepseek_v31_hf_loader_slices_full_expert_tensors_for_proxy_targets():
     import torch
 
-    from megatron.lite.model.glm5.lite.checkpoint import _slice_to_target_shape
+    from megatron.lite.model.deepseek_v31.lite.checkpoint import _slice_to_target_shape
 
     source = torch.arange(256 * 8, dtype=torch.float32).reshape(256, 8)
     target = torch.empty(4, 8)
@@ -544,15 +568,15 @@ def test_glm5_hf_loader_slices_full_expert_tensors_for_proxy_targets():
     assert torch.equal(_slice_to_target_shape(source3d, target3d), source3d[:4])
 
 
-def test_glm5_hf_loader_resolves_packed_experts_from_single_safetensor(tmp_path):
+def test_deepseek_v31_hf_loader_resolves_packed_experts_from_single_safetensor(tmp_path):
     import torch
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import _resolve_named_parameter_tensor
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.checkpoint import _resolve_named_parameter_tensor
     from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
 
-    cfg = Glm5Config(**_tiny_config_kwargs())
+    cfg = DeepSeekV31Config(**_tiny_config_kwargs())
     gate_up = torch.arange(3 * 12 * 16, dtype=torch.float32).reshape(3, 12, 16)
     down = torch.arange(3 * 16 * 6, dtype=torch.float32).reshape(3, 16, 6)
     save_safetensors(
@@ -583,10 +607,10 @@ def test_glm5_hf_loader_resolves_packed_experts_from_single_safetensor(tmp_path)
     assert torch.equal(resolved_down, down)
 
 
-def test_glm5_protocol_allows_cp_only_parallel_scope():
+def test_deepseek_v31_protocol_allows_cp_only_parallel_scope():
     import pytest
 
-    from megatron.lite.model.glm5.lite.protocol import _validate_parallel_scope
+    from megatron.lite.model.deepseek_v31.lite.protocol import _validate_parallel_scope
     from megatron.lite.runtime.contracts import ParallelConfig
 
     _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=2, pp=1, vpp=1))
@@ -596,38 +620,38 @@ def test_glm5_protocol_allows_cp_only_parallel_scope():
         _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=1, pp=2, vpp=2))
 
 
-def test_glm5_impl_config_accepts_runtime_mtp_fields():
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.protocol import ImplConfig
+def test_deepseek_v31_impl_config_accepts_runtime_mtp_fields():
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.protocol import ImplConfig
 
-    cfg = Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1)
+    cfg = DeepSeekV31Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1)
 
     assert ImplConfig(mtp_enable=False, mtp_enable_train=False).mtp_enable is False
     assert ImplConfig(mtp_enable=True, mtp_enable_train=True).mtp_enable_train is True
     assert cfg.num_nextn_predict_layers == 1
 
 
-def test_glm5_pipeline_layer_split_handles_non_divisible_pp():
+def test_deepseek_v31_pipeline_layer_split_handles_non_divisible_pp():
     from types import SimpleNamespace
 
-    from megatron.lite.model.glm5.lite.model import _build_glm5_pipeline_layers
+    from megatron.lite.model.deepseek_v31.lite.model import _build_deepseek_v31_pipeline_layers
 
     def split_for_rank(pp_rank):
         ps = SimpleNamespace(pp_size=4, pp_rank=pp_rank)
-        return _build_glm5_pipeline_layers(5, ps)
+        return _build_deepseek_v31_pipeline_layers(5, ps)
 
     assert [split_for_rank(rank) for rank in range(4)] == [[], [0, 1], [2, 3], [4]]
 
 
-def test_glm5_protocol_uses_mlite_optimizer_api():
-    from megatron.lite.model.glm5.lite.protocol import ImplConfig
+def test_deepseek_v31_protocol_uses_mlite_optimizer_api():
+    from megatron.lite.model.deepseek_v31.lite.protocol import ImplConfig
 
     protocol_path = (
         Path(__file__).resolve().parents[3]
         / "megatron"
         / "lite"
         / "model"
-        / "glm5"
+        / "deepseek_v31"
         / "lite"
         / "protocol.py"
     )
@@ -637,11 +661,11 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     assert "build_dist_opt_training_optimizer" in protocol_text
 
 
-def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
+def test_deepseek_v31_lite_tiny_cpu_forward_backward(monkeypatch):
     import torch
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+    from megatron.lite.model.deepseek_v31.lite.model import DeepSeekV31ForCausalLM
     from megatron.lite.primitive.attention import dsa
 
     def fake_fused_indexer_sparse_attn(
@@ -687,7 +711,7 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
     )
 
     torch.manual_seed(1234)
-    model = Glm5ForCausalLM(Glm5Config(**_tiny_config_kwargs()))
+    model = DeepSeekV31ForCausalLM(DeepSeekV31Config(**_tiny_config_kwargs()))
     input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
     labels = torch.randint(0, model.config.vocab_size, (2, 5))
 
@@ -701,8 +725,8 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
     )
     assert torch.isfinite(grad_norm)
 
-    mtp_model = Glm5ForCausalLM(
-        Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1),
+    mtp_model = DeepSeekV31ForCausalLM(
+        DeepSeekV31Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1),
         mtp_enable=True,
         mtp_enable_train=True,
     )

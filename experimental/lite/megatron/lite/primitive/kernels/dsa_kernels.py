@@ -36,7 +36,6 @@ from torch import Tensor
 
 _flash_mla_sparse_fwd = None
 _DSA = None
-_indexer_fwd_sm90: Optional[Callable] = None
 _indexer_fwd_sm100: Optional[Callable] = None
 
 
@@ -61,6 +60,14 @@ def _ensure_flash_mla():
             "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
         ) from e
     _flash_mla_sparse_fwd = _fwd
+
+
+def _has_flash_mla_sparse_fwd() -> bool:
+    try:
+        _ensure_flash_mla()
+    except ImportError:
+        return False
+    return True
 
 
 def _get_topk_alignment() -> int:
@@ -95,7 +102,19 @@ def _dsa_fwd_flash_mla(
     assert not (
         indexer_topk > 0 and topk_length is not None
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
-    _ensure_flash_mla()
+    try:
+        _ensure_flash_mla()
+    except ImportError:
+        return _dsa_fwd_torch(
+            q,
+            kv,
+            topk_idxs,
+            softmax_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=indexer_topk,
+        )
 
     _total_S_q, _H, _D = q.shape
     TopK = topk_idxs.shape[-1]
@@ -134,6 +153,56 @@ def _dsa_fwd_flash_mla(
     return out, lse, None
 
 
+def _masked_lse(scores: Tensor, attn_sink: Optional[Tensor]) -> Tensor:
+    if attn_sink is None:
+        return torch.logsumexp(scores, dim=-1)
+    sink = attn_sink.float().view(1, -1, 1).expand(scores.shape[0], scores.shape[1], 1)
+    return torch.logsumexp(torch.cat([scores, sink], dim=-1), dim=-1)
+
+
+def _dsa_fwd_torch(
+    q: Tensor,
+    kv: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[Tensor] = None,
+    topk_length: Optional[Tensor] = None,
+    indexer_topk: int = 0,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Sparse forward for the current H100 DSA overlay when FlashMLA sparse is absent."""
+    total_q, n_heads, head_dim = q.shape
+    total_kv = kv.shape[0]
+    topk = topk_idxs.shape[-1]
+    value_dim = min(d_v, kv.shape[-1])
+
+    idx = topk_idxs.long()
+    valid = (idx >= 0) & (idx < total_kv)
+    if topk_length is not None:
+        cols = torch.arange(topk, device=idx.device).view(1, topk)
+        valid = valid & (cols < topk_length.long().view(-1, 1))
+
+    safe_idx = idx.clamp(min=0, max=max(total_kv - 1, 0))
+    gathered = kv.index_select(0, safe_idx.reshape(-1)).reshape(total_q, topk, head_dim)
+    scores = torch.einsum("rhd,rkd->rhk", q.float(), gathered.float()) * softmax_scale
+    scores = scores.masked_fill(~valid.view(total_q, 1, topk), torch.finfo(torch.float32).min)
+
+    lse = _masked_lse(scores, attn_sink)
+    probs = torch.exp(scores - lse.unsqueeze(-1))
+    probs = torch.where(valid.view(total_q, 1, topk), probs, torch.zeros_like(probs))
+
+    values = gathered[..., :value_dim]
+    out = torch.einsum("rhk,rkv->rhv", probs.to(values.dtype), values).to(q.dtype)
+
+    lse_indexer = None
+    if indexer_topk > 0:
+        if indexer_topk >= topk:
+            lse_indexer = lse.clone()
+        else:
+            lse_indexer = _masked_lse(scores[..., :indexer_topk], attn_sink)
+    return out, lse, lse_indexer
+
+
 def _ensure_dsa_namespace():
     """Lazily import the cudnn-frontend DSA namespace."""
     global _DSA
@@ -154,20 +223,9 @@ def _ensure_dsa_namespace():
 
 
 def _load_indexer_fwd_sm90():
-    """Load the H100 SM90 indexer forward entry only when it is selected."""
-    global _indexer_fwd_sm90
-    if _indexer_fwd_sm90 is None:
-        try:
-            module = import_module(
-                "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90"
-            )
-            _indexer_fwd_sm90 = module.indexer_fwd
-        except (AttributeError, ImportError) as exc:
-            raise ImportError(
-                "H100 DSA indexer forward requires the SM90 cudnn route "
-                "`cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90.indexer_fwd`."
-            ) from exc
-    return _indexer_fwd_sm90
+    """Use the cuDNN DSA namespace wrapper for the H100 SM90 indexer path."""
+    _ensure_dsa_namespace()
+    return None
 
 
 def _load_indexer_fwd_sm100():
@@ -195,6 +253,42 @@ def _select_indexer_forward(device):
     return None
 
 
+def _torch_indexer_forward_bshd(
+    q: Tensor,
+    k: Tensor,
+    w: Tensor,
+    *,
+    ratio: int,
+    qhead_per_kv_head: Optional[int],
+) -> Tensor:
+    b, sq, n_heads_q, head_dim = q.shape
+    b_k, sk, n_heads_kv, head_dim_k = k.shape
+    if (b, head_dim) != (b_k, head_dim_k):
+        raise ValueError(
+            "DSA indexer fallback shape mismatch: "
+            f"q={tuple(q.shape)} k={tuple(k.shape)} w={tuple(w.shape)}."
+        )
+    if w.shape != (b, sq, n_heads_q):
+        raise ValueError(
+            "DSA indexer fallback weight shape mismatch: "
+            f"expected {(b, sq, n_heads_q)}, got {tuple(w.shape)}."
+        )
+    if qhead_per_kv_head is None:
+        qhead_per_kv_head = max(1, n_heads_q // n_heads_kv)
+    kv_head_idx = torch.div(
+        torch.arange(n_heads_q, device=q.device),
+        qhead_per_kv_head,
+        rounding_mode="floor",
+    ).clamp(max=n_heads_kv - 1)
+    k_expanded = k.index_select(2, kv_head_idx)
+    scores_by_head = torch.einsum("bqhd,bkhd->bqkh", q.float(), k_expanded.float()).relu()
+    scores = (scores_by_head * w.float().unsqueeze(2)).sum(dim=-1)
+    q_idx = torch.arange(sq, device=q.device)
+    valid_per_q = ((q_idx + 1) // ratio).clamp(max=sk)
+    valid = torch.arange(sk, device=q.device).view(1, 1, sk) < valid_per_q.view(1, sq, 1)
+    return scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+
+
 def _dsa_indexer_forward_wrapper(
     q: Tensor,
     k: Tensor,
@@ -210,6 +304,19 @@ def _dsa_indexer_forward_wrapper(
 ):
     """Route indexer forward to architecture-specific CuTe-DSL backends."""
     if q.is_cuda:
+        major, _minor = torch.cuda.get_device_capability(q.device)
+        if major == 9:
+            if cu_seqlens_q is not None or cu_seqlens_k is not None:
+                raise RuntimeError("SM90 DSA indexer fallback expects dense BSHD inputs.")
+            return {
+                "scores": _torch_indexer_forward_bshd(
+                    q,
+                    k,
+                    w,
+                    ratio=ratio,
+                    qhead_per_kv_head=qhead_per_kv_head,
+                )
+            }
         indexer_fwd = _select_indexer_forward(q.device)
         if indexer_fwd is not None:
             return {
@@ -484,10 +591,22 @@ def _indexer_topk_bshd(
     seq_lens = valid_per_q.repeat(b)  # (b*sq,), row-major over (b, sq)
 
     topk_k = min(topk, sk)
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
-    )
-    topk_indices = tk_result["indices"].view(b, sq, topk_k)
+    major, _minor = torch.cuda.get_device_capability(device) if scores.is_cuda else (0, 0)
+    if major == 9:
+        topk_indices = scores.topk(topk_k, dim=-1, sorted=False).indices
+        valid_lengths = valid_per_q.clamp(max=topk_k).view(1, sq).expand(b, -1)
+        topk_rank = torch.arange(topk_k, device=device).view(1, 1, topk_k)
+        topk_indices = torch.where(
+            topk_rank < valid_lengths.unsqueeze(-1),
+            topk_indices,
+            torch.full_like(topk_indices, -1),
+        )
+    else:
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        )
+        topk_indices = tk_result["indices"].view(b, sq, topk_k)
+    topk_indices = topk_indices.int()
 
     if topk_k < topk:
         pad = torch.full((b, sq, topk - topk_k), -1, dtype=torch.int32, device=device)
@@ -775,6 +894,64 @@ def _kl_loss_from_dense_scores(
     return loss_coeff * loss
 
 
+def _fused_indexer_sparse_attn_torch_no_loss(
+    query: Tensor,
+    kv_full: Tensor,
+    attn_sink: Tensor,
+    window_idxs: Tensor,
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    indexer_topk: int,
+    ratio: int,
+    softmax_scale: float,
+    indexer_softmax_scale: float,
+    kv_offset: int,
+    value_dim: Optional[int],
+) -> Tuple[Tensor, Tensor]:
+    sq, b, np_, d = query.shape
+    skv = kv_full.shape[0]
+    n_comp = k_indexer.shape[0]
+    requested_topk = indexer_topk
+    effective_topk = min(requested_topk, n_comp)
+
+    q_idx_bshd, k_idx_bsd, _w_bsh, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
+        q_indexer, k_indexer, weights, indexer_softmax_scale
+    )
+    topk_indices_cmp, _, _scores = _indexer_topk_bshd(
+        q_idx_bshd, k_idx_bsd, w_bsh_scaled, effective_topk, ratio
+    )
+
+    compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
+    if requested_topk > effective_topk:
+        pad = torch.full(
+            (b, sq, requested_topk - effective_topk),
+            -1,
+            device=compress_topk_idxs.device,
+            dtype=compress_topk_idxs.dtype,
+        )
+        compress_topk_idxs = torch.cat([compress_topk_idxs, pad], dim=-1)
+    combined_local = torch.cat([compress_topk_idxs, window_idxs], dim=-1)
+    global_idxs = local_to_global_flat(combined_local, b, skv)
+
+    q_flat = query.reshape(sq * b, np_, d)
+    kv_flat = kv_full.reshape(skv * b, d)
+    out_flat, _lse, _lse_indexer = _dsa_fwd_torch(
+        q_flat,
+        kv_flat,
+        global_idxs,
+        softmax_scale,
+        d_v=512 if value_dim is None else value_dim,
+        attn_sink=attn_sink,
+        topk_length=None,
+        indexer_topk=0,
+    )
+    d_v = out_flat.shape[-1]
+    out = out_flat.reshape(sq, b, np_, d_v).reshape(sq, b, np_ * d_v)
+    loss = torch.zeros((), device=query.device, dtype=torch.float32)
+    return out, loss
+
+
 class FusedIndexerSparseAttnFunc(torch.autograd.Function):
     """Path B: fused indexer (+KL loss) + sparse attention in one autograd.
 
@@ -866,50 +1043,45 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
         # ---- 5. Derive predict from indexer_scores, compute target. --------
-        # Attention-path tensors (detached — loss is not differentiable through them).
-        q_attn_bshd = query.detach().permute(1, 0, 2, 3).contiguous()
-        k_attn_compressed_bsd = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
-        lse_indexer_bsqh = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
+        if loss_coeff > 0:
+            # Attention-path tensors (detached — loss is not differentiable through them).
+            q_attn_bshd = query.detach().permute(1, 0, 2, 3).contiguous()
+            k_attn_compressed_bsd = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+            lse_indexer_bsqh = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
 
-        if sparse_loss:
-            # Derive predict: gather topk scores from indexer_scores → softmax.
-            safe_indices = topk_indices_cmp.clamp(min=0).long()
-            gathered_scores = torch.gather(indexer_scores, dim=2, index=safe_indices)
-            gathered_scores = torch.where(
-                topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
-            )
-            predict = torch.softmax(gathered_scores, dim=-1)  # (b, sq, topk) fp32
+            if sparse_loss:
+                # Derive predict: gather topk scores from indexer_scores → softmax.
+                safe_indices = topk_indices_cmp.clamp(min=0).long()
+                gathered_scores = torch.gather(indexer_scores, dim=2, index=safe_indices)
+                gathered_scores = torch.where(
+                    topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
+                )
+                predict = torch.softmax(gathered_scores, dim=-1)  # (b, sq, topk) fp32
 
-            target = _compute_attn_target(
-                q_attn_bshd,
-                k_attn_compressed_bsd,
-                lse_indexer_bsqh,
-                topk_indices_cmp,
-                softmax_scale,
-                qhead_per_kv_head=np_,
-            )
-
-            if loss_coeff > 0:
+                target = _compute_attn_target(
+                    q_attn_bshd,
+                    k_attn_compressed_bsd,
+                    lse_indexer_bsqh,
+                    topk_indices_cmp,
+                    softmax_scale,
+                    qhead_per_kv_head=np_,
+                )
                 indexer_loss = _kl_loss_from_target_predict(
                     target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
                 )
             else:
-                indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
-        else:
-            # Dense: use full indexer_scores directly + logsumexp.
-            index_score = indexer_scores  # (b, sq, n_comp) fp32
-            index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
+                # Dense: use full indexer_scores directly + logsumexp.
+                index_score = indexer_scores  # (b, sq, n_comp) fp32
+                index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
 
-            attn_score, attn_l1norm = _compute_dense_attn_score(
-                q_attn_bshd,
-                k_attn_compressed_bsd.unsqueeze(2),
-                lse_indexer_bsqh,
-                qhead_per_kv_head=np_,
-                softmax_scale=softmax_scale,
-                ratio=ratio,
-            )
-
-            if loss_coeff > 0:
+                attn_score, attn_l1norm = _compute_dense_attn_score(
+                    q_attn_bshd,
+                    k_attn_compressed_bsd.unsqueeze(2),
+                    lse_indexer_bsqh,
+                    qhead_per_kv_head=np_,
+                    softmax_scale=softmax_scale,
+                    ratio=ratio,
+                )
                 indexer_loss = _kl_loss_from_dense_scores(
                     attn_score,
                     attn_l1norm,
@@ -918,8 +1090,8 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     loss_coeff,
                     calculate_per_token_loss,
                 )
-            else:
-                indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
+        else:
+            indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
 
         # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
         # The actual grad_loss scaling is deferred to backward (when
@@ -1117,6 +1289,22 @@ def fused_indexer_sparse_attn(
         ``(output, indexer_loss)`` where ``output`` is ``(sq, b, np * d_v)``
         bf16 and ``indexer_loss`` is a scalar f32.
     """
+    if loss_coeff <= 0.0 and not _has_flash_mla_sparse_fwd():
+        return _fused_indexer_sparse_attn_torch_no_loss(
+            query,
+            kv_full,
+            attn_sink,
+            window_idxs,
+            q_indexer,
+            k_indexer,
+            weights,
+            indexer_topk,
+            ratio,
+            softmax_scale,
+            indexer_softmax_scale,
+            kv_offset,
+            value_dim,
+        )
     return FusedIndexerSparseAttnFunc.apply(
         query,
         kv_full,

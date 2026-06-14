@@ -1,4 +1,4 @@
-"""Direct HF safetensor loading for native GLM-5."""
+"""Direct HF safetensor loading for native DeepSeek-V3.1."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections.abc import Iterator
 import torch
 import torch.nn as nn
 
-from megatron.lite.model.glm5.config import Glm5Config
+from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
 from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, save_safetensors, unwrap_model
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
@@ -148,7 +148,7 @@ def _local_layer_indices(model: nn.Module) -> list[int]:
 
 
 def _to_hf_state_name(
-    name: str, *, config: Glm5Config, model: nn.Module, ps: ParallelState
+    name: str, *, config: DeepSeekV31Config, model: nn.Module, ps: ParallelState
 ) -> str | None:
     if name == "model.mtp_embed.weight":
         return "model.embed_tokens.weight"
@@ -188,7 +188,7 @@ def _resolve_named_parameter_tensor(
     name: str,
     target: nn.Parameter | torch.Tensor,
     *,
-    config: Glm5Config,
+    config: DeepSeekV31Config,
     ps: ParallelState,
 ) -> torch.Tensor | None:
     match = _PACKED_EXPERT_RE.match(name)
@@ -224,9 +224,11 @@ def _resolve_named_parameter_tensor(
     return torch.stack(tensors, dim=0).contiguous()
 
 
-def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: ParallelState) -> None:
+def load_hf_weights(
+    model: nn.Module, path: str, config: DeepSeekV31Config, ps: ParallelState
+) -> None:
     if ps.tp_size != 1 or ps.etp_size != 1:
-        raise NotImplementedError("GLM5 direct HF load currently supports TP=ETP=1.")
+        raise NotImplementedError("DeepSeek-V3.1 direct HF load currently supports TP=ETP=1.")
 
     reader = SafeTensorReader(path)
     base_model = unwrap_model(model)
@@ -248,9 +250,9 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
         _copy_param(target, tensor)
         loaded += 1
 
-    log_rank0(f"GLM5 native loaded {loaded} tensors from {path}")
+    log_rank0(f"DeepSeek-V3.1 native loaded {loaded} tensors from {path}")
     for name in missing:
-        log_rank0(f"WARNING: GLM5 checkpoint tensor missing: {name}")
+        log_rank0(f"WARNING: DeepSeek-V3.1 checkpoint tensor missing: {name}")
 
 
 def _rank0() -> int:
@@ -261,14 +263,14 @@ def _rank0() -> int:
 
 def _validate_export_scope(ps: ParallelState) -> None:
     if ps.tp_size != 1 or ps.etp_size != 1:
-        raise NotImplementedError("GLM5 direct HF export currently supports TP=ETP=1.")
+        raise NotImplementedError("DeepSeek-V3.1 direct HF export currently supports TP=ETP=1.")
     if ps.ep_size != 1:
-        raise NotImplementedError("GLM5 direct HF export currently supports EP=1.")
+        raise NotImplementedError("DeepSeek-V3.1 direct HF export currently supports EP=1.")
 
 
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
-    config: Glm5Config,
+    config: DeepSeekV31Config,
     ps: ParallelState,
     *,
     rank0_only: bool = False,
@@ -295,7 +297,7 @@ def export_hf_weights(
 def save_hf_weights(
     model: nn.Module | list[nn.Module],
     path: str,
-    config: Glm5Config,
+    config: DeepSeekV31Config,
     ps: ParallelState,
     *,
     export_dtype: torch.dtype | None = None,
@@ -308,7 +310,7 @@ def save_hf_weights(
 
 
 def save_weights(
-    model: nn.Module | list[nn.Module], path: str, config: Glm5Config, ps: ParallelState
+    model: nn.Module | list[nn.Module], path: str, config: DeepSeekV31Config, ps: ParallelState
 ) -> None:
     rank = _rank0()
     if rank != 0:

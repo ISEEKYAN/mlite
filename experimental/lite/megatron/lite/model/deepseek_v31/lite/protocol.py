@@ -1,4 +1,4 @@
-"""GLM-5 native lite protocol for Megatron Lite runtime."""
+"""DeepSeek-V3.1 native lite protocol for Megatron Lite runtime."""
 
 from __future__ import annotations
 
@@ -10,14 +10,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from megatron.lite.model.glm5.config import Glm5Config
-from megatron.lite.model.glm5.lite.checkpoint import (
+from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
+from megatron.lite.model.deepseek_v31.lite.checkpoint import (
     EXPERT_CLASSIFIER,
     export_hf_weights as _export_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
     save_weights as _save_weights_impl,
 )
-from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.deepseek_v31.lite.checkpoint import (
+    load_hf_weights as _load_hf_weights_impl,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec, wrap_checkpoint
@@ -53,15 +55,11 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
 
 
-def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
+def build_model_config(source: str | Path | dict, **overrides) -> DeepSeekV31Config:
     if isinstance(source, dict):
-        cfg = Glm5Config._from_hf_dict(source)
+        return DeepSeekV31Config._from_hf_dict(source, **overrides)
     else:
-        cfg = Glm5Config.from_hf(str(source))
-    for key, value in overrides.items():
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
-    return cfg
+        return DeepSeekV31Config.from_hf(str(source), **overrides)
 
 
 def _forward_step(model: nn.Module, batch: dict) -> dict:
@@ -77,7 +75,7 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
     return model(**kwargs)
 
 
-def _apply_glm5_recompute(
+def _apply_deepseek_v31_recompute(
     layers: nn.ModuleList, recompute_spec: list[str], ps: ParallelState
 ) -> None:
     if not recompute_spec:
@@ -98,7 +96,7 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
     etp = 1 if p.etp is None else p.etp
     if (p.tp, etp, p.vpp) != (1, 1, 1):
         raise NotImplementedError(
-            "GLM5 native lite currently supports TP=ETP=VPP=1. "
+            "DeepSeek-V3.1 native lite currently supports TP=ETP=VPP=1. "
             "EP/PP/CP are wired through existing Megatron Lite primitives."
         )
     if p.ep < 1 or p.pp < 1 or p.cp < 1:
@@ -107,8 +105,8 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
-def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+def build_model(model_cfg: DeepSeekV31Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    from megatron.lite.model.deepseek_v31.lite.model import DeepSeekV31ForCausalLM
 
     _validate_parallel_scope(impl_cfg.parallel)
     mtp_enable = bool(impl_cfg.mtp_enable)
@@ -126,7 +124,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     train_cfg = SimpleNamespace(use_deepep=impl_cfg.use_deepep)
     chunk = (
-        Glm5ForCausalLM(
+        DeepSeekV31ForCausalLM(
             model_cfg,
             train_cfg=train_cfg,
             ps=ps,
@@ -139,7 +137,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     )
     chunks = [chunk]
 
-    _apply_glm5_recompute(chunk.model.layers, recompute_spec, ps)
+    _apply_deepseek_v31_recompute(chunk.model.layers, recompute_spec, ps)
 
     if impl_cfg.offload:
         from megatron.lite.primitive.recompute import apply_offload
@@ -160,7 +158,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         optimizer_backend = "fsdp2"
 
         def _post_model_load_hook():
-            from megatron.lite.model.glm5.lite.model import Glm5Layer
+            from megatron.lite.model.deepseek_v31.lite.model import DeepSeekV31Layer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
@@ -168,7 +166,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
                     chunks,
                     impl_cfg.optimizer_config,
                     ps,
-                    unit_modules=(Glm5Layer,),
+                    unit_modules=(DeepSeekV31Layer,),
                     expert_classifier=is_expert_param,
                     deterministic=impl_cfg.deterministic,
                     vpp=1,
@@ -178,7 +176,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
 
         post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer is not None:
-        raise ValueError(f"Unsupported GLM5 optimizer: {impl_cfg.optimizer!r}")
+        raise ValueError(f"Unsupported DeepSeek-V3.1 optimizer: {impl_cfg.optimizer!r}")
 
     return ModelBundle(
         chunks=chunks,
@@ -201,7 +199,7 @@ def _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps):
         chunks,
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
-        model_name="glm5",
+        model_name="deepseek_v31",
         ps=ps,
         is_expert=is_expert_param,
         deterministic=impl_cfg.deterministic,
@@ -209,21 +207,23 @@ def _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps):
 
 
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: Glm5Config, ps: ParallelState
+    chunk: nn.Module, hf_path: str, model_cfg: DeepSeekV31Config, ps: ParallelState
 ) -> None:
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
 
 
-def export_hf_weights(chunks: list[nn.Module], model_cfg: Glm5Config, ps: ParallelState, **kwargs):
+def export_hf_weights(
+    chunks: list[nn.Module], model_cfg: DeepSeekV31Config, ps: ParallelState, **kwargs
+):
     yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(
     chunks: list[nn.Module],
     path: str,
-    model_cfg: Glm5Config,
+    model_cfg: DeepSeekV31Config,
     ps: ParallelState,
     *,
     export_dtype: torch.dtype | None = None,
@@ -232,10 +232,10 @@ def save_hf_weights(
 
 
 def save_weights(
-    chunks: list[nn.Module], path: str, model_cfg: Glm5Config, ps: ParallelState
+    chunks: list[nn.Module], path: str, model_cfg: DeepSeekV31Config, ps: ParallelState
 ) -> None:
     _save_weights_impl(chunks, path, model_cfg, ps)
 
 
-def vocab_size(model_cfg: Glm5Config) -> int | None:
+def vocab_size(model_cfg: DeepSeekV31Config) -> int | None:
     return model_cfg.vocab_size

@@ -1,12 +1,34 @@
-"""GLM-5 architecture config."""
+"""DeepSeek-V3.1 architecture config."""
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import fields as dc_fields
 from typing import Any
 
 from megatron.lite.primitive.config import load_hf_config_dict
+
+DEFAULT_DEEPSEEK_V31_VARIANT = "glm-5"
+
+
+@dataclass(frozen=True)
+class DeepSeekV31VariantConfig:
+    name: str
+    defaults: dict[str, Any] = field(default_factory=dict)
+    hf_model_types: tuple[str, ...] = ()
+
+
+DEEPSEEK_V31_VARIANTS = {
+    "glm-5": DeepSeekV31VariantConfig("glm-5", hf_model_types=("glm_moe_dsa",)),
+}
+
+DEEPSEEK_V31_HF_MODEL_TYPES = tuple(
+    hf_model_type
+    for variant_config in DEEPSEEK_V31_VARIANTS.values()
+    for hf_model_type in variant_config.hf_model_types
+)
 
 _HF_FIELDS = frozenset(
     {
@@ -57,10 +79,34 @@ _HF_FIELDS = frozenset(
 )
 
 
-@dataclass
-class Glm5Config:
-    """Pure GLM-5 MoE + MLA + DSA architecture parameters."""
+def _variant_entry(variant: str) -> DeepSeekV31VariantConfig:
+    if variant not in DEEPSEEK_V31_VARIANTS:
+        raise ValueError(
+            f"Unknown DeepSeekV31 variant: {variant!r}. "
+            f"Available variants: {tuple(DEEPSEEK_V31_VARIANTS)}"
+        )
+    return DEEPSEEK_V31_VARIANTS[variant]
 
+
+def _explicit_variant_from_hf(hf: dict[str, Any]) -> str | None:
+    variant = hf.get("variant")
+    if isinstance(variant, str):
+        return variant
+    text_config = hf.get("text_config")
+    if isinstance(text_config, dict) and isinstance(text_config.get("variant"), str):
+        return text_config["variant"]
+    return None
+
+
+def _variant_defaults(variant: str) -> dict[str, Any]:
+    return deepcopy(_variant_entry(variant).defaults)
+
+
+@dataclass
+class DeepSeekV31Config:
+    """Pure DeepSeek-V3.1 MoE + MLA + DSA architecture parameters."""
+
+    variant: str = DEFAULT_DEEPSEEK_V31_VARIANT
     num_hidden_layers: int = 78
     hidden_size: int = 6144
     num_attention_heads: int = 64
@@ -109,6 +155,7 @@ class Glm5Config:
     mlp_layer_types: list[str] | None = None
 
     def __post_init__(self):
+        _variant_entry(self.variant)
         self._validate()
 
     @property
@@ -142,7 +189,7 @@ class Glm5Config:
         check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
         check(
             self.num_key_value_heads == self.num_attention_heads,
-            "initial GLM5 native path expects MLA heads to be ungrouped",
+            "initial DeepSeek-V3.1 native path expects MLA heads to be ungrouped",
         )
         check(self.vocab_size > 0, "vocab_size must be > 0")
         check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
@@ -170,7 +217,7 @@ class Glm5Config:
 
         if errors:
             raise ValueError(
-                f"Invalid Glm5Config ({len(errors)} error"
+                f"Invalid DeepSeekV31Config ({len(errors)} error"
                 f"{'s' if len(errors) != 1 else ''}):\n  " + "\n  ".join(errors)
             )
 
@@ -178,23 +225,47 @@ class Glm5Config:
         return {f.name: getattr(self, f.name) for f in dc_fields(self)}
 
     @classmethod
-    def from_hf(cls, path_or_name: str, **overrides) -> Glm5Config:
+    def from_hf(cls, path_or_name: str, **overrides) -> DeepSeekV31Config:
         return cls._from_hf_dict(load_hf_config_dict(path_or_name), **overrides)
 
     @classmethod
-    def from_hf_config(cls, hf_config, **overrides) -> Glm5Config:
+    def from_hf_config(cls, hf_config, **overrides) -> DeepSeekV31Config:
         hf = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
         return cls._from_hf_dict(hf, **overrides)
 
     @classmethod
-    def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> Glm5Config:
-        kwargs = {
-            key: value for key, value in hf.items() if key in _HF_FIELDS and value is not None
-        }
+    def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> DeepSeekV31Config:
+        overrides = dict(overrides)
+        if "variant" in overrides:
+            variant = overrides.pop("variant")
+        else:
+            variant = _explicit_variant_from_hf(hf) or DEFAULT_DEEPSEEK_V31_VARIANT
+        _variant_entry(variant)
+        kwargs = _variant_defaults(variant)
+        kwargs.update(
+            {key: value for key, value in hf.items() if key in _HF_FIELDS and value is not None}
+        )
         if "num_nextn_predict_layers" not in kwargs and hf.get("num_nextn_predict") is not None:
             kwargs["num_nextn_predict_layers"] = int(hf["num_nextn_predict"])
         rope_parameters = hf.get("rope_parameters")
         if isinstance(rope_parameters, dict) and "rope_theta" not in kwargs:
             kwargs["rope_theta"] = float(rope_parameters.get("rope_theta", cls.rope_theta))
+        kwargs["variant"] = variant
         kwargs.update(overrides)
         return cls(**kwargs)
+
+    @classmethod
+    def from_variant(cls, variant: str, **overrides) -> DeepSeekV31Config:
+        kwargs = _variant_defaults(variant)
+        kwargs["variant"] = variant
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
+
+__all__ = [
+    "DEFAULT_DEEPSEEK_V31_VARIANT",
+    "DEEPSEEK_V31_HF_MODEL_TYPES",
+    "DEEPSEEK_V31_VARIANTS",
+    "DeepSeekV31Config",
+    "DeepSeekV31VariantConfig",
+]

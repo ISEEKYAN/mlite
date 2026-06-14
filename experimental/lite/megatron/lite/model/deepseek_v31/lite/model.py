@@ -1,4 +1,4 @@
-"""Native GLM-5 model assembled from Megatron Lite primitives."""
+"""Native DeepSeek-V3.1 model assembled from Megatron Lite primitives."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.lite.model.glm5.config import Glm5Config
+from megatron.lite.model.deepseek_v31.config import DeepSeekV31Config
 from megatron.lite.primitive.attention import (
     DynamicSparseAttention,
     RMSNorm,
@@ -21,7 +21,7 @@ from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.primitive.utils import ensure_divisible
 
 
-class Glm5MLP(nn.Module):
+class DeepSeekV31MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -32,7 +32,7 @@ class Glm5MLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Glm5RoutedExperts(nn.Module):
+class DeepSeekV31RoutedExperts(nn.Module):
     def __init__(
         self,
         num_experts: int,
@@ -173,8 +173,8 @@ class Glm5RoutedExperts(nn.Module):
                 _copy(f"{prefix}{expert_idx}.down_proj.weight", self.down_proj[expert_idx])
 
 
-class Glm5Router(nn.Module):
-    def __init__(self, config: Glm5Config):
+class DeepSeekV31Router(nn.Module):
+    def __init__(self, config: DeepSeekV31Config):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
         self.register_buffer(
@@ -209,7 +209,7 @@ class Glm5Router(nn.Module):
         return weights * self.route_scale, indices
 
 
-def _build_glm5_pipeline_layers(num_hidden_layers: int, ps: ParallelState) -> list[int]:
+def _build_deepseek_v31_pipeline_layers(num_hidden_layers: int, ps: ParallelState) -> list[int]:
     if ps.pp_size > 2 and num_hidden_layers % ps.pp_size:
         middle_layers = -(-num_hidden_layers // ps.pp_size)
         edge_layers = num_hidden_layers - middle_layers * (ps.pp_size - 2)
@@ -226,14 +226,18 @@ def _build_glm5_pipeline_layers(num_hidden_layers: int, ps: ParallelState) -> li
     return list(range(start, start + local_count))
 
 
-class Glm5MoE(nn.Module):
+class DeepSeekV31MoE(nn.Module):
     def __init__(
-        self, config: Glm5Config, ps: ParallelState | None = None, *, use_deepep: bool = False
+        self,
+        config: DeepSeekV31Config,
+        ps: ParallelState | None = None,
+        *,
+        use_deepep: bool = False,
     ):
         super().__init__()
         ps = ps or ParallelState()
         self.hidden_size = config.hidden_size
-        self.gate = Glm5Router(config)
+        self.gate = DeepSeekV31Router(config)
         self.dispatcher = None
         if ps.ep_size > 1:
             from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
@@ -245,12 +249,12 @@ class Glm5MoE(nn.Module):
                 use_deepep=use_deepep,
                 fuse_score_alltoall=True,
             )
-        self.experts = Glm5RoutedExperts(
+        self.experts = DeepSeekV31RoutedExperts(
             config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, ps
         )
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
-            Glm5MLP(config.hidden_size, shared_intermediate)
+            DeepSeekV31MLP(config.hidden_size, shared_intermediate)
             if config.n_shared_experts > 0
             else None
         )
@@ -272,10 +276,10 @@ class Glm5MoE(nn.Module):
         return y
 
 
-class Glm5Layer(nn.Module):
+class DeepSeekV31Layer(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepSeekV31Config,
         layer_idx: int,
         ps: ParallelState | None = None,
         *,
@@ -309,9 +313,9 @@ class Glm5Layer(nn.Module):
             cp_group=ps.cp_group,
         )
         self.mlp = (
-            Glm5MoE(config, ps, use_deepep=use_deepep)
+            DeepSeekV31MoE(config, ps, use_deepep=use_deepep)
             if config.is_moe_layer(layer_idx)
-            else Glm5MLP(config.hidden_size, config.intermediate_size)
+            else DeepSeekV31MLP(config.hidden_size, config.intermediate_size)
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -352,10 +356,10 @@ def _roll_mtp_sequence(
     return rolled
 
 
-class Glm5MTPLayer(nn.Module):
+class DeepSeekV31MTPLayer(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepSeekV31Config,
         layer_idx: int,
         ps: ParallelState,
         *,
@@ -371,7 +375,7 @@ class Glm5MTPLayer(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.transformer_layer = Glm5Layer(config, layer_idx, ps, use_deepep=use_deepep)
+        self.transformer_layer = DeepSeekV31Layer(config, layer_idx, ps, use_deepep=use_deepep)
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -412,10 +416,10 @@ class Glm5MTPLayer(nn.Module):
         return hidden_states, input_ids, position_ids
 
 
-class Glm5MTPBlock(nn.Module):
+class DeepSeekV31MTPBlock(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepSeekV31Config,
         ps: ParallelState,
         *,
         embedding: nn.Embedding,
@@ -429,7 +433,7 @@ class Glm5MTPBlock(nn.Module):
         layers_to_build = 1 if self.repeated_layer else self.num_layers
         self.layers = nn.ModuleList(
             [
-                Glm5MTPLayer(
+                DeepSeekV31MTPLayer(
                     config,
                     config.num_hidden_layers + layer_idx,
                     ps,
@@ -464,10 +468,10 @@ class Glm5MTPBlock(nn.Module):
         return outputs
 
 
-class Glm5Model(nn.Module):
+class DeepSeekV31Model(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepSeekV31Config,
         ps: ParallelState | None = None,
         *,
         use_deepep: bool = False,
@@ -477,24 +481,27 @@ class Glm5Model(nn.Module):
         super().__init__()
         self.config = config
         self.ps = ps or ParallelState()
-        self.layer_indices = _build_glm5_pipeline_layers(config.num_hidden_layers, self.ps)
+        self.layer_indices = _build_deepseek_v31_pipeline_layers(config.num_hidden_layers, self.ps)
         self.embed_tokens = (
             nn.Embedding(config.vocab_size, config.hidden_size) if self.ps.pp_is_first else None
         )
         self.layers = nn.ModuleList(
-            [Glm5Layer(config, i, self.ps, use_deepep=use_deepep) for i in self.layer_indices]
+            [
+                DeepSeekV31Layer(config, i, self.ps, use_deepep=use_deepep)
+                for i in self.layer_indices
+            ]
         )
         self.norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if self.ps.pp_is_last else None
         )
         self.mtp_embed: nn.Embedding | None = None
-        self.mtp: Glm5MTPBlock | None = None
+        self.mtp: DeepSeekV31MTPBlock | None = None
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.ps.pp_is_last:
             mtp_embedding = self.embed_tokens
             if mtp_embedding is None:
                 mtp_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
                 self.mtp_embed = mtp_embedding
-            self.mtp = Glm5MTPBlock(
+            self.mtp = DeepSeekV31MTPBlock(
                 config,
                 self.ps,
                 embedding=mtp_embedding,
@@ -520,7 +527,7 @@ class Glm5Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         batch, seq_len, _ = hidden_states.shape
         if position_ids is None and packed_seq_params is not None:
-            raise ValueError("GLM5 packed THD forward requires explicit position_ids.")
+            raise ValueError("DeepSeek-V3.1 packed THD forward requires explicit position_ids.")
         if position_ids is None:
             if self.ps.cp_size > 1:
                 full_seq_len = seq_len * self.ps.cp_size
@@ -558,10 +565,10 @@ class Glm5Model(nn.Module):
         return self.norm(h) if self.norm is not None else h
 
 
-class Glm5ForCausalLM(nn.Module):
+class DeepSeekV31ForCausalLM(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepSeekV31Config,
         train_cfg: SimpleNamespace | None = None,
         ps: ParallelState | None = None,
         *,
@@ -574,7 +581,7 @@ class Glm5ForCausalLM(nn.Module):
         self.train_cfg = train_cfg or SimpleNamespace(fp8=False)
         self.ps = ps or ParallelState()
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
-        self.model = Glm5Model(
+        self.model = DeepSeekV31Model(
             config,
             self.ps,
             use_deepep=bool(getattr(self.train_cfg, "use_deepep", False)),
@@ -701,7 +708,9 @@ class Glm5ForCausalLM(nn.Module):
         batch, seq_len = input_ids.shape
         if position_ids is None:
             if packed_seq_params is not None:
-                raise ValueError("GLM5 MTP packed THD forward requires explicit position_ids.")
+                raise ValueError(
+                    "DeepSeek-V3.1 MTP packed THD forward requires explicit position_ids."
+                )
             position_ids = (
                 torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
                 .unsqueeze(0)
@@ -762,22 +771,22 @@ class Glm5ForCausalLM(nn.Module):
                     if hasattr(module, "reset_parameters")
                     else module.weight.fill_(1.0)
                 )
-            elif isinstance(module, Glm5Router):
+            elif isinstance(module, DeepSeekV31Router):
                 nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
                 module.e_score_correction_bias.zero_()
-            elif isinstance(module, Glm5RoutedExperts):
+            elif isinstance(module, DeepSeekV31RoutedExperts):
                 nn.init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
                 nn.init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
 __all__ = [
-    "Glm5ForCausalLM",
-    "Glm5Layer",
-    "Glm5MLP",
-    "Glm5MTPBlock",
-    "Glm5MTPLayer",
-    "Glm5MoE",
-    "Glm5Model",
-    "Glm5Router",
-    "Glm5RoutedExperts",
+    "DeepSeekV31ForCausalLM",
+    "DeepSeekV31Layer",
+    "DeepSeekV31MLP",
+    "DeepSeekV31MTPBlock",
+    "DeepSeekV31MTPLayer",
+    "DeepSeekV31MoE",
+    "DeepSeekV31Model",
+    "DeepSeekV31Router",
+    "DeepSeekV31RoutedExperts",
 ]
