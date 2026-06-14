@@ -7,6 +7,9 @@ import torch
 from megatron.lite.primitive.parallel import (
     ParallelState,
     build_pipeline_chunk_layout,
+    pack_nested_thd,
+    parallel_state_from_model,
+    prepare_packed_thd_for_context_parallel,
     reconstruct_packed_from_cp_parts,
     roll_packed_thd_left,
     split_packed_to_cp_local,
@@ -110,3 +113,98 @@ def test_thd_cp_split_and_reconstruct_roundtrip():
         reconstruct_packed_from_cp_parts(parts, cu_seqlens_padded=cu_seqlens, cp_size=2, dim=0),
         tensor,
     )
+
+
+def test_plain_thd_batch_is_split_by_protocol_context_parallel_helper():
+    ids = torch.nested.as_nested_tensor(
+        [torch.arange(1, 6), torch.arange(11, 18)],
+        layout=torch.jagged,
+    )
+    labels = torch.nested.as_nested_tensor(
+        [torch.arange(101, 106), torch.arange(111, 118)],
+        layout=torch.jagged,
+    )
+    loss_mask = torch.nested.as_nested_tensor(
+        [torch.ones(5), torch.ones(7)],
+        layout=torch.jagged,
+    )
+    packed = pack_nested_thd(
+        ids,
+        cp_size=2,
+        split_cp=False,
+        labels=labels,
+        loss_mask=loss_mask,
+    )
+
+    assert packed.input_ids.shape == (1, 16)
+    assert packed.cp_size == 2
+    assert packed.packed_seq_params.local_cp_size is None
+
+    local_params, local_tensors = prepare_packed_thd_for_context_parallel(
+        packed.packed_seq_params,
+        (packed.input_ids, packed.labels, packed.loss_mask, packed.position_ids),
+        cp_size=2,
+        cp_rank=0,
+    )
+
+    expected_ids = split_packed_to_cp_local(
+        packed.input_ids,
+        cu_seqlens_padded=packed.cu_seqlens_padded,
+        cp_size=2,
+        cp_rank=0,
+        dim=1,
+    )
+    expected_pos = split_packed_to_cp_local(
+        packed.position_ids,
+        cu_seqlens_padded=packed.cu_seqlens_padded,
+        cp_size=2,
+        cp_rank=0,
+        dim=1,
+    )
+    local_ids, local_labels, local_loss_mask, local_pos = local_tensors
+    assert torch.equal(local_ids, expected_ids)
+    assert torch.equal(local_pos, expected_pos)
+    assert local_labels is not None
+    assert local_loss_mask is not None
+    assert local_params.local_cp_size == 2
+    assert local_params.cp_rank == 0
+
+
+def test_parallel_state_from_model_unwraps_ddp_style_module():
+    class Model:
+        ps = ParallelState(cp_size=2, cp_rank=1)
+
+    class Wrapper:
+        module = Model()
+
+    assert parallel_state_from_model(Wrapper()).cp_rank == 1
+
+
+def test_protocol_context_parallel_helper_keeps_pre_split_thd_batch_idempotent():
+    ids = torch.nested.as_nested_tensor([torch.arange(8)], layout=torch.jagged)
+    packed = pack_nested_thd(ids, cp_size=2, cp_rank=1)
+
+    local_params, local_tensors = prepare_packed_thd_for_context_parallel(
+        packed.packed_seq_params,
+        (packed.input_ids, packed.position_ids),
+        cp_size=2,
+        cp_rank=1,
+    )
+
+    assert local_params is packed.packed_seq_params
+    assert torch.equal(local_tensors[0], packed.input_ids)
+    assert local_params.local_cp_size == 2
+
+
+def test_protocol_context_parallel_helper_is_noop_without_packed_thd_params():
+    tensor = torch.arange(8)
+
+    local_params, local_tensors = prepare_packed_thd_for_context_parallel(
+        None,
+        (tensor,),
+        cp_size=2,
+        cp_rank=0,
+    )
+
+    assert local_params is None
+    assert local_tensors[0] is tensor

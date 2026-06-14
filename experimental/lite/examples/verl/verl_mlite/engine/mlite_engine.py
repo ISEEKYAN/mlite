@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+from enum import Enum
 from typing import Any
 
 import torch
@@ -12,7 +13,6 @@ import torch.distributed as dist
 from tensordict import TensorDict
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
-from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.workers.config import HFModelConfig, OptimizerConfig
 
@@ -32,6 +32,14 @@ BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro
     load_verl_engine_api()
 )
 
+try:
+    from verl.utils.dataset.dataset_utils import DatasetPadMode
+except ImportError:
+
+    class DatasetPadMode(Enum):
+        NO_PADDING = "no_padding"
+
+
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
 
 
@@ -49,6 +57,15 @@ def _isolate_compile_cache_per_rank() -> None:
         rank_dir = os.path.join(root, f"rank_{rank}")
         os.makedirs(rank_dir, exist_ok=True)
         os.environ[var] = rank_dir
+
+
+def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
+    return (
+        pad_mode == DatasetPadMode.NO_PADDING
+        or getattr(pad_mode, "name", None) == "NO_PADDING"
+        or getattr(pad_mode, "value", None) == "no_padding"
+        or str(pad_mode) in {"no_padding", "DatasetPadMode.NO_PADDING"}
+    )
 
 
 class _MegatronLiteLRScheduler:
@@ -311,7 +328,7 @@ class MegatronLiteEngine(BaseEngine):
         pad_mode = tu.get_non_tensor_data(
             data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING
         )
-        if pad_mode != DatasetPadMode.NO_PADDING:
+        if not _is_no_padding_pad_mode(pad_mode):
             raise NotImplementedError(
                 "MegatronLiteEngine only supports pad_mode=no_padding for now."
             )
@@ -567,6 +584,7 @@ class MegatronLiteEngine(BaseEngine):
             optimizer=self._build_mlite_optimizer_config(),
             attention_backend_override=self.engine_config.attention_backend_override,
             router_aux_loss_coef=self.engine_config.router_aux_loss_coef,
+            load_hf_weights=self.engine_config.load_hf_weights,
             impl_cfg=self._build_impl_cfg(),
         )
 
@@ -669,7 +687,7 @@ class MegatronLiteEngine(BaseEngine):
 
     def _use_runtime_forward_backward(self) -> bool:
         ps = self.handle._parallel_state
-        return ps.pp_size > 1
+        return ps.pp_size > 1 or ps.cp_size > 1
 
     def _forward_backward_batch_with_runtime(
         self,
@@ -747,6 +765,7 @@ class MegatronLiteEngine(BaseEngine):
             cp_size=ps.cp_size,
             cp_rank=ps.cp_rank,
             cp_group=ps.cp_group if ps.cp_size > 1 else None,
+            split_cp=False,
             labels=input_ids,
             roll_labels=True,
             loss_mask=loss_mask,

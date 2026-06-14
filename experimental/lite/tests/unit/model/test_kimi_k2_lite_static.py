@@ -107,19 +107,19 @@ def test_kimi_k2_lite_optimizer_names_are_current():
     root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
     protocol_text = (root / "protocol.py").read_text()
 
-    assert 'optimizer: str | None = "distopt"' in protocol_text
-    assert 'impl_cfg.optimizer == "distopt"' in protocol_text
+    assert 'optimizer: str | None = "dist_opt"' in protocol_text
+    assert 'impl_cfg.optimizer == "dist_opt"' in protocol_text
     assert 'impl_cfg.optimizer == "fsdp2"' in protocol_text
     for forbidden in ("m" + "c_full", 'optimizer == "m' + 'c"'):
         assert forbidden not in protocol_text
 
 
-def test_kimi_k2_distopt_deterministic_default_is_enabled():
+def test_kimi_k2_dist_opt_deterministic_default_is_enabled():
     from megatron.lite.model.kimi_k2.lite.protocol import ImplConfig
 
-    cfg = ImplConfig(optimizer="distopt", deterministic=True, mtp_enable=True)
+    cfg = ImplConfig(optimizer="dist_opt", deterministic=True, mtp_enable=True)
 
-    assert cfg.optimizer == "distopt"
+    assert cfg.optimizer == "dist_opt"
     assert cfg.deterministic is True
     assert cfg.mtp_enable is True
 

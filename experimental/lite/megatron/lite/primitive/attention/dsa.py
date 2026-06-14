@@ -433,6 +433,7 @@ class DynamicSparseAttention(nn.Module):
         if packed_seq_params is not None:
             if self.cp_size > 1:
                 x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
+                cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
             out = self._forward_packed_full(x, cos, sin, position_ids, packed_seq_params)
             if self.cp_size > 1:
                 out = split_packed_to_cp_local(
@@ -653,6 +654,25 @@ class DynamicSparseAttention(nn.Module):
             pos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
         )
         return full_x, full_position_ids
+
+    def _gather_packed_cp_rotary(
+        self, cos: torch.Tensor, sin: torch.Tensor, packed_seq_params, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.dim() != 3 or sin.dim() != 3:
+            return cos, sin
+        cu_seqlens = self._packed_cu_seqlens(packed_seq_params, device)
+        full_seq = int(cu_seqlens[-1].item())
+        if cos.shape[1] == full_seq and sin.shape[1] == full_seq:
+            return cos, sin
+        cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
+        sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
+        full_cos = reconstruct_packed_from_cp_parts(
+            cos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
+        )
+        full_sin = reconstruct_packed_from_cp_parts(
+            sin_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
+        )
+        return full_cos, full_sin
 
     @staticmethod
     def _packed_cu_seqlens(packed_seq_params, device: torch.device) -> torch.Tensor:
