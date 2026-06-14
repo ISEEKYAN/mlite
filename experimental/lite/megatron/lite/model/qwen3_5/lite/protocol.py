@@ -215,6 +215,28 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "distopt"
+    elif impl_cfg.optimizer == "mfsdp":
+        optimizer_backend = "mfsdp"
+
+        def _post_model_load_hook():
+            from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
+            from megatron.lite.primitive.optimizers.mfsdp import (
+                build_mfsdp_training_optimizer,
+            )
+
+            optimizer, finalize = build_mfsdp_training_optimizer(
+                chunks,
+                model_cfg=model_cfg,
+                impl_cfg=impl_cfg,
+                ps=ps,
+                model_name="qwen3_5",
+                is_expert=is_expert_param,
+                fsdp_unit_modules=(Qwen35Layer,),
+                deterministic=deterministic,
+            )
+            return {"optimizer": optimizer, "finalize_grads": finalize}
+
+        post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 
