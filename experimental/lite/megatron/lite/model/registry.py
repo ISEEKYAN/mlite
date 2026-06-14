@@ -7,6 +7,8 @@ import importlib
 import json
 from pathlib import Path
 
+from megatron.lite.model.deepseek_v3.config import DEEPSEEK_V3_HF_MODEL_TYPES
+
 # ---------------------------------------------------------------------------
 # Registry tables (populated by register_model)
 # ---------------------------------------------------------------------------
@@ -97,7 +99,7 @@ _DEEPSEEK_V3_LITE = "megatron.lite.model.deepseek_v3.lite.protocol"
 register_model(
     "deepseek_v3",
     package="megatron.lite.model.deepseek_v3",
-    hf_model_types=["deepseek_v3", "kimi_k2", "kimi_k25", "kimi_k26", "kimi_k27"],
+    hf_model_types=list(DEEPSEEK_V3_HF_MODEL_TYPES),
     impls={"lite": _DEEPSEEK_V3_LITE},
 )
 

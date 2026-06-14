@@ -83,13 +83,9 @@ class ImplConfig:
 
 def build_model_config(source: str | Path | dict, **overrides) -> DeepSeekV3Config:
     if isinstance(source, dict):
-        cfg = DeepSeekV3Config._from_hf_dict(source)
+        return DeepSeekV3Config._from_hf_dict(source, **overrides)
     else:
-        cfg = DeepSeekV3Config.from_hf(str(source))
-    for key, value in overrides.items():
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
-    return cfg
+        return DeepSeekV3Config.from_hf(str(source), **overrides)
 
 
 def _forward_step(model: nn.Module, batch: dict) -> dict:

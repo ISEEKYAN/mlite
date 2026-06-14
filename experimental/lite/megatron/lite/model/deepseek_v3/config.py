@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
+from typing import Any
 
 from megatron.lite.primitive.config import load_hf_config_dict
+
+DEFAULT_DEEPSEEK_V3_VARIANT = "kimi-k2"
 
 _KIMI_K25_FAMILY = {
     "rms_norm_eps": 1e-5,
@@ -21,35 +25,41 @@ _KIMI_K25_FAMILY = {
     },
 }
 
-_VARIANT_ALIASES = {
-    "deepseek-v3": "kimi-k2",
-    "deepseek_v3": "kimi-k2",
-    "kimi-k2": "kimi-k2",
-    "kimi-k2-instruct": "kimi-k2",
-    "kimi_k2": "kimi-k2",
-    "kimi_k2_instruct": "kimi-k2",
-    "kimi-k2.5": "kimi-k2.5",
-    "kimi_k2.5": "kimi-k2.5",
-    "kimi_k25": "kimi-k2.5",
-    "kimi_k2_5": "kimi-k2.5",
-    "kimi-k2.6": "kimi-k2.6",
-    "kimi_k2.6": "kimi-k2.6",
-    "kimi_k26": "kimi-k2.6",
-    "kimi_k2_6": "kimi-k2.6",
-    "kimi-k2.7": "kimi-k2.7",
-    "kimi-k2.7-code": "kimi-k2.7",
-    "kimi_k2.7": "kimi-k2.7",
-    "kimi_k27": "kimi-k2.7",
-    "kimi_k2_7": "kimi-k2.7",
-    "kimi_k27_code": "kimi-k2.7",
+
+@dataclass(frozen=True)
+class DeepSeekV3VariantConfig:
+    name: str
+    defaults: dict[str, Any] = field(default_factory=dict)
+    hf_model_types: tuple[str, ...] = ()
+
+
+DEEPSEEK_V3_VARIANTS = {
+    "kimi-k2": DeepSeekV3VariantConfig(
+        "kimi-k2",
+        hf_model_types=("deepseek_v3", "kimi_k2"),
+    ),
+    "kimi-k2.5": DeepSeekV3VariantConfig(
+        "kimi-k2.5",
+        defaults=_KIMI_K25_FAMILY,
+        hf_model_types=("kimi_k25",),
+    ),
+    "kimi-k2.6": DeepSeekV3VariantConfig(
+        "kimi-k2.6",
+        defaults=_KIMI_K25_FAMILY,
+        hf_model_types=("kimi_k26",),
+    ),
+    "kimi-k2.7": DeepSeekV3VariantConfig(
+        "kimi-k2.7",
+        defaults=_KIMI_K25_FAMILY,
+        hf_model_types=("kimi_k27",),
+    ),
 }
 
-DEEPSEEK_V3_VARIANT_CONFIGS = {
-    "kimi-k2": {},
-    "kimi-k2.5": _KIMI_K25_FAMILY,
-    "kimi-k2.6": _KIMI_K25_FAMILY,
-    "kimi-k2.7": _KIMI_K25_FAMILY,
-}
+DEEPSEEK_V3_HF_MODEL_TYPES = tuple(
+    hf_model_type
+    for variant_config in DEEPSEEK_V3_VARIANTS.values()
+    for hf_model_type in variant_config.hf_model_types
+)
 
 _HF_FIELDS = frozenset(
     {
@@ -90,56 +100,34 @@ _HF_FIELDS = frozenset(
 )
 
 
-def _normalize_variant(name: str | None) -> str:
-    if not name:
-        return "kimi-k2"
-    normalized = str(name).strip().lower().replace("_", "-")
-    normalized = normalized.removeprefix("moonshotai/")
-    normalized = normalized.removeprefix("moonshot/")
-    normalized = normalized.replace("kimi-k25", "kimi-k2.5")
-    normalized = normalized.replace("kimi-k26", "kimi-k2.6")
-    normalized = normalized.replace("kimi-k27-code", "kimi-k2.7-code")
-    normalized = normalized.replace("kimi-k27", "kimi-k2.7")
-    return _VARIANT_ALIASES.get(normalized, _VARIANT_ALIASES.get(str(name), normalized))
+def _variant_entry(variant: str) -> DeepSeekV3VariantConfig:
+    if variant not in DEEPSEEK_V3_VARIANTS:
+        raise ValueError(
+            f"Unknown DeepSeekV3 variant: {variant!r}. "
+            f"Available variants: {tuple(DEEPSEEK_V3_VARIANTS)}"
+        )
+    return DEEPSEEK_V3_VARIANTS[variant]
 
 
-def _variant_defaults(variant: str) -> dict:
-    defaults = DEEPSEEK_V3_VARIANT_CONFIGS.get(_normalize_variant(variant), {})
-    return {k: (dict(v) if isinstance(v, dict) else v) for k, v in defaults.items()}
+def _variant_defaults(variant: str) -> dict[str, Any]:
+    return deepcopy(_variant_entry(variant).defaults)
 
 
-def _infer_variant_from_text(text: str | None) -> str | None:
-    if not text:
-        return None
-    normalized = str(text).lower().replace("_", "-")
-    if "k2.7" in normalized or "k27" in normalized:
-        return "kimi-k2.7"
-    if "k2.6" in normalized or "k26" in normalized:
-        return "kimi-k2.6"
-    if "k2.5" in normalized or "k25" in normalized:
-        return "kimi-k2.5"
-    if "kimi-k2" in normalized or "deepseek-v3" in normalized:
-        return "kimi-k2"
+def _explicit_variant_from_hf(hf: dict) -> str | None:
+    variant = hf.get("variant")
+    if isinstance(variant, str):
+        return variant
+    text_config = hf.get("text_config")
+    if isinstance(text_config, dict) and isinstance(text_config.get("variant"), str):
+        return text_config["variant"]
     return None
-
-
-def _infer_variant(hf: dict) -> str:
-    for key in ("variant", "_name_or_path", "model_type"):
-        if key in hf:
-            variant = _infer_variant_from_text(hf[key]) or _normalize_variant(hf[key])
-            if variant in DEEPSEEK_V3_VARIANT_CONFIGS:
-                return variant
-    architectures = hf.get("architectures")
-    if isinstance(architectures, list) and any("KimiK25" in str(item) for item in architectures):
-        return "kimi-k2.5"
-    return "kimi-k2"
 
 
 @dataclass
 class DeepSeekV3Config:
     """Pure architecture parameters for DeepSeekV3 Instruct."""
 
-    variant: str = "kimi-k2"
+    variant: str = DEFAULT_DEEPSEEK_V3_VARIANT
     num_hidden_layers: int = 61
     hidden_size: int = 7168
     num_attention_heads: int = 64
@@ -197,7 +185,7 @@ class DeepSeekV3Config:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     def __post_init__(self) -> None:
-        self.variant = _normalize_variant(self.variant)
+        _variant_entry(self.variant)
         errors: list[str] = []
 
         def _check(cond: bool, msg: str) -> None:
@@ -240,9 +228,6 @@ class DeepSeekV3Config:
 
     @classmethod
     def from_hf(cls, path: str, **overrides) -> DeepSeekV3Config:
-        path_variant = _infer_variant_from_text(path)
-        if path_variant is not None:
-            overrides.setdefault("variant", path_variant)
         return cls._from_hf_dict(load_hf_config_dict(path), **overrides)
 
     @classmethod
@@ -252,9 +237,11 @@ class DeepSeekV3Config:
     @classmethod
     def _from_hf_dict(cls, hf: dict, **overrides) -> DeepSeekV3Config:
         overrides = dict(overrides)
-        variant = _infer_variant(hf)
         if "variant" in overrides:
-            variant = _normalize_variant(overrides.pop("variant"))
+            variant = overrides.pop("variant")
+        else:
+            variant = _explicit_variant_from_hf(hf) or DEFAULT_DEEPSEEK_V3_VARIANT
+        _variant_entry(variant)
         if "text_config" in hf and isinstance(hf["text_config"], dict):
             hf = hf["text_config"]
         kwargs = _variant_defaults(variant)
@@ -267,9 +254,8 @@ class DeepSeekV3Config:
 
     @classmethod
     def from_variant(cls, variant: str, **overrides) -> DeepSeekV3Config:
-        canonical = _normalize_variant(variant)
-        kwargs = _variant_defaults(canonical)
-        kwargs["variant"] = canonical
+        kwargs = _variant_defaults(variant)
+        kwargs["variant"] = variant
         kwargs.update(overrides)
         return cls(**kwargs)
 
@@ -280,4 +266,10 @@ class DeepSeekV3Config:
         return (layer_idx - self.first_k_dense_replace) % freq == 0
 
 
-__all__ = ["DeepSeekV3Config", "DEEPSEEK_V3_VARIANT_CONFIGS"]
+__all__ = [
+    "DEFAULT_DEEPSEEK_V3_VARIANT",
+    "DEEPSEEK_V3_HF_MODEL_TYPES",
+    "DEEPSEEK_V3_VARIANTS",
+    "DeepSeekV3Config",
+    "DeepSeekV3VariantConfig",
+]

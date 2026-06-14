@@ -84,7 +84,7 @@ def test_deepseek_v3_kimi_variant_configs_capture_public_hf_differences(tmp_path
     k2 = DeepSeekV3Config.from_variant("kimi-k2")
     k25 = DeepSeekV3Config.from_variant("kimi-k2.5")
     k26 = DeepSeekV3Config.from_variant("kimi-k2.6")
-    k27 = DeepSeekV3Config.from_variant("kimi-k2.7-code")
+    k27 = DeepSeekV3Config.from_variant("kimi-k2.7")
 
     assert k2.variant == "kimi-k2"
     assert k2.rms_norm_eps == 1e-6
@@ -106,11 +106,32 @@ def test_deepseek_v3_kimi_variant_configs_capture_public_hf_differences(tmp_path
             "model_type": "kimi_k25",
             "architectures": ["KimiK25ForConditionalGeneration"],
             "text_config": {"model_type": "kimi_k2"},
-        }
+        },
+        variant="kimi-k2.5",
     )
     assert hf_cfg.variant == "kimi-k2.5"
     assert hf_cfg.max_position_embeddings == 262144
     assert hf_cfg.rope_scaling["factor"] == 64.0
+
+    implicit_hf_cfg = DeepSeekV3Config._from_hf_dict(
+        {
+            "model_type": "kimi_k25",
+            "architectures": ["KimiK25ForConditionalGeneration"],
+            "text_config": {"model_type": "kimi_k2"},
+        }
+    )
+    assert implicit_hf_cfg.variant == "kimi-k2"
+    assert implicit_hf_cfg.max_position_embeddings == 131072
+    assert implicit_hf_cfg.rope_scaling["factor"] == 32.0
+
+    embedded_variant_cfg = DeepSeekV3Config._from_hf_dict(
+        {
+            "model_type": "kimi_k25",
+            "variant": "kimi-k2.6",
+            "text_config": {"model_type": "kimi_k2"},
+        }
+    )
+    assert embedded_variant_cfg.variant == "kimi-k2.6"
 
     local_repo = tmp_path / "moonshotai" / "Kimi-K2.6"
     local_repo.mkdir(parents=True)
@@ -124,8 +145,16 @@ def test_deepseek_v3_kimi_variant_configs_capture_public_hf_differences(tmp_path
         )
     )
     path_cfg = DeepSeekV3Config.from_hf(str(local_repo))
-    assert path_cfg.variant == "kimi-k2.6"
-    assert path_cfg.max_position_embeddings == 262144
+    assert path_cfg.variant == "kimi-k2"
+    assert path_cfg.max_position_embeddings == 131072
+
+    explicit_path_cfg = DeepSeekV3Config.from_hf(str(local_repo), variant="kimi-k2.6")
+    assert explicit_path_cfg.variant == "kimi-k2.6"
+    assert explicit_path_cfg.max_position_embeddings == 262144
+
+    for implicit_name in ("kimi_k25", "kimi-k2.7-code", "moonshotai/Kimi-K2.6"):
+        with pytest.raises(ValueError, match="Unknown DeepSeekV3 variant"):
+            DeepSeekV3Config.from_variant(implicit_name)
 
 
 def test_deepseek_v3_lite_does_not_import_wrappers_or_sibling_models():
