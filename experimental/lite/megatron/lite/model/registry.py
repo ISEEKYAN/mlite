@@ -99,6 +99,13 @@ register_model(
     impls={"lite": "megatron.lite.model.kimi_k2.lite.protocol"},
 )
 
+register_model(
+    "glm5",
+    package="megatron.lite.model.glm5",
+    hf_model_types=["glm_moe_dsa"],
+    impls={"lite": "megatron.lite.model.glm5.lite.protocol"},
+)
+
 
 # ---------------------------------------------------------------------------
 # Lookup functions
