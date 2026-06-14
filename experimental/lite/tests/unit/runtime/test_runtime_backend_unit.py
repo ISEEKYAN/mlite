@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -181,6 +182,26 @@ def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     runtime.to(handle, "cuda", model=False, optimizer=True, grad=False)
 
     assert optimizer.calls == ["offload", "load"]
+
+
+def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
+    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+
+    class NativeModel:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def to(self, device):
+            self.calls.append(device)
+            return self
+
+    monkeypatch.setitem(sys.modules, "megatron.core", None)
+    model = NativeModel()
+
+    offload_model_to_cpu([model])
+    load_model_to_gpu([model])
+
+    assert model.calls == ["cpu", "cuda"]
 
 
 def test_model_handle_dp_defaults():

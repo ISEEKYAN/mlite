@@ -77,11 +77,6 @@ def _load_verl_file(relative_path: str, module_name: str):
 
 def load_verl_engine_api():
     try:
-        from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
-        from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
-    except ModuleNotFoundError as exc:
-        if exc.name != "megatron.core":
-            raise
         base = _load_verl_file("workers/engine/base.py", "_verl_mlite_verl_engine_base")
         utils = _load_verl_file("workers/engine/utils.py", "_verl_mlite_verl_engine_utils")
         BaseEngine = base.BaseEngine
@@ -89,5 +84,8 @@ def load_verl_engine_api():
         EngineRegistry = base.EngineRegistry
         postprocess_batch_func = utils.postprocess_batch_func
         prepare_micro_batches = utils.prepare_micro_batches
+    except (FileNotFoundError, ModuleNotFoundError, ImportError):
+        from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
+        from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 
     return BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches

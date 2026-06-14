@@ -71,6 +71,39 @@ def _write_kimi_config(path) -> None:
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def _write_glm5_config(path) -> None:
+    config = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "head_dim": 256,
+        "vocab_size": 32,
+        "max_position_embeddings": 64,
+        "initializer_range": 0.002,
+        "q_lora_rank": 16,
+        "kv_lora_rank": 512,
+        "qk_head_dim": 256,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "index_topk": 512,
+        "intermediate_size": 20,
+        "moe_intermediate_size": 6,
+        "first_k_dense_replace": 1,
+        "n_routed_experts": 3,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 3,
+        "num_nextn_predict_layers": 1,
+        "mlp_layer_types": ["dense", "dense"],
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 def _optimizer_config() -> SimpleNamespace:
     return SimpleNamespace(
         optimizer="adam",
@@ -94,7 +127,16 @@ def _optimizer_config() -> SimpleNamespace:
     )
 
 
-def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(tmp_path):
+@pytest.mark.parametrize(
+    ("model_name", "model_type", "write_config", "vocab_size", "lengths"),
+    [
+        ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [5, 7, 9]),
+        ("glm5", "glm_moe_dsa", _write_glm5_config, 32, [16, 20, 24]),
+    ],
+)
+def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(
+    tmp_path, model_name, model_type, write_config, vocab_size, lengths
+):
     torch = pytest.importorskip("torch")
     dist = pytest.importorskip("torch.distributed")
     TensorDict = pytest.importorskip("tensordict").TensorDict
@@ -107,17 +149,17 @@ def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(tmp_path)
     device = _init_dist_or_skip()
     world = dist.get_world_size()
     rank = dist.get_rank()
-    hf_path = tmp_path / "tiny-kimi"
-    _write_kimi_config(hf_path)
+    hf_path = tmp_path / f"tiny-{model_name}"
+    write_config(hf_path)
 
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path=str(hf_path),
-            hf_config={"model_type": "deepseek_v3"},
+            hf_config={"model_type": model_type},
             mtp=None,
         ),
         engine_config=MegatronLiteEngineConfig(
-            model_name="kimi_k2",
+            model_name=model_name,
             cp=world,
             impl_cfg={"use_thd": True, "optimizer": None, "deterministic": False},
             use_fused_kernels=False,
@@ -136,9 +178,11 @@ def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(tmp_path)
     engine.initialize()
     engine.optimizer_zero_grad()
 
-    lengths = [5, 7, 9]
     input_ids = torch.nested.as_nested_tensor(
-        [torch.randint(0, 128, (length,), device=device, dtype=torch.long) for length in lengths],
+        [
+            torch.randint(0, vocab_size, (length,), device=device, dtype=torch.long)
+            for length in lengths
+        ],
         layout=torch.jagged,
     )
     loss_mask = torch.nested.as_nested_tensor(
@@ -198,6 +242,7 @@ def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(tmp_path)
     if rank == 0:
         print(
             "NON_SKIP_VERL_MLITE_RUNTIME_THD_CP_SMOKE_PASSED "
+            f"model={model_name} "
             f"world_size={world} lengths={lengths} "
             f"loss={float(result.model_output.loss.detach().item()):.6e} "
             f"grad_norm_sum={float(grad_norm.item()):.6e}"
