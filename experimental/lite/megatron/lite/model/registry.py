@@ -92,11 +92,13 @@ register_model(
     impls={"lite": "megatron.lite.model.qwen3_5.lite.protocol"},
 )
 
+_DEEPSEEK_V3_LITE = "megatron.lite.model.deepseek_v3.lite.protocol"
+
 register_model(
-    "kimi_k2",
-    package="megatron.lite.model.kimi_k2",
-    hf_model_types=["kimi_k2", "deepseek_v3"],
-    impls={"lite": "megatron.lite.model.kimi_k2.lite.protocol"},
+    "deepseek_v3",
+    package="megatron.lite.model.deepseek_v3",
+    hf_model_types=["deepseek_v3", "kimi_k2", "kimi_k25", "kimi_k26", "kimi_k27"],
+    impls={"lite": _DEEPSEEK_V3_LITE},
 )
 
 

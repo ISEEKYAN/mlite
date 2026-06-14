@@ -1,34 +1,48 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Static smoke coverage for Kimi K2 lite native implementation."""
+"""Static smoke coverage for DeepSeekV3 lite native implementation."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 
-def test_kimi_k2_lite_registry_resolves():
+def test_deepseek_v3_lite_registry_resolves():
     from megatron.lite.model.registry import (
         get_train_runtime_module,
         resolve_model_type_from_hf,
         resolve_runtime_model_name,
     )
 
-    runtime_name = resolve_runtime_model_name("kimi_k2", "lite")
-    assert runtime_name == "kimi_k2"
-    assert resolve_model_type_from_hf({"model_type": "kimi_k2"}) == "kimi_k2"
-    assert resolve_model_type_from_hf({"model_type": "deepseek_v3"}) == "kimi_k2"
+    runtime_name = resolve_runtime_model_name("deepseek_v3", "lite")
+    assert runtime_name == "deepseek_v3"
+    assert resolve_model_type_from_hf({"model_type": "deepseek_v3"}) == "deepseek_v3"
+    assert resolve_model_type_from_hf({"model_type": "kimi_k2"}) == "deepseek_v3"
+    assert resolve_model_type_from_hf({"model_type": "kimi_k25"}) == "deepseek_v3"
+    assert resolve_model_type_from_hf({"model_type": "kimi_k26"}) == "deepseek_v3"
+    assert resolve_model_type_from_hf({"model_type": "kimi_k27"}) == "deepseek_v3"
     module = get_train_runtime_module(runtime_name)
-    assert module.__name__ == "megatron.lite.model.kimi_k2.lite.protocol"
+    assert module.__name__ == "megatron.lite.model.deepseek_v3.lite.protocol"
+
+    with pytest.raises(ValueError, match="No runtime"):
+        resolve_runtime_model_name("kimi_k2", "lite")
 
 
-def test_kimi_k2_config_reads_hf_fields():
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
+def test_deepseek_v3_has_no_independent_kimi_k2_model_dir():
+    model_root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model"
 
-    cfg = KimiK2Config._from_hf_dict(
+    assert (model_root / "deepseek_v3").is_dir()
+    assert not (model_root / "kimi_k2").exists()
+
+
+def test_deepseek_v3_config_reads_hf_fields():
+    from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
+
+    cfg = DeepSeekV3Config._from_hf_dict(
         {
-            "model_type": "kimi_k2",
+            "model_type": "deepseek_v3",
             "num_hidden_layers": 3,
             "hidden_size": 32,
             "num_attention_heads": 4,
@@ -64,8 +78,60 @@ def test_kimi_k2_config_reads_hf_fields():
     assert cfg.is_moe_layer(1)
 
 
-def test_kimi_k2_lite_does_not_import_wrappers_or_sibling_models():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
+def test_deepseek_v3_kimi_variant_configs_capture_public_hf_differences(tmp_path):
+    from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
+
+    k2 = DeepSeekV3Config.from_variant("kimi-k2")
+    k25 = DeepSeekV3Config.from_variant("kimi-k2.5")
+    k26 = DeepSeekV3Config.from_variant("kimi-k2.6")
+    k27 = DeepSeekV3Config.from_variant("kimi-k2.7-code")
+
+    assert k2.variant == "kimi-k2"
+    assert k2.rms_norm_eps == 1e-6
+    assert k2.max_position_embeddings == 131072
+    assert k2.rope_scaling["factor"] == 32.0
+    assert k2.rope_scaling["beta_fast"] == 1.0
+
+    for variant_cfg, variant in ((k25, "kimi-k2.5"), (k26, "kimi-k2.6"), (k27, "kimi-k2.7")):
+        assert variant_cfg.variant == variant
+        assert variant_cfg.rms_norm_eps == 1e-5
+        assert variant_cfg.max_position_embeddings == 262144
+        assert variant_cfg.rope_scaling["factor"] == 64.0
+        assert variant_cfg.rope_scaling["beta_fast"] == 32.0
+        assert variant_cfg.hidden_size == k2.hidden_size
+        assert variant_cfg.n_routed_experts == k2.n_routed_experts
+
+    hf_cfg = DeepSeekV3Config._from_hf_dict(
+        {
+            "model_type": "kimi_k25",
+            "architectures": ["KimiK25ForConditionalGeneration"],
+            "text_config": {"model_type": "kimi_k2"},
+        }
+    )
+    assert hf_cfg.variant == "kimi-k2.5"
+    assert hf_cfg.max_position_embeddings == 262144
+    assert hf_cfg.rope_scaling["factor"] == 64.0
+
+    local_repo = tmp_path / "moonshotai" / "Kimi-K2.6"
+    local_repo.mkdir(parents=True)
+    (local_repo / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_k25",
+                "architectures": ["KimiK25ForConditionalGeneration"],
+                "text_config": {"model_type": "kimi_k2"},
+            }
+        )
+    )
+    path_cfg = DeepSeekV3Config.from_hf(str(local_repo))
+    assert path_cfg.variant == "kimi-k2.6"
+    assert path_cfg.max_position_embeddings == 262144
+
+
+def test_deepseek_v3_lite_does_not_import_wrappers_or_sibling_models():
+    root = (
+        Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "deepseek_v3" / "lite"
+    )
     forbidden = (
         "megatron.lite.model.qwen3_5",
         "megatron.lite.model.qwen3_moe",
@@ -81,16 +147,18 @@ def test_kimi_k2_lite_does_not_import_wrappers_or_sibling_models():
             assert token not in text
 
 
-def test_kimi_k2_lite_implementation_files_stay_small():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
+def test_deepseek_v3_lite_implementation_files_stay_small():
+    root = (
+        Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "deepseek_v3" / "lite"
+    )
     for name in ("model.py", "protocol.py", "checkpoint.py"):
         line_count = len((root / name).read_text().splitlines())
         assert line_count < 1000, f"{name} has {line_count} lines"
 
 
-def test_kimi_k2_lite_uses_shared_mla_primitive():
+def test_deepseek_v3_lite_uses_shared_mla_primitive():
     lite_root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
-    model_root = lite_root / "model" / "kimi_k2" / "lite"
+    model_root = lite_root / "model" / "deepseek_v3" / "lite"
     primitive_mla = lite_root / "primitive" / "attention" / "mla.py"
     model_text = (model_root / "model.py").read_text()
     mla_text = primitive_mla.read_text()
@@ -100,11 +168,13 @@ def test_kimi_k2_lite_uses_shared_mla_primitive():
     assert "class MultiLatentAttention" not in model_text
     assert "class MultiLatentAttention" in mla_text
     assert "megatron.core" not in mla_text
-    assert "KimiK2SigmoidTopKRouter" in model_text
+    assert "DeepSeekV3SigmoidTopKRouter" in model_text
 
 
-def test_kimi_k2_lite_optimizer_names_are_current():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
+def test_deepseek_v3_lite_optimizer_names_are_current():
+    root = (
+        Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "deepseek_v3" / "lite"
+    )
     protocol_text = (root / "protocol.py").read_text()
 
     assert 'optimizer: str | None = "distopt"' in protocol_text
@@ -114,8 +184,8 @@ def test_kimi_k2_lite_optimizer_names_are_current():
         assert forbidden not in protocol_text
 
 
-def test_kimi_k2_distopt_deterministic_default_is_enabled():
-    from megatron.lite.model.kimi_k2.lite.protocol import ImplConfig
+def test_deepseek_v3_distopt_deterministic_default_is_enabled():
+    from megatron.lite.model.deepseek_v3.lite.protocol import ImplConfig
 
     cfg = ImplConfig(optimizer="distopt", deterministic=True, mtp_enable=True)
 
@@ -124,11 +194,11 @@ def test_kimi_k2_distopt_deterministic_default_is_enabled():
     assert cfg.mtp_enable is True
 
 
-def test_kimi_k2_impl_config_accepts_runtime_mtp_fields():
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
-    from megatron.lite.model.kimi_k2.lite.protocol import ImplConfig
+def test_deepseek_v3_impl_config_accepts_runtime_mtp_fields():
+    from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
+    from megatron.lite.model.deepseek_v3.lite.protocol import ImplConfig
 
-    cfg = KimiK2Config(
+    cfg = DeepSeekV3Config(
         num_hidden_layers=1,
         hidden_size=8,
         num_attention_heads=2,
@@ -155,7 +225,7 @@ def test_kimi_k2_impl_config_accepts_runtime_mtp_fields():
     assert cfg.num_nextn_predict_layers == 1
 
 
-def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
+def test_deepseek_v3_mtp_and_pp_layout_rules_are_explicit():
     from megatron.lite.primitive.parallel import ParallelState, build_pipeline_chunk_layout
 
     model_text = (
@@ -163,7 +233,7 @@ def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
         / "megatron"
         / "lite"
         / "model"
-        / "kimi_k2"
+        / "deepseek_v3"
         / "lite"
         / "model.py"
     ).read_text()
@@ -187,18 +257,18 @@ def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
         build_pipeline_chunk_layout(3, rank0, vpp=2, vpp_chunk_id=0)
 
 
-def test_kimi_k2_checkpoint_exports_hf_names():
+def test_deepseek_v3_checkpoint_exports_hf_names():
     torch = pytest.importorskip("torch")
 
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
-    from megatron.lite.model.kimi_k2.lite import protocol
-    from megatron.lite.model.kimi_k2.lite.checkpoint import (
-        KimiK2WeightSpec,
+    from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
+    from megatron.lite.model.deepseek_v3.lite import protocol
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import (
+        DeepSeekV3WeightSpec,
         export_hf_weights,
         save_hf_weights,
     )
 
-    cfg = KimiK2Config(
+    cfg = DeepSeekV3Config(
         num_hidden_layers=2,
         hidden_size=8,
         num_attention_heads=2,
@@ -219,7 +289,7 @@ def test_kimi_k2_checkpoint_exports_hf_names():
         v_head_dim=2,
         num_nextn_predict_layers=1,
     )
-    spec = KimiK2WeightSpec(cfg)
+    spec = DeepSeekV3WeightSpec(cfg)
 
     assert callable(export_hf_weights)
     assert callable(save_hf_weights)
@@ -265,12 +335,12 @@ def test_kimi_k2_checkpoint_exports_hf_names():
     }
 
 
-def test_kimi_k2_fp8_checkpoint_dequant_cpu_path():
+def test_deepseek_v3_fp8_checkpoint_dequant_cpu_path():
     torch = pytest.importorskip("torch")
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch float8_e4m3fn is required for this smoke.")
 
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _dequant_fp8_weight
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import _dequant_fp8_weight
 
     class Reader:
         index = {"w_scale_inv": "fake.safetensors"}
@@ -286,10 +356,10 @@ def test_kimi_k2_fp8_checkpoint_dequant_cpu_path():
     torch.testing.assert_close(out, weight.float() * 2.0)
 
 
-def test_kimi_k2_int4_checkpoint_dequant_cpu_path():
+def test_deepseek_v3_int4_checkpoint_dequant_cpu_path():
     torch = pytest.importorskip("torch")
 
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _get
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import _get
 
     values = torch.tensor([[-8, -7, -1, 0, 1, 2, 6, 7, -8, 7]], dtype=torch.int8)
     unsigned = (values + 8).to(torch.int32)
@@ -320,8 +390,8 @@ def test_kimi_k2_int4_checkpoint_dequant_cpu_path():
     torch.testing.assert_close(out, expected)
 
 
-def test_kimi_k2_real_checkpoint_prefix_helpers():
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _lm_head_name, _text_prefix
+def test_deepseek_v3_real_checkpoint_prefix_helpers():
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import _lm_head_name, _text_prefix
 
     class Reader:
         index = {

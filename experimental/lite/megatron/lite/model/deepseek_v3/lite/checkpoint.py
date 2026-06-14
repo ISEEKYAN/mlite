@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Kimi K2 lite native checkpoint mapping."""
+"""DeepSeekV3 lite native checkpoint mapping."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
-from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _cast_export_tensor,
@@ -135,7 +135,7 @@ def _text_prefix(reader: SafeTensorReader) -> str:
     for prefix in ("model", "language_model.model", "model.language_model"):
         if _has(reader, f"{prefix}.embed_tokens.weight"):
             return prefix
-    raise KeyError("Could not find Kimi K2 text model prefix in HF checkpoint.")
+    raise KeyError("Could not find DeepSeekV3 text model prefix in HF checkpoint.")
 
 
 def _lm_head_name(reader: SafeTensorReader, text_prefix: str) -> str:
@@ -147,11 +147,11 @@ def _lm_head_name(reader: SafeTensorReader, text_prefix: str) -> str:
     for name in candidates:
         if _has(reader, name):
             return name
-    raise KeyError("Could not find Kimi K2 lm_head.weight in HF checkpoint.")
+    raise KeyError("Could not find DeepSeekV3 lm_head.weight in HF checkpoint.")
 
 
 def _load_vocab(
-    reader: SafeTensorReader, name: str, cfg: KimiK2Config, ps: ParallelState
+    reader: SafeTensorReader, name: str, cfg: DeepSeekV3Config, ps: ParallelState
 ) -> torch.Tensor:
     from megatron.lite.primitive.parallel import pad_vocab_for_tp
 
@@ -273,7 +273,7 @@ def _load_experts(
     *,
     local_prefix: str,
     hf_mlp_prefix: str,
-    cfg: KimiK2Config,
+    cfg: DeepSeekV3Config,
     ps: ParallelState,
     reader: SafeTensorReader,
 ) -> None:
@@ -310,7 +310,7 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
         if actual is not None:
             resolved[actual] = tensor
         else:
-            log_rank0(f"WARNING: kimi_k2 checkpoint tensor has no target param: {name}")
+            log_rank0(f"WARNING: deepseek_v3 checkpoint tensor has no target param: {name}")
 
     for name, target in model.named_parameters():
         if name not in resolved:
@@ -326,10 +326,10 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
         target.data.copy_(tensor.to(dtype=target.dtype) if target.is_floating_point() else tensor)
 
 
-class KimiK2WeightSpec:
-    """Export Kimi K2 lite weights to HF DeepSeekV3/Kimi-style names."""
+class DeepSeekV3WeightSpec:
+    """Export DeepSeekV3 lite weights to HF DeepSeekV3/Kimi-style names."""
 
-    def __init__(self, config: KimiK2Config):
+    def __init__(self, config: DeepSeekV3Config):
         self.config = config
 
     @property
@@ -485,7 +485,9 @@ class KimiK2WeightSpec:
         return f"{prefix}.weight{local_idx}"
 
 
-def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: ParallelState) -> None:
+def load_hf_weights(
+    model: nn.Module, path: str, config: DeepSeekV3Config, ps: ParallelState
+) -> None:
     base_model = unwrap_model(model)
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
@@ -613,10 +615,10 @@ def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: Paral
     _copy_loaded_state(base_model, out)
 
 
-def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
+def export_hf_weights(model, config: DeepSeekV3Config, ps: ParallelState, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
-    spec = KimiK2WeightSpec(config)
+    spec = DeepSeekV3WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
@@ -639,7 +641,7 @@ def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
                 yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
-def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState) -> None:
+def save_hf_weights(model, path: str, config: DeepSeekV3Config, ps: ParallelState) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
 
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -652,7 +654,7 @@ def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState) -
 
 __all__ = [
     "EXPERT_CLASSIFIER",
-    "KimiK2WeightSpec",
+    "DeepSeekV3WeightSpec",
     "PLACEMENT_FN",
     "_dequant_int4_weight",
     "_dequant_fp8_weight",

@@ -13,7 +13,7 @@ def _init_dist_or_skip():
     import torch.distributed as dist
 
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for Kimi K2 CP smoke.")
+        pytest.skip("CUDA is required for DeepSeekV3 CP smoke.")
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Run with torchrun so CP ranks are available.")
 
@@ -22,14 +22,14 @@ def _init_dist_or_skip():
     if not dist.is_initialized():
         dist.init_process_group("nccl")
     if dist.get_world_size() < 2:
-        pytest.skip("Kimi K2 CP smoke requires at least 2 ranks.")
+        pytest.skip("DeepSeekV3 CP smoke requires at least 2 ranks.")
     return torch.device("cuda", local_rank)
 
 
 def _tiny_config():
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
+    from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
 
-    return KimiK2Config(
+    return DeepSeekV3Config(
         num_hidden_layers=2,
         hidden_size=64,
         num_attention_heads=4,
@@ -63,9 +63,9 @@ def _tiny_config():
 
 
 def _tiny_hf_parity_config():
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
+    from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
 
-    return KimiK2Config(
+    return DeepSeekV3Config(
         num_hidden_layers=2,
         hidden_size=64,
         num_attention_heads=4,
@@ -168,7 +168,7 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
     return float(stats[0].item()), float((stats[0] / stats[1]).item())
 
 
-def _hf_state_dict_for_kimi_loader(model):
+def _hf_state_dict_for_deepseek_v3_loader(model):
     state = {
         name: tensor.detach().cpu().contiguous().clone()
         for name, tensor in model.state_dict().items()
@@ -189,7 +189,7 @@ def _hf_state_dict_for_kimi_loader(model):
     return state
 
 
-def test_kimi_k2_mla_cp2_matches_full_sequence_reference_forward_and_grad():
+def test_deepseek_v3_mla_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch
     import torch.distributed as dist
 
@@ -244,12 +244,12 @@ def test_kimi_k2_mla_cp2_matches_full_sequence_reference_forward_and_grad():
     torch.testing.assert_close(local_x.grad, expected_grad, atol=1e-1, rtol=1e-1)
 
 
-def test_kimi_k2_tiny_model_cp2_matches_full_sequence_reference_forward():
+def test_deepseek_v3_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch
     import torch.distributed as dist
 
     device = _init_dist_or_skip()
-    from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
+    from megatron.lite.model.deepseek_v3.lite.model import DeepSeekV3Model
     from megatron.lite.primitive.parallel import ParallelState
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import init_parallel
@@ -261,12 +261,12 @@ def test_kimi_k2_tiny_model_cp2_matches_full_sequence_reference_forward():
     ps = init_parallel(ParallelConfig(tp=1, ep=1, etp=1, cp=world, pp=1))
 
     torch.manual_seed(777)
-    cp_model = KimiK2Model(cfg, _train_cfg(world), ps, use_thd=False).to(
+    cp_model = DeepSeekV3Model(cfg, _train_cfg(world), ps, use_thd=False).to(
         device=device,
         dtype=torch.bfloat16,
     )
     torch.manual_seed(777)
-    ref_model = KimiK2Model(cfg, _train_cfg(1), ParallelState(), use_thd=False).to(
+    ref_model = DeepSeekV3Model(cfg, _train_cfg(1), ParallelState(), use_thd=False).to(
         device=device,
         dtype=torch.bfloat16,
     )
@@ -290,14 +290,14 @@ def test_kimi_k2_tiny_model_cp2_matches_full_sequence_reference_forward():
     torch.testing.assert_close(cp_out["log_probs"], expected_log_probs, atol=1e-1, rtol=1e-1)
 
 
-def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
+def test_deepseek_v3_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     import torch
     import torch.distributed as dist
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
     device = _init_dist_or_skip()
-    from megatron.lite.model.kimi_k2.lite.checkpoint import load_hf_weights
-    from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import load_hf_weights
+    from megatron.lite.model.deepseek_v3.lite.model import DeepSeekV3Model
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import init_parallel
@@ -315,12 +315,12 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     hf_ref.eval()
     rank_tmp_path = tmp_path / f"rank{rank}"
     save_safetensors(
-        _hf_state_dict_for_kimi_loader(hf_ref),
+        _hf_state_dict_for_deepseek_v3_loader(hf_ref),
         str(rank_tmp_path),
     )
 
     ps = init_parallel(ParallelConfig(tp=1, ep=1, etp=1, cp=world, pp=1))
-    native = KimiK2Model(cfg, _train_cfg(world), ps, use_thd=False).to(
+    native = DeepSeekV3Model(cfg, _train_cfg(world), ps, use_thd=False).to(
         device=device,
         dtype=torch.bfloat16,
     )
@@ -355,7 +355,7 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     with torch.no_grad():
         if rank == 0:
             print(
-                "kimi_k2_hf_native_parity reference=transformers.DeepseekV3ForCausalLM "
+                "deepseek_v3_hf_native_parity reference=transformers.DeepseekV3ForCausalLM "
                 "rope=DeepseekV3RotaryEmbedding+apply_rotary_pos_emb_interleave"
             )
         hf_logits = hf_ref(full_ids).logits
@@ -374,7 +374,7 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(
-                f"kimi_k2_hf_native_parity layer={layer_idx} "
+                f"deepseek_v3_hf_native_parity layer={layer_idx} "
                 f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
             )
         torch.testing.assert_close(
@@ -388,7 +388,7 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     max_abs, max_rel = _distributed_diff_stats(native_logits, expected)
     if rank == 0:
         print(
-            "kimi_k2_hf_native_parity logits "
+            "deepseek_v3_hf_native_parity logits "
             f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
         )
     torch.testing.assert_close(
@@ -399,12 +399,12 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     )
 
 
-def test_kimi_k2_packed_thd_variable_sequence_cp2_smoke():
+def test_deepseek_v3_packed_thd_variable_sequence_cp2_smoke():
     import torch
     import torch.distributed as dist
 
     device = _init_dist_or_skip()
-    from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
+    from megatron.lite.model.deepseek_v3.lite.model import DeepSeekV3Model
     from megatron.lite.primitive.parallel.state import init_parallel
     from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
     from megatron.lite.runtime.contracts import ParallelConfig
@@ -415,7 +415,7 @@ def test_kimi_k2_packed_thd_variable_sequence_cp2_smoke():
     ps = init_parallel(ParallelConfig(tp=1, ep=1, etp=1, cp=world, pp=1))
 
     torch.manual_seed(20260614)
-    model = KimiK2Model(cfg, _train_cfg(world), ps, use_thd=True).to(
+    model = DeepSeekV3Model(cfg, _train_cfg(world), ps, use_thd=True).to(
         device=device,
         dtype=torch.bfloat16,
     )
@@ -464,18 +464,18 @@ def test_kimi_k2_packed_thd_variable_sequence_cp2_smoke():
 
     if rank == 0:
         print(
-            "NON_SKIP_KIMI_K2_THD_CP_SMOKE_PASSED "
+            "NON_SKIP_DeepSeekV3_THD_CP_SMOKE_PASSED "
             f"world_size={world} lengths={lengths} "
             f"loss={float(out['loss'].detach().item()):.6e}"
         )
 
 
-def test_kimi_k2_tiny_model_fsdp2_optimizer_step_smoke():
+def test_deepseek_v3_tiny_model_fsdp2_optimizer_step_smoke():
     import torch
     import torch.distributed as dist
 
     device = _init_dist_or_skip()
-    from megatron.lite.model.kimi_k2.lite.protocol import ImplConfig, build_model
+    from megatron.lite.model.deepseek_v3.lite.protocol import ImplConfig, build_model
     from megatron.lite.primitive.optimizers.fsdp2 import FSDP2Optimizer, fsdp2_available
     from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
@@ -529,7 +529,7 @@ def test_kimi_k2_tiny_model_fsdp2_optimizer_step_smoke():
     assert torch.isfinite(torch.tensor(grad_norm))
     if rank == 0:
         print(
-            "kimi_k2_fsdp2_smoke optimizer=fsdp2 "
+            "deepseek_v3_fsdp2_smoke optimizer=fsdp2 "
             f"world_size={world} loss={float(loss.detach().item()):.6e} "
             f"grad_norm={grad_norm:.6e}"
         )

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Kimi K2 lite impl - native model protocol for Megatron Lite runtime."""
+"""DeepSeekV3 lite impl - native model protocol for Megatron Lite runtime."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.model.deepseek_v3.config import DeepSeekV3Config
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
@@ -23,7 +23,7 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    from megatron.lite.model.kimi_k2.lite.checkpoint import PLACEMENT_FN as placement_fn
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import PLACEMENT_FN as placement_fn
 
     return placement_fn(param_name)
 
@@ -81,11 +81,11 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
 
 
-def build_model_config(source: str | Path | dict, **overrides) -> KimiK2Config:
+def build_model_config(source: str | Path | dict, **overrides) -> DeepSeekV3Config:
     if isinstance(source, dict):
-        cfg = KimiK2Config._from_hf_dict(source)
+        cfg = DeepSeekV3Config._from_hf_dict(source)
     else:
-        cfg = KimiK2Config.from_hf(str(source))
+        cfg = DeepSeekV3Config.from_hf(str(source))
     for key, value in overrides.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
@@ -119,7 +119,7 @@ def _make_aux_loss_hook():
 
 
 def _build_distopt_optimizer(
-    chunks, model_cfg: KimiK2Config, impl_cfg: ImplConfig, ps: ParallelState
+    chunks, model_cfg: DeepSeekV3Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
     from megatron.lite.primitive.optimizers.megatron_wrap import build_distopt_training_optimizer
 
@@ -128,13 +128,13 @@ def _build_distopt_optimizer(
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
         ps=ps,
-        model_name="kimi_k2",
+        model_name="deepseek_v3",
         is_expert=is_expert_param,
         deterministic=impl_cfg.deterministic,
     )
 
 
-def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+def build_model(model_cfg: DeepSeekV3Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
@@ -151,7 +151,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     elif hasattr(model_cfg, "num_nextn_predict_layers"):
         model_cfg.num_nextn_predict_layers = 0
 
-    from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
+    from megatron.lite.model.deepseek_v3.lite.model import DeepSeekV3Model
 
     ps = init_parallel(p)
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
@@ -179,10 +179,12 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     )
 
     if vpp is None:
-        chunks = [KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            DeepSeekV3Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()
+        ]
     else:
         chunks = [
-            KimiK2Model(
+            DeepSeekV3Model(
                 model_cfg,
                 train_cfg,
                 ps,
@@ -222,7 +224,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
         optimizer_backend = "fsdp2"
 
         def _post_model_load_hook():
-            from megatron.lite.model.kimi_k2.lite.model import KimiK2Layer
+            from megatron.lite.model.deepseek_v3.lite.model import DeepSeekV3Layer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
@@ -230,7 +232,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
                     chunks,
                     impl_cfg.optimizer_config,
                     ps,
-                    unit_modules=(KimiK2Layer,),
+                    unit_modules=(DeepSeekV3Layer,),
                     expert_classifier=is_expert_param,
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
@@ -240,7 +242,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer is not None:
-        raise ValueError(f"Unknown kimi_k2 lite optimizer: {impl_cfg.optimizer!r}.")
+        raise ValueError(f"Unknown deepseek_v3 lite optimizer: {impl_cfg.optimizer!r}.")
 
     return ModelBundle(
         chunks=chunks,
@@ -258,17 +260,17 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
 
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: KimiK2Config, ps: ParallelState
+    chunk: nn.Module, hf_path: str, model_cfg: DeepSeekV3Config, ps: ParallelState
 ) -> None:
     if not hf_path:
         return
-    from megatron.lite.model.kimi_k2.lite.checkpoint import load_hf_weights as load_impl
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import load_hf_weights as load_impl
 
     load_impl(chunk, hf_path, model_cfg, ps)
 
 
-def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwargs):
-    from megatron.lite.model.kimi_k2.lite.checkpoint import export_hf_weights as export_impl
+def export_hf_weights(chunks, model_cfg: DeepSeekV3Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.deepseek_v3.lite.checkpoint import export_hf_weights as export_impl
 
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
