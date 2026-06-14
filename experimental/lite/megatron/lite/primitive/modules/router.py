@@ -123,7 +123,7 @@ class TopKRouter(nn.Module):
 
 
 class SigmoidTopKRouter(nn.Module):
-    """Sigmoid-based TopK router for DeepSeek V3."""
+    """Sigmoid-family TopK router for DeepSeek-style MoE."""
 
     def __init__(
         self,
@@ -143,8 +143,9 @@ class SigmoidTopKRouter(nn.Module):
             )
         self.topk = config.num_experts_per_tok
         self.num_experts = config.n_routed_experts
-        self.aux_loss_coeff = config.aux_loss_alpha
+        self.aux_loss_coeff = getattr(config, "aux_loss_alpha", 0.0)
         self.scaling_factor = config.routed_scaling_factor
+        self.score_function = getattr(config, "scoring_func", "sigmoid")
         self.router_bias_rate = router_bias_rate
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
@@ -166,7 +167,7 @@ class SigmoidTopKRouter(nn.Module):
         probs_dense, routing_map = topk_routing_with_score_function(
             logits,
             self.topk,
-            score_function="sigmoid",
+            score_function=self.score_function,
             expert_bias=self.expert_bias.to(logits.dtype),
             scaling_factor=(self.scaling_factor or None),
             fused=self.moe_router_fusion,
@@ -178,7 +179,7 @@ class SigmoidTopKRouter(nn.Module):
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():
             _, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function="sigmoid", fused=self.moe_router_fusion
+                logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens

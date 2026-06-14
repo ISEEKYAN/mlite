@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from collections.abc import Iterator
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -15,15 +16,6 @@ def zigzag_split_for_cp(
     cp_size: int,
     seq_dim: int = 1,
 ) -> torch.Tensor:
-    """Split tensor along sequence dim using zigzag (striped) pattern for CP.
-
-    Splits into 2*cp_size chunks; GPU i gets chunk[i] + chunk[2*cp_size-1-i].
-    This balances causal-mask workload across CP ranks.
-
-    Example (CP=2, seq=8): chunks [0,1,2,3] ->
-        GPU0: chunk[0]+chunk[3] = tokens [0,1,6,7]
-        GPU1: chunk[1]+chunk[2] = tokens [2,3,4,5]
-    """
     if cp_size <= 1:
         return tensor
     seq_len = tensor.shape[seq_dim]
@@ -89,18 +81,48 @@ def zigzag_slice_for_cp(
     return torch.cat((first, second), dim=seq_dim).contiguous()
 
 
+def contiguous_slice_for_cp(
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int = 1
+) -> torch.Tensor:
+    if cp_size <= 1:
+        return tensor
+    seq_len = tensor.shape[seq_dim]
+    assert seq_len % cp_size == 0, f"seq_len={seq_len} must be divisible by cp_size={cp_size}"
+    chunk = seq_len // cp_size
+    return tensor.narrow(seq_dim, cp_rank * chunk, chunk).contiguous()
+
+
+def split_packed_contiguous_for_cp(
+    tensor: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    name: str,
+) -> torch.Tensor | None:
+    if tensor is None or cp_size <= 1:
+        return tensor
+    total_tokens = int(cu_seqlens[-1].item())
+    matches = [idx for idx, size in enumerate(tensor.shape) if size == total_tokens]
+    if not matches:
+        raise ValueError(f"Packed {name} has no sequence dimension of length {total_tokens}.")
+    seq_dim = matches[-1]
+    parts = []
+    for idx in range(cu_seqlens.size(0) - 1):
+        start, end = int(cu_seqlens[idx].item()), int(cu_seqlens[idx + 1].item())
+        seq_len = end - start
+        if seq_len % cp_size:
+            raise ValueError(f"Packed sample {idx} length {seq_len} must divide cp={cp_size}.")
+        local_len = seq_len // cp_size
+        parts.append(tensor.narrow(seq_dim, start + cp_rank * local_len, local_len))
+    return torch.cat(parts, dim=seq_dim).contiguous()
+
+
 def zigzag_to_contiguous_chunks(
     tensor: torch.Tensor,
     cp_group: dist.ProcessGroup | None,
     seq_dim: int = 1,
 ) -> torch.Tensor:
-    """Swap a CP-local tensor from Megatron zigzag layout to contiguous chunks.
-
-    Zigzag CP layout assigns rank ``r`` global chunks ``[r, 2*cp-r-1]``.
-    Linear-attention all-gather CP kernels expect rank ``r`` to hold chunks
-    ``[2*r, 2*r+1]``. The conversion is a chunk-level all-to-all and preserves
-    the local tensor shape.
-    """
     return _zigzag_contiguous_chunk_swap(tensor, cp_group, seq_dim, to_contiguous=True)
 
 
@@ -109,7 +131,6 @@ def contiguous_to_zigzag_chunks(
     cp_group: dist.ProcessGroup | None,
     seq_dim: int = 1,
 ) -> torch.Tensor:
-    """Inverse of :func:`zigzag_to_contiguous_chunks`."""
     return _zigzag_contiguous_chunk_swap(tensor, cp_group, seq_dim, to_contiguous=False)
 
 
@@ -152,13 +173,9 @@ def _zigzag_contiguous_chunk_swap(
     target_in_zigzag = not to_contiguous
     local_chunks = [tensor[:chunk_len], tensor[chunk_len:]]
     local_chunk_indices = rank_to_chunks(cp_rank, source_in_zigzag)
-    local_dests = [
-        chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in local_chunk_indices
-    ]
+    local_dests = [chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in local_chunk_indices]
     local_slot_order = sorted(range(2), key=lambda slot: local_dests[slot])
-    send_buf = torch.cat(
-        [local_chunks[slot] for slot in local_slot_order], dim=0
-    ).contiguous()
+    send_buf = torch.cat([local_chunks[slot] for slot in local_slot_order], dim=0).contiguous()
 
     input_split_chunks = [0] * cp_size
     for dst_rank, _dst_slot in local_dests:
@@ -168,9 +185,7 @@ def _zigzag_contiguous_chunk_swap(
     recv_dst_slots_per_source: list[list[int]] = [[] for _ in range(cp_size)]
     for src_rank in range(cp_size):
         src_chunks = rank_to_chunks(src_rank, source_in_zigzag)
-        src_dests = [
-            chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in src_chunks
-        ]
+        src_dests = [chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in src_chunks]
         src_slot_order = sorted(range(2), key=lambda slot: src_dests[slot])
         for slot in src_slot_order:
             dst_rank, dst_slot = src_dests[slot]
@@ -226,6 +241,191 @@ def zigzag_position_ids_for_cp(
     return torch.cat([first, second]).unsqueeze(0)
 
 
+def contiguous_position_ids_for_cp(
+    seq_len: int,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if cp_size <= 1:
+        return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    assert seq_len % cp_size == 0, f"seq_len={seq_len} must be divisible by cp_size={cp_size}"
+    local_len = seq_len // cp_size
+    start = cp_rank * local_len
+    return torch.arange(start, start + local_len, device=device, dtype=torch.long).unsqueeze(0)
+
+
+def _ring_shift(
+    tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    send_delta: int,
+    recv_delta: int,
+) -> torch.Tensor:
+    rank = group.rank()
+    size = group.size()
+    send = tensor.new_zeros((size, *tensor.shape))
+    recv = torch.empty_like(send)
+    send[(rank + send_delta) % size].copy_(tensor.contiguous())
+    dist.all_to_all_single(recv, send, group=group)
+    return recv[(rank + recv_delta) % size].contiguous()
+
+
+class _RingExchangeForCP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup):
+        cp_size = group.size()
+        ctx.group = group
+        ctx.cp_size = cp_size
+        if cp_size <= 1:
+            return tensor
+        return _ring_shift(tensor, group, send_delta=1, recv_delta=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.cp_size <= 1:
+            return grad_output, None
+        return _ring_shift(grad_output, ctx.group, send_delta=-1, recv_delta=1), None
+
+
+def _ring_exchange_for_cp(tensor: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
+    if group is None or group.size() <= 1:
+        return tensor
+    return _RingExchangeForCP.apply(tensor, group)
+
+
+def local_contiguous_sequence_tensor_for_cp(
+    tensor: torch.Tensor | None,
+    *,
+    local_seq_len: int,
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+    name: str = "tensor",
+    unsqueeze_1d: bool = True,
+) -> torch.Tensor | None:
+    if tensor is None or cp_size <= 1:
+        return tensor
+    if unsqueeze_1d and tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    full_seq_len = local_seq_len * cp_size
+    if tensor.size(seq_dim) == local_seq_len:
+        return tensor
+    if tensor.size(seq_dim) == full_seq_len:
+        return contiguous_slice_for_cp(tensor, cp_rank, cp_size, seq_dim=seq_dim)
+    raise ValueError(
+        f"Contiguous CP expects {name} to be either CP-local or full-length; "
+        f"got {tensor.size(seq_dim)} for local_seq_len={local_seq_len}, cp={cp_size}."
+    )
+
+
+def iter_cp_sources(
+    tensor: torch.Tensor,
+    position_ids: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    cp_group: dist.ProcessGroup | None,
+) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
+    if cp_size <= 1:
+        yield cp_rank, tensor, position_ids
+        return
+    if cp_group is None:
+        raise RuntimeError("CP source iteration requires a context-parallel process group.")
+    source_rank = cp_rank
+    source_tensor = tensor
+    source_positions = position_ids
+    for step in range(cp_size):
+        yield source_rank, source_tensor, source_positions
+        if step + 1 < cp_size:
+            source_tensor = _ring_exchange_for_cp(source_tensor, cp_group)
+            source_positions = _ring_exchange_for_cp(source_positions.contiguous(), cp_group)
+            source_rank = (source_rank - 1) % cp_size
+
+
+def _drop_prefix_along_dim(tensor: torch.Tensor, dim: int, prefix_len: int) -> torch.Tensor:
+    if prefix_len <= 0:
+        return tensor
+    return tensor.narrow(dim, prefix_len, tensor.size(dim) - prefix_len)
+
+
+def _previous_contiguous_chunk_tail(
+    tensor: torch.Tensor,
+    *,
+    tail_len: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_group: dist.ProcessGroup | None,
+    seq_dim: int = 1,
+) -> torch.Tensor | None:
+    if cp_size <= 1 or tail_len <= 0:
+        return None
+    if cp_group is None:
+        raise RuntimeError("CP chunk-tail gather requires a context-parallel process group.")
+    if tensor.size(seq_dim) < tail_len:
+        raise ValueError(
+            f"CP chunk-tail gather requires local_len >= {tail_len}, got {tensor.size(seq_dim)}."
+        )
+    tail = tensor.narrow(seq_dim, tensor.size(seq_dim) - tail_len, tail_len).contiguous()
+    return _ring_exchange_for_cp(tail, cp_group)
+
+
+def compress_contiguous_chunks_for_cp(
+    compressor,
+    tensor: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    cp_group: dist.ProcessGroup | None,
+    compress_kwargs: dict[str, Any] | None = None,
+    seq_dim: int = 1,
+    compressed_seq_dim: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    kwargs = compress_kwargs or {}
+    compress_ratio = int(compressor.compress_ratio)
+    if cp_size <= 1:
+        compressed = compressor(tensor, position_ids=position_ids, **kwargs)
+        if compressed is None:
+            return None
+        cutoff = (tensor.size(seq_dim) // compress_ratio) * compress_ratio
+        comp_pos = position_ids[:, :cutoff:compress_ratio]
+        return compressed, comp_pos
+
+    previous_tail = (
+        _previous_contiguous_chunk_tail(
+            tensor,
+            tail_len=compress_ratio,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            cp_group=cp_group,
+            seq_dim=seq_dim,
+        )
+        if compressor.overlap
+        else None
+    )
+    chunk, chunk_pos, drop_prefix = tensor, position_ids, 0
+    if compressor.overlap and cp_rank > 0:
+        if previous_tail is None:
+            raise RuntimeError("CP compressor boundary tails are missing.")
+        prefix = previous_tail.to(device=tensor.device, dtype=tensor.dtype)
+        prefix_pos = chunk_pos[:, :compress_ratio] - compress_ratio
+        chunk = torch.cat([prefix, chunk], dim=seq_dim)
+        chunk_pos = torch.cat([prefix_pos, chunk_pos], dim=1)
+        drop_prefix = 1
+    compressed = compressor(chunk, position_ids=chunk_pos, **kwargs)
+    if compressed is None:
+        return None
+    comp_pos = chunk_pos[
+        :, : (chunk.size(seq_dim) // compress_ratio) * compress_ratio : compress_ratio
+    ]
+    if drop_prefix:
+        compressed = _drop_prefix_along_dim(compressed, compressed_seq_dim, drop_prefix)
+        comp_pos = comp_pos[:, drop_prefix:]
+    return None if compressed.size(compressed_seq_dim) == 0 else (compressed, comp_pos)
+
+
 def split_packed_for_cp(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -234,16 +434,6 @@ def split_packed_for_cp(
     cp_rank: int,
     cp_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Zigzag-split a packed sequence batch for context parallelism.
-
-    Each sample defined by *cu_seqlens* is split with the same zigzag
-    (striped) pattern as :func:`zigzag_split_for_cp`: tokens are divided
-    into ``2 * cp_size`` chunks, and this rank keeps
-    ``chunk[cp_rank] + chunk[2*cp_size - 1 - cp_rank]``.
-
-    Returns:
-        ``(input_ids, position_ids, cu_seqlens, max_seqlen)`` for this CP rank.
-    """
     if cp_size <= 1:
         return input_ids, position_ids, cu_seqlens, max_seqlen
 
@@ -274,14 +464,3 @@ def split_packed_for_cp(
     new_cu = torch.zeros(num_seqs + 1, dtype=torch.int32, device=cu_seqlens.device)
     torch.cumsum(lens, dim=0, out=new_cu[1:])
     return new_ids, new_pos, new_cu, max(new_lengths)
-
-
-__all__ = [
-    "contiguous_to_zigzag_chunks",
-    "split_packed_for_cp",
-    "zigzag_to_contiguous_chunks",
-    "zigzag_reconstruct_from_cp_parts",
-    "zigzag_position_ids_for_cp",
-    "zigzag_slice_for_cp",
-    "zigzag_split_for_cp",
-]

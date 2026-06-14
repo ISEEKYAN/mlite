@@ -125,7 +125,7 @@ def _hf_state_dict_for_glm5_loader(model):
 
 
 def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
-    from megatron.lite.primitive.attention import DynamicSparseAttention
+    from megatron.lite.primitive.modules.attention import DynamicSparseAttention
 
     return DynamicSparseAttention(
         hidden_size=128,
@@ -150,7 +150,7 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.primitive.attention import build_rope_cache
+    from megatron.lite.primitive.modules.attention import build_rope_cache
     from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp, zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 

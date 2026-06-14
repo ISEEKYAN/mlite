@@ -91,11 +91,13 @@ def test_kimi_k2_lite_implementation_files_stay_small():
 def test_kimi_k2_lite_uses_shared_mla_primitive():
     lite_root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     model_root = lite_root / "model" / "kimi_k2" / "lite"
-    primitive_mla = lite_root / "primitive" / "attention" / "mla.py"
+    primitive_mla = lite_root / "primitive" / "modules" / "attention" / "mla.py"
     model_text = (model_root / "model.py").read_text()
     mla_text = primitive_mla.read_text()
 
-    assert "from megatron.lite.primitive.attention import MultiLatentAttention" in model_text
+    assert (
+        "from megatron.lite.primitive.modules.attention import MultiLatentAttention" in model_text
+    )
     assert not (model_root / "mla.py").exists()
     assert "class MultiLatentAttention" not in model_text
     assert "class MultiLatentAttention" in mla_text

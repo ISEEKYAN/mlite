@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.lite.model.glm5.config import Glm5Config
-from megatron.lite.primitive.attention import (
+from megatron.lite.primitive.modules.attention import (
     DynamicSparseAttention,
     RMSNorm,
     build_rotary_embeddings,
