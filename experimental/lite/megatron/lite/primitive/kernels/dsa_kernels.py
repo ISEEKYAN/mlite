@@ -23,7 +23,8 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from importlib import import_module
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -35,6 +36,8 @@ from torch import Tensor
 
 _flash_mla_sparse_fwd = None
 _DSA = None
+_indexer_fwd_sm90: Optional[Callable] = None
+_indexer_fwd_sm100: Optional[Callable] = None
 
 
 def _ensure_flash_mla():
@@ -150,6 +153,48 @@ def _ensure_dsa_namespace():
     _DSA = _ns
 
 
+def _load_indexer_fwd_sm90():
+    """Load the H100 SM90 indexer forward entry only when it is selected."""
+    global _indexer_fwd_sm90
+    if _indexer_fwd_sm90 is None:
+        try:
+            module = import_module(
+                "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90"
+            )
+            _indexer_fwd_sm90 = module.indexer_fwd
+        except (AttributeError, ImportError) as exc:
+            raise ImportError(
+                "H100 DSA indexer forward requires the SM90 cudnn route "
+                "`cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90.indexer_fwd`."
+            ) from exc
+    return _indexer_fwd_sm90
+
+
+def _load_indexer_fwd_sm100():
+    """Load the Blackwell SM100 indexer forward entry only when it is selected."""
+    global _indexer_fwd_sm100
+    if _indexer_fwd_sm100 is None:
+        try:
+            module = import_module("cudnn.deepseek_sparse_attention.indexer_forward._interface")
+            _indexer_fwd_sm100 = module.indexer_fwd
+        except (AttributeError, ImportError) as exc:
+            raise ImportError(
+                "Blackwell DSA indexer forward requires the SM100 cudnn route "
+                "`cudnn.deepseek_sparse_attention.indexer_forward._interface.indexer_fwd` "
+                "(exported by cudnn-frontend as indexer_fwd_sm100)."
+            ) from exc
+    return _indexer_fwd_sm100
+
+
+def _select_indexer_forward(device):
+    major, _minor = torch.cuda.get_device_capability(device)
+    if major == 9:
+        return _load_indexer_fwd_sm90()
+    if major >= 10:
+        return _load_indexer_fwd_sm100()
+    return None
+
+
 def _dsa_indexer_forward_wrapper(
     q: Tensor,
     k: Tensor,
@@ -163,18 +208,12 @@ def _dsa_indexer_forward_wrapper(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
 ):
-    """Route Hopper indexer forward to the SM90 CuTe-DSL backend when present."""
-    _ensure_dsa_namespace()
-    if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 9:
-        try:
-            from cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90 import (
-                indexer_fwd as _indexer_fwd_sm90,
-            )
-        except ImportError as exc:
-            raise ImportError("H100 DSA indexer forward requires the SM90 cudnn route.") from exc
-        else:
+    """Route indexer forward to architecture-specific CuTe-DSL backends."""
+    if q.is_cuda:
+        indexer_fwd = _select_indexer_forward(q.device)
+        if indexer_fwd is not None:
             return {
-                "scores": _indexer_fwd_sm90(
+                "scores": indexer_fwd(
                     q,
                     k,
                     w,
@@ -187,6 +226,7 @@ def _dsa_indexer_forward_wrapper(
                     max_seqlen_k=max_seqlen_k,
                 )
             }
+    _ensure_dsa_namespace()
     return _DSA.indexer_forward_wrapper(
         q,
         k,

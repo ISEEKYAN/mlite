@@ -68,7 +68,7 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
     kwargs: dict[str, Any] = {"input_ids": batch["input_ids"], "labels": batch.get("labels")}
     if kwargs["input_ids"].dim() == 1:
         kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(0)
-    for key in ("position_ids", "attention_mask"):
+    for key in ("position_ids", "attention_mask", "packed_seq_params"):
         if key in batch:
             kwargs[key] = batch[key]
     for key in ("loss_mask", "temperature", "calculate_entropy"):
@@ -151,7 +151,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     finalize_grads = None
     post_model_load_hook = None
     if impl_cfg.optimizer == "distopt":
-        optimizer, finalize_grads = _build_distopt_optimizer(chunks, model_cfg, impl_cfg, ps)
+        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         register_training_hooks(chunks, optimizer)
@@ -194,10 +194,10 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     )
 
 
-def _build_distopt_optimizer(chunks, model_cfg, impl_cfg, ps):
-    from megatron.lite.primitive.optimizers.megatron_wrap import build_distopt_training_optimizer
+def _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps):
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
 
-    return build_distopt_training_optimizer(
+    return build_dist_opt_training_optimizer(
         chunks,
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,

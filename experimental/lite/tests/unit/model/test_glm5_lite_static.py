@@ -127,14 +127,18 @@ def test_glm5_lite_does_not_import_wrappers_or_sibling_models():
         assert "megatron.core" not in text
 
 
-def test_glm5_lite_uses_primitive_mla_dsa():
+def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     model_text = (root / "model" / "glm5" / "lite" / "model.py").read_text()
-    primitive_text = (root / "primitive" / "modules" / "mla_dsa.py").read_text()
-    kernel_text = (root / "primitive" / "modules" / "dsa_kernels.py").read_text()
+    primitive_text = (root / "primitive" / "attention" / "dsa.py").read_text()
+    kernel_text = (root / "primitive" / "kernels" / "dsa_kernels.py").read_text()
 
-    assert "from megatron.lite.primitive.modules.mla_dsa import MLADSA" in model_text
-    assert "class MLADSA" in primitive_text
+    assert "DynamicSparseAttention" in model_text
+    assert (
+        "from megatron.lite.primitive.attention.mla import MultiLatentAttention" in primitive_text
+    )
+    assert "class DynamicSparseAttention" in primitive_text
+    assert "class MultiLatentAttention" not in primitive_text
     assert "class DSAIndexer" in primitive_text
     assert "megatron.core" not in primitive_text
     assert "dsa_kernels.fused_indexer_sparse_attn" in primitive_text
@@ -143,16 +147,38 @@ def test_glm5_lite_uses_primitive_mla_dsa():
     assert "value_dim" in kernel_text
     assert "from cudnn.deepseek_sparse_attention import DSA" in kernel_text
     assert "from cudnn import DSA" in kernel_text
+    assert "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90" in kernel_text
+    assert "cudnn.deepseek_sparse_attention.indexer_forward._interface" in kernel_text
+    assert "torch.cuda.get_device_capability(device)" in kernel_text
     assert "torch.topk" not in primitive_text
     assert "torch.softmax" not in primitive_text
     assert "torch.matmul" not in primitive_text
 
 
-def test_glm5_mla_dsa_training_forward_uses_fused_kernel(monkeypatch):
+def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    sm90_entry = object()
+    sm100_entry = object()
+
+    monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm90", lambda: sm90_entry)
+    monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm100", lambda: sm100_entry)
+
+    monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (9, 0))
+    assert dsa_kernels._select_indexer_forward(None) is sm90_entry
+
+    monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (10, 0))
+    assert dsa_kernels._select_indexer_forward(None) is sm100_entry
+
+    monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (8, 0))
+    assert dsa_kernels._select_indexer_forward(None) is None
+
+
+def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import torch
 
-    from megatron.lite.primitive.modules import mla_dsa
-    from megatron.lite.primitive.modules.mla_dsa import MLADSA, build_rope_cache
+    from megatron.lite.primitive.attention import dsa
+    from megatron.lite.primitive.attention import DynamicSparseAttention, build_rope_cache
 
     calls = {}
 
@@ -192,10 +218,10 @@ def test_glm5_mla_dsa_training_forward_uses_fused_kernel(monkeypatch):
         ), torch.zeros((), device=query.device, dtype=torch.float32)
 
     monkeypatch.setattr(
-        mla_dsa._dsa_kernels, "fused_indexer_sparse_attn", fake_fused_indexer_sparse_attn
+        dsa._dsa_kernels, "fused_indexer_sparse_attn", fake_fused_indexer_sparse_attn
     )
 
-    attn = MLADSA(
+    attn = DynamicSparseAttention(
         hidden_size=16,
         num_attention_heads=2,
         q_lora_rank=8,
@@ -230,11 +256,11 @@ def test_glm5_mla_dsa_training_forward_uses_fused_kernel(monkeypatch):
     }
 
 
-def test_glm5_mla_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
+def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import torch
 
-    from megatron.lite.primitive.modules import mla_dsa
-    from megatron.lite.primitive.modules.mla_dsa import MLADSA, build_rope_cache
+    from megatron.lite.primitive.attention import dsa
+    from megatron.lite.primitive.attention import DynamicSparseAttention, build_rope_cache
 
     calls = {}
 
@@ -258,10 +284,10 @@ def test_glm5_mla_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
         calls["sparse"] = {"topk_length_is_set": topk_length is not None, "value_dim": value_dim}
         return query.new_zeros(query.shape[0], query.shape[1], query.shape[2] * value_dim)
 
-    monkeypatch.setattr(mla_dsa._dsa_kernels, "indexer_topk", fake_indexer_topk)
-    monkeypatch.setattr(mla_dsa._dsa_kernels, "dsa_sparse_attn", fake_dsa_sparse_attn)
+    monkeypatch.setattr(dsa._dsa_kernels, "indexer_topk", fake_indexer_topk)
+    monkeypatch.setattr(dsa._dsa_kernels, "dsa_sparse_attn", fake_dsa_sparse_attn)
 
-    attn = MLADSA(
+    attn = DynamicSparseAttention(
         hidden_size=16,
         num_attention_heads=2,
         q_lora_rank=8,
@@ -608,7 +634,7 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     protocol_text = protocol_path.read_text()
 
     assert ImplConfig().optimizer == "distopt"
-    assert "build_distopt_training_optimizer" in protocol_text
+    assert "build_dist_opt_training_optimizer" in protocol_text
 
 
 def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
@@ -616,7 +642,7 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
-    from megatron.lite.primitive.modules import mla_dsa
+    from megatron.lite.primitive.attention import dsa
 
     def fake_fused_indexer_sparse_attn(
         query,
@@ -657,7 +683,7 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
         ), torch.zeros((), device=query.device, dtype=torch.float32)
 
     monkeypatch.setattr(
-        mla_dsa._dsa_kernels, "fused_indexer_sparse_attn", fake_fused_indexer_sparse_attn
+        dsa._dsa_kernels, "fused_indexer_sparse_attn", fake_fused_indexer_sparse_attn
     )
 
     torch.manual_seed(1234)

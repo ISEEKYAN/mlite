@@ -11,8 +11,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.lite.model.glm5.config import Glm5Config
-from megatron.lite.primitive.modules.mla_dsa import MLADSA, RMSNorm, build_rotary_embeddings
+from megatron.lite.primitive.attention import (
+    DynamicSparseAttention,
+    RMSNorm,
+    build_rotary_embeddings,
+)
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.primitive.utils import ensure_divisible
 
 
@@ -278,7 +283,7 @@ class Glm5Layer(nn.Module):
     ):
         super().__init__()
         ps = ps or ParallelState()
-        self.self_attn = MLADSA(
+        self.self_attn = DynamicSparseAttention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             q_lora_rank=config.q_lora_rank,
@@ -319,6 +324,7 @@ class Glm5Layer(nn.Module):
         sin: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         attn_out = self.self_attn(
             self.input_layernorm(x),
@@ -326,13 +332,19 @@ class Glm5Layer(nn.Module):
             sin=sin,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
         x = x + attn_out
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
-def _roll_mtp_sequence(tensor: torch.Tensor, *, seq_dim: int = 1) -> torch.Tensor:
+def _roll_mtp_sequence(
+    tensor: torch.Tensor, *, seq_dim: int = 1, packed_seq_params=None
+) -> torch.Tensor:
+    if packed_seq_params is not None:
+        rolled, _ = roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=seq_dim)
+        return rolled
     rolled = torch.roll(tensor, shifts=-1, dims=seq_dim)
     index = [slice(None)] * rolled.dim()
     index[seq_dim] = -1
@@ -369,10 +381,12 @@ class Glm5MTPLayer(nn.Module):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         rotary_position_ids = position_ids
-        input_ids = _roll_mtp_sequence(input_ids)
-        position_ids = _roll_mtp_sequence(position_ids)
+        input_ids = _roll_mtp_sequence(input_ids, packed_seq_params=packed_seq_params)
+        if packed_seq_params is None or position_ids.shape[-1] == input_ids.shape[-1]:
+            position_ids = _roll_mtp_sequence(position_ids, packed_seq_params=packed_seq_params)
         decoder_input = self.embedding(input_ids)
         if self.detach_encoder:
             decoder_input = decoder_input.detach()
@@ -392,6 +406,7 @@ class Glm5MTPLayer(nn.Module):
             sin=sin,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -433,6 +448,7 @@ class Glm5MTPBlock(nn.Module):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor] = []
         for depth in range(self.num_layers):
@@ -442,6 +458,7 @@ class Glm5MTPBlock(nn.Module):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
             outputs.append(hidden_states)
         return outputs
@@ -493,6 +510,7 @@ class Glm5Model(nn.Module):
         hidden_states: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         if hidden_states is None:
             if input_ids is None:
@@ -501,6 +519,8 @@ class Glm5Model(nn.Module):
                 raise ValueError("input_ids are only accepted on the first pipeline stage")
             hidden_states = self.embed_tokens(input_ids)
         batch, seq_len, _ = hidden_states.shape
+        if position_ids is None and packed_seq_params is not None:
+            raise ValueError("GLM5 packed THD forward requires explicit position_ids.")
         if position_ids is None:
             if self.ps.cp_size > 1:
                 full_seq_len = seq_len * self.ps.cp_size
@@ -527,7 +547,14 @@ class Glm5Model(nn.Module):
 
         h = hidden_states
         for layer in self.layers:
-            h = layer(h, cos=cos, sin=sin, position_ids=position_ids, attention_mask=attention_mask)
+            h = layer(
+                h,
+                cos=cos,
+                sin=sin,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+            )
         return self.norm(h) if self.norm is not None else h
 
 
@@ -574,6 +601,7 @@ class Glm5ForCausalLM(nn.Module):
         hidden_states: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor = 1.0,
@@ -591,6 +619,7 @@ class Glm5ForCausalLM(nn.Module):
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
             logits = self.lm_head(hidden) if self.lm_head is not None else None
 
@@ -605,7 +634,11 @@ class Glm5ForCausalLM(nn.Module):
         output["logits"] = logits
 
         mtp_hidden_states = self._apply_mtp(
-            hidden, input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            hidden,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
         if mtp_hidden_states is not None:
             output["mtp_hidden_states"] = tuple(mtp_hidden_states)
@@ -636,7 +669,10 @@ class Glm5ForCausalLM(nn.Module):
                 probs = torch.softmax(logits.float(), dim=-1)
                 output["entropy"] = -(probs * torch.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
             mtp_loss = self._apply_mtp_loss(
-                output.get("mtp_logits"), labels=labels, loss_mask=loss_mask
+                output.get("mtp_logits"),
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
             )
             if mtp_loss is not None:
                 output["mtp_loss"] = mtp_loss
@@ -654,6 +690,7 @@ class Glm5ForCausalLM(nn.Module):
         input_ids: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
+        packed_seq_params,
     ) -> list[torch.Tensor] | None:
         if self.model.mtp is None:
             return None
@@ -663,6 +700,8 @@ class Glm5ForCausalLM(nn.Module):
             return None
         batch, seq_len = input_ids.shape
         if position_ids is None:
+            if packed_seq_params is not None:
+                raise ValueError("GLM5 MTP packed THD forward requires explicit position_ids.")
             position_ids = (
                 torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
                 .unsqueeze(0)
@@ -675,6 +714,7 @@ class Glm5ForCausalLM(nn.Module):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
 
     def _apply_mtp_loss(
@@ -683,6 +723,7 @@ class Glm5ForCausalLM(nn.Module):
         *,
         labels: torch.Tensor,
         loss_mask: torch.Tensor | None,
+        packed_seq_params=None,
     ) -> torch.Tensor | None:
         if mtp_logits is None or not self.mtp_enable_train:
             return None
@@ -694,8 +735,8 @@ class Glm5ForCausalLM(nn.Module):
         mtp_labels = labels.clone()
         losses = []
         for logits in logits_list:
-            mtp_labels = _roll_mtp_sequence(mtp_labels)
-            mtp_loss_mask = _roll_mtp_sequence(mtp_loss_mask)
+            mtp_labels = _roll_mtp_sequence(mtp_labels, packed_seq_params=packed_seq_params)
+            mtp_loss_mask = _roll_mtp_sequence(mtp_loss_mask, packed_seq_params=packed_seq_params)
             token_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
                 mtp_labels.reshape(-1),
@@ -739,5 +780,4 @@ __all__ = [
     "Glm5Model",
     "Glm5Router",
     "Glm5RoutedExperts",
-    "MLADSA",
 ]

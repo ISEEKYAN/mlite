@@ -1,11 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Multi-head Latent Attention with Dynamic Sparse Attention.
+"""Dynamic Sparse Attention.
 
 The module is model-agnostic: callers pass architecture dimensions directly and
 keep model config classes out of the primitive layer.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -14,8 +16,15 @@ from megatron.lite.primitive.parallel.cp import (
     zigzag_reconstruct_from_cp_parts,
     zigzag_slice_for_cp,
 )
+from megatron.lite.primitive.parallel.thd import (
+    reconstruct_packed_from_cp_parts,
+    split_packed_to_cp_local,
+)
 
-from . import dsa_kernels as _dsa_kernels
+from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
+
+if TYPE_CHECKING:
+    from megatron.lite.primitive.attention.mla import MultiLatentAttention
 
 
 def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
@@ -316,8 +325,14 @@ class DSAIndexer(nn.Module):
         return topk_indices
 
 
-class MLADSA(nn.Module):
-    """Correctness-first MLA + DSA attention path."""
+class DynamicSparseAttention(nn.Module):
+    """Correctness-first DSA attention path."""
+
+    @staticmethod
+    def dense_attention_cls() -> type[MultiLatentAttention]:
+        from megatron.lite.primitive.attention.mla import MultiLatentAttention
+
+        return MultiLatentAttention
 
     def __init__(
         self,
@@ -408,18 +423,80 @@ class MLADSA(nn.Module):
         sin: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         if attention_mask is not None:
             raise NotImplementedError(
                 "GLM5 fused DSA only supports causal masking; custom attention_mask "
                 "is not supported."
             )
-        cp_restore = False
-        if self.cp_size > 1:
+        if packed_seq_params is not None:
+            if self.cp_size > 1:
+                x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
+            out = self._forward_packed_full(x, cos, sin, position_ids, packed_seq_params)
+            if self.cp_size > 1:
+                out = split_packed_to_cp_local(
+                    out,
+                    cu_seqlens_padded=self._packed_cu_seqlens(packed_seq_params, x.device),
+                    cp_size=self.cp_size,
+                    cp_rank=self.cp_rank,
+                    dim=1,
+                )
+            return out
+
+        cp_restore = self.cp_size > 1
+        if cp_restore:
             x, position_ids, attention_mask = self._gather_cp_inputs(
                 x, position_ids, attention_mask
             )
-            cp_restore = True
+
+        out = self._forward_dense_full(x, cos, sin, position_ids)
+        if cp_restore:
+            out = zigzag_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
+        return out
+
+    def _forward_packed_full(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        packed_seq_params,
+    ) -> torch.Tensor:
+        cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        if position_ids.shape[-1] != x.shape[1]:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention position_ids must cover the reconstructed packed tokens, "
+                f"got {tuple(position_ids.shape)} for packed length {x.shape[1]}."
+            )
+        pieces = []
+        for idx in range(int(cu_seqlens.numel()) - 1):
+            start = int(cu_seqlens[idx].item())
+            end = int(cu_seqlens[idx + 1].item())
+            if end <= start:
+                continue
+            seg_cos, seg_sin = self._slice_rotary_cache(cos, sin, start, end)
+            pieces.append(
+                self._forward_dense_full(
+                    x[:, start:end, :],
+                    seg_cos,
+                    seg_sin,
+                    position_ids[:, start:end],
+                )
+            )
+        if pieces:
+            return torch.cat(pieces, dim=1)
+        return x.new_empty(x.shape[0], 0, self.o_proj.out_features)
+
+    def _forward_dense_full(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
 
         batch, seq_len, _ = x.shape
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
@@ -494,8 +571,6 @@ class MLADSA(nn.Module):
         out = out.permute(1, 0, 2, 3).contiguous()
         out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
         out = out.reshape(batch, seq_len, self.num_heads * self.v_head_dim)
-        if cp_restore:
-            out = zigzag_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
         return self.o_proj(out)
 
     def _split_kv_b_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -519,7 +594,7 @@ class MLADSA(nn.Module):
             expected = (full_seq, full_seq)
             if tuple(attention_mask.shape[-2:]) != expected:
                 raise NotImplementedError(
-                    "GLM5 MLADSA CP attention_mask must already cover the reconstructed "
+                    "GLM5 DynamicSparseAttention CP attention_mask must already cover the reconstructed "
                     f"full sequence {expected}, got {tuple(attention_mask.shape)}."
                 )
         return full_x, full_position_ids, attention_mask
@@ -541,7 +616,7 @@ class MLADSA(nn.Module):
             return position_ids.to(device=device, dtype=torch.long)
         if position_ids.shape[-1] != local_seq:
             raise ValueError(
-                "GLM5 MLADSA CP position_ids must be either local or full sequence length, "
+                "GLM5 DynamicSparseAttention CP position_ids must be either local or full sequence length, "
                 f"got {tuple(position_ids.shape)} for local_seq={local_seq}, full_seq={full_seq}."
             )
 
@@ -552,10 +627,55 @@ class MLADSA(nn.Module):
         )
         return zigzag_reconstruct_from_cp_parts(pos_parts, seq_dim=1)
 
+    def _gather_packed_cp_inputs(
+        self, x: torch.Tensor, position_ids: torch.Tensor, packed_seq_params
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        local_seq = x.shape[1]
+        cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
+        full_seq = int(cu_seqlens[-1].item())
+        x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
+        full_x = reconstruct_packed_from_cp_parts(
+            x_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
+        )
+
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        position_ids = position_ids.to(device=x.device, dtype=torch.long)
+        if position_ids.shape[-1] == full_seq:
+            return full_x, position_ids
+        if position_ids.shape[-1] != local_seq:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP position_ids must be either local or full packed length, "
+                f"got {tuple(position_ids.shape)} for local_seq={local_seq}, full_seq={full_seq}."
+            )
+        pos_parts = _all_gather_cp(position_ids, cp_size=self.cp_size, cp_group=self.cp_group)
+        full_position_ids = reconstruct_packed_from_cp_parts(
+            pos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
+        )
+        return full_x, full_position_ids
+
+    @staticmethod
+    def _packed_cu_seqlens(packed_seq_params, device: torch.device) -> torch.Tensor:
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+        if cu_seqlens is None:
+            cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+        if cu_seqlens is None:
+            raise ValueError("GLM5 packed DynamicSparseAttention requires packed cu_seqlens.")
+        return cu_seqlens.to(device=device, dtype=torch.int32)
+
+    @staticmethod
+    def _slice_rotary_cache(
+        cos: torch.Tensor, sin: torch.Tensor, start: int, end: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.dim() == 3 and sin.dim() == 3:
+            return cos[:, start:end, :], sin[:, start:end, :]
+        return cos, sin
+
 
 __all__ = [
     "DSAIndexer",
-    "MLADSA",
+    "DSAIndexerLossAutoScaler",
+    "DynamicSparseAttention",
     "RMSNorm",
     "apply_rotary_emb",
     "apply_rotary_pos_emb",

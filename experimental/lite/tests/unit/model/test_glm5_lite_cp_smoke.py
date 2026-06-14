@@ -124,10 +124,10 @@ def _hf_state_dict_for_glm5_loader(model):
     }
 
 
-def _make_mla_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
-    from megatron.lite.primitive.modules.mla_dsa import MLADSA
+def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
+    from megatron.lite.primitive.attention import DynamicSparseAttention
 
-    return MLADSA(
+    return DynamicSparseAttention(
         hidden_size=128,
         num_attention_heads=64,
         q_lora_rank=16,
@@ -146,11 +146,11 @@ def _make_mla_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
 
 
 @pytest.mark.gpu
-def test_glm5_mla_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
+def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.primitive.modules.mla_dsa import build_rope_cache
+    from megatron.lite.primitive.attention import build_rope_cache
     from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp, zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -160,11 +160,11 @@ def test_glm5_mla_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(2026)
-    cp_attn = _make_mla_dsa(cp_size=world, cp_rank=rank, cp_group=ps.cp_group).to(
+    cp_attn = _make_dsa(cp_size=world, cp_rank=rank, cp_group=ps.cp_group).to(
         device=device, dtype=torch.bfloat16
     )
     torch.manual_seed(2026)
-    ref_attn = _make_mla_dsa().to(device=device, dtype=torch.bfloat16)
+    ref_attn = _make_dsa().to(device=device, dtype=torch.bfloat16)
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(99)
@@ -266,6 +266,89 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
         if param.grad is not None:
             grad_norm = grad_norm + param.grad.detach().float().norm()
     assert torch.isfinite(grad_norm)
+
+
+@pytest.mark.gpu
+def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
+    import torch
+    import torch.distributed as dist
+
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.primitive.parallel.state import ParallelState
+    from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
+
+    device = _init_dist_or_skip()
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    cfg_kwargs = _tiny_config_kwargs()
+    cfg_kwargs.update(max_position_embeddings=64, num_nextn_predict_layers=1)
+    cfg = Glm5Config(**cfg_kwargs)
+    cfg.mlp_layer_types = ["dense", "dense"]
+    ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
+
+    torch.manual_seed(20260614)
+    model = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True, mtp_enable_train=True).to(
+        device=device, dtype=torch.bfloat16
+    )
+    model.train()
+
+    lengths = [16, 20, 24]
+    ids = torch.nested.as_nested_tensor(
+        [
+            torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
+            for length in lengths
+        ],
+        layout=torch.jagged,
+    )
+    labels = torch.nested.as_nested_tensor(
+        [
+            torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
+            for length in lengths
+        ],
+        layout=torch.jagged,
+    )
+    loss_mask = torch.nested.as_nested_tensor(
+        [torch.ones(length, device=device, dtype=torch.float32) for length in lengths],
+        layout=torch.jagged,
+    )
+    packed = pack_nested_thd(
+        ids,
+        cp_size=world,
+        cp_rank=rank,
+        cp_group=ps.cp_group,
+        labels=labels,
+        loss_mask=loss_mask,
+    )
+
+    out = model(
+        input_ids=packed.input_ids,
+        labels=packed.labels,
+        loss_mask=packed.loss_mask,
+        position_ids=packed.position_ids,
+        packed_seq_params=packed.packed_seq_params,
+    )
+    assert torch.isfinite(out["loss"])
+    assert "mtp_loss" in out
+    out["loss"].backward()
+
+    grad_norm = torch.zeros((), device=device)
+    for param in model.parameters():
+        if param.grad is not None:
+            grad_norm = grad_norm + param.grad.detach().float().norm()
+    assert torch.isfinite(grad_norm)
+
+    nested_logits = unpack_packed_thd_to_nested(out["logits"], packed)
+    assert nested_logits.offsets().numel() == len(lengths) + 1
+    assert [int(x) for x in nested_logits.offsets().diff().cpu()] == lengths
+
+    if rank == 0:
+        print(
+            "NON_SKIP_GLM5_THD_CP_SMOKE_PASSED "
+            f"world_size={world} lengths={lengths} "
+            f"loss={float(out['loss'].detach().item()):.6e} "
+            f"grad_norm={float(grad_norm.detach().item()):.6e}"
+        )
 
 
 @pytest.mark.gpu
