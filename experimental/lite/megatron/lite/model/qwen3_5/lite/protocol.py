@@ -41,7 +41,7 @@ def is_expert_param(name: str) -> bool:
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "distopt"
+    optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -114,12 +114,12 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _build_distopt_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
+def _build_dist_opt_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
     from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_distopt_training_optimizer,
+        build_dist_opt_training_optimizer,
     )
 
-    return build_distopt_training_optimizer(
+    return build_dist_opt_training_optimizer(
         chunks,
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
@@ -205,8 +205,8 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     finalize_grads = None
     post_model_load_hook = None
     optimizer_backend = "none"
-    if impl_cfg.optimizer == "distopt":
-        optimizer, finalize_grads = _build_distopt_optimizer(chunks, model_cfg, impl_cfg, ps)
+    if impl_cfg.optimizer == "dist_opt":
+        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -214,7 +214,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
         register_training_hooks(chunks, optimizer)
-        optimizer_backend = "distopt"
+        optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

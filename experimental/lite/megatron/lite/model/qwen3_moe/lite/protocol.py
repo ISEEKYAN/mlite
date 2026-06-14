@@ -63,7 +63,7 @@ class ImplConfig:
     """Lite impl knobs. Constructed by runtime from user config."""
 
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "mc"  # None = no optimizer (inference)
+    optimizer: str | None = "dist_opt"  # None = no optimizer (inference)
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -217,10 +217,10 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
-    if impl_cfg.optimizer == "mc":
-        from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
+    if impl_cfg.optimizer == "dist_opt":
+        from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
 
-        optimizer, finalize_grads = build_mc_training_optimizer(
+        optimizer, finalize_grads = build_dist_opt_training_optimizer(
             chunks,
             model_cfg=model_cfg,
             impl_cfg=impl_cfg,
@@ -234,7 +234,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
-        optimizer_backend = "distopt"
+        optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

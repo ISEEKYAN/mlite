@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark
 def _qwen3_moe_symbols():
     te = pytest.importorskip(
         "transformer_engine.pytorch",
-        reason="Qwen3MoE distopt checkpoint smoke requires real Transformer Engine.",
+        reason="Qwen3MoE dist_opt checkpoint smoke requires real Transformer Engine.",
     )
     assert hasattr(te, "Linear"), "Qwen3MoE smoke requires real Transformer Engine Linear."
     from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
@@ -32,7 +32,7 @@ def _qwen3_moe_symbols():
 @pytest.fixture(scope="module", autouse=True)
 def _single_node_cuda_dist():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for Qwen3MoE distopt checkpoint smoke tests.")
+        pytest.skip("CUDA is required for Qwen3MoE dist_opt checkpoint smoke tests.")
     if int(os.environ.get("WORLD_SIZE", "1")) > 8:
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
@@ -90,7 +90,7 @@ def _build_handle(model_seed: int) -> ModelHandle:
     model_cfg = _tiny_qwen3_moe_config()
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
-        optimizer="mc",
+        optimizer="dist_opt",
         optimizer_config=OptimizerConfig(
             optimizer="adam", lr=1.0e-3, weight_decay=0.0, clip_grad=1.0
         ),
@@ -170,9 +170,9 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
         torch.testing.assert_close(lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0)
 
 
-def test_qwen3_moe_distopt_checkpoint_restores_rng_and_continues_bitwise_tp2_pp2_ep2(tmp_path):
+def test_qwen3_moe_dist_opt_checkpoint_restores_rng_and_continues_bitwise_tp2_pp2_ep2(tmp_path):
     if dist.get_world_size() != 8:
-        pytest.skip("Qwen3MoE tp2/pp2/ep2 distopt checkpoint smoke requires exactly 8 GPUs.")
+        pytest.skip("Qwen3MoE tp2/pp2/ep2 dist_opt checkpoint smoke requires exactly 8 GPUs.")
 
     set_deterministic(2026)
     model_cfg = _tiny_qwen3_moe_config()

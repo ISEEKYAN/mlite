@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
+from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.ops.gated_delta_rule import (
     l2norm,
     torch_chunk_gated_delta_rule,
@@ -28,10 +29,6 @@ from megatron.lite.primitive.parallel.thd import (
     split_packed_to_cp_local,
 )
 from megatron.lite.primitive.utils import ensure_divisible
-
-
-def jit_fuser(fn):
-    return fn
 
 
 try:

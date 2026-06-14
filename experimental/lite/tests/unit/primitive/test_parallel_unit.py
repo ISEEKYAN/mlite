@@ -70,6 +70,22 @@ def test_pp_layout_rejects_non_divisible_vpp_layer_counts():
         build_pipeline_chunk_layout(10, ps, vpp=3, vpp_chunk_id=0)
 
 
+def test_virtual_pipeline_rank_is_tracked_on_lite_parallel_state():
+    from megatron.lite.primitive.parallel.pipeline import _set_virtual_pipeline_rank
+
+    ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
+
+    _set_virtual_pipeline_rank(ps, chunk_id=1, num_chunks=2)
+
+    assert ps.virtual_pipeline_size == 2
+    assert ps.virtual_pipeline_rank == 1
+
+    _set_virtual_pipeline_rank(ps, chunk_id=None, num_chunks=2)
+
+    assert ps.virtual_pipeline_size is None
+    assert ps.virtual_pipeline_rank is None
+
+
 def test_thd_roll_keeps_sequence_boundaries():
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
     rolled, token_sum = roll_packed_thd_left(torch.arange(8), cu_seqlens_padded=cu_seqlens, dims=0)

@@ -1,11 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MoE router implementations: TopKRouter (softmax) and SigmoidTopKRouter.
-
-Internals call the atomic free functions in Megatron-Core's
-`megatron.core.transformer.moe.moe_utils` (plan `docs/moe_mc_wrap_plan.md`
-D3/D4). The outer classes keep the flat-kwargs + `ParallelState` constructor
-style of megatron.lite primitives — no `TransformerConfig`, no mpu globals.
-"""
+"""MoE router implementations: TopKRouter (softmax) and SigmoidTopKRouter."""
 
 from __future__ import annotations
 
@@ -15,13 +9,13 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
-from megatron.core.transformer.moe.moe_utils import (  # pyright: ignore[reportMissingImports]
+from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
+from megatron.lite.primitive.utils.moe import (
     compute_routing_scores_for_aux_loss,
     router_gating_linear,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
 )
-from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel import ParallelState
