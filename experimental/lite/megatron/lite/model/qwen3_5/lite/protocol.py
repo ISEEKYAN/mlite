@@ -18,6 +18,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.thd import prepare_packed_thd_kwargs_for_context_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
@@ -100,6 +101,7 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
             kwargs[key] = batch[key]
     if kwargs["input_ids"].dim() == 1:
         kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(0)
+    prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
     return model(**kwargs)
 
 
@@ -114,7 +116,9 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _build_dist_opt_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
+def _build_dist_opt_optimizer(
+    chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState
+):
     from megatron.lite.primitive.optimizers.megatron_wrap import (
         build_dist_opt_training_optimizer,
     )

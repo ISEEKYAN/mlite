@@ -633,7 +633,7 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     )
     protocol_text = protocol_path.read_text()
 
-    assert ImplConfig().optimizer == "distopt"
+    assert ImplConfig().optimizer == "dist_opt"
     assert "build_dist_opt_training_optimizer" in protocol_text
 
 

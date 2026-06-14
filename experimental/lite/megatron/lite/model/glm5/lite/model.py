@@ -659,6 +659,7 @@ class Glm5ForCausalLM(nn.Module):
                 ignore_index=-100,
                 reduction="none",
             )
+            output["log_probs"] = (-token_loss).view_as(labels).contiguous()
             if loss_mask is not None:
                 valid = loss_mask.reshape(-1).float()
                 loss = (token_loss * valid).sum() / valid.sum().clamp_min(1.0)

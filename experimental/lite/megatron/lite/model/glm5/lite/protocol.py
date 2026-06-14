@@ -39,9 +39,10 @@ def is_expert_param(name: str) -> bool:
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "distopt"
+    optimizer: str | None = "dist_opt"
     hf_path: str = ""
     deterministic: bool = True
+    use_thd: bool = False
     recompute: str | list[str] | None = None
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -150,12 +151,12 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     optimizer_backend = "none"
     finalize_grads = None
     post_model_load_hook = None
-    if impl_cfg.optimizer == "distopt":
+    if impl_cfg.optimizer == "dist_opt":
         optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         register_training_hooks(chunks, optimizer)
-        optimizer_backend = "distopt"
+        optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

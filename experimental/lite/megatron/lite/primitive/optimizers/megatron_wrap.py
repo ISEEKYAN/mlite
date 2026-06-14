@@ -60,7 +60,9 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
     )
 
 
-def build_dist_opt_optimizer_config(opt, *, override_optimizer_config: dict[str, Any] | None = None):
+def build_dist_opt_optimizer_config(
+    opt, *, override_optimizer_config: dict[str, Any] | None = None
+):
     """Build Megatron-Core OptimizerConfig from user's OptimizerConfig (duck-typed).
 
     Single source of truth for Megatron Lite's Megatron-Core optimizer stack.
@@ -187,7 +189,9 @@ def build_dist_opt_stack(
             use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
-        optimizer._dist_opt_pg_collection = pg_collection  # pyright: ignore[reportAttributeAccessIssue]
+        optimizer._dist_opt_pg_collection = (
+            pg_collection  # pyright: ignore[reportAttributeAccessIssue]
+        )
     return wrapped_chunks, optimizer
 
 
