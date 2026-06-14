@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -14,8 +15,6 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
-from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
@@ -25,8 +24,13 @@ from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
+from verl_mlite.compat import load_verl_engine_api
 
 from .config import MegatronLiteEngineConfig
+
+BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
+    load_verl_engine_api()
+)
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
 
@@ -47,13 +51,119 @@ def _isolate_compile_cache_per_rank() -> None:
         os.environ[var] = rank_dir
 
 
+class _MegatronLiteLRScheduler:
+    def __init__(
+        self,
+        optimizer,
+        *,
+        init_lr: float,
+        max_lr: float,
+        min_lr: float,
+        lr_warmup_steps: int,
+        lr_decay_steps: int,
+        lr_decay_style: str,
+        start_wd: float,
+        end_wd: float,
+        wd_incr_steps: int,
+        wd_incr_style: str,
+        wsd_decay_steps: int | None,
+        lr_wsd_decay_style: str,
+    ):
+        self.optimizer = optimizer
+        self.init_lr = init_lr
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.lr_warmup_steps = max(lr_warmup_steps, 0)
+        self.lr_decay_steps = max(lr_decay_steps, self.lr_warmup_steps + 1)
+        self.lr_decay_style = lr_decay_style.lower()
+        self.start_wd = start_wd
+        self.end_wd = end_wd
+        self.wd_incr_steps = max(wd_incr_steps, 1)
+        self.wd_incr_style = wd_incr_style.lower()
+        self.wsd_decay_steps = wsd_decay_steps
+        self.lr_wsd_decay_style = lr_wsd_decay_style.lower()
+        self.num_steps = 0
+        self._apply()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"num_steps": self.num_steps}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.num_steps = int(state.get("num_steps", state.get("step", 0)))
+        self._apply()
+
+    def step(self, increment: int = 1) -> None:
+        self.num_steps += increment
+        self._apply()
+
+    def get_last_lr(self) -> list[float]:
+        return [group["lr"] for group in self.optimizer.param_groups]
+
+    def _apply(self) -> None:
+        lr = self._get_lr()
+        wd = self._get_wd()
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+            if param_group.get("weight_decay", None) is not None:
+                param_group["weight_decay"] = wd
+
+    def _get_lr(self) -> float:
+        if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
+            ratio = self.num_steps / self.lr_warmup_steps
+            return self.init_lr + (self.max_lr - self.init_lr) * ratio
+
+        if self.lr_decay_style == "constant":
+            return self.max_lr
+
+        if self.lr_decay_style == "inverse-square-root":
+            warmup = max(self.lr_warmup_steps, 1)
+            step = max(self.num_steps, 1)
+            return max(self.min_lr, self.max_lr * math.sqrt(warmup) / math.sqrt(step))
+
+        if self.lr_decay_style == "wsd":
+            return self._get_wsd_lr()
+
+        decay_span = max(self.lr_decay_steps - self.lr_warmup_steps, 1)
+        ratio = min(max((self.num_steps - self.lr_warmup_steps) / decay_span, 0.0), 1.0)
+        return self._decay(self.max_lr, self.min_lr, ratio, self.lr_decay_style)
+
+    def _get_wsd_lr(self) -> float:
+        decay_steps = self.wsd_decay_steps or 0
+        decay_start = max(self.lr_decay_steps - decay_steps, self.lr_warmup_steps)
+        if decay_steps <= 0 or self.num_steps <= decay_start:
+            return self.max_lr
+        ratio = min((self.num_steps - decay_start) / max(decay_steps, 1), 1.0)
+        return self._decay(self.max_lr, self.min_lr, ratio, self.lr_wsd_decay_style)
+
+    def _get_wd(self) -> float:
+        if self.wd_incr_style == "constant":
+            return self.end_wd
+        ratio = min(max(self.num_steps / self.wd_incr_steps, 0.0), 1.0)
+        return self._decay(self.start_wd, self.end_wd, ratio, self.wd_incr_style)
+
+    @staticmethod
+    def _decay(start: float, end: float, ratio: float, style: str) -> float:
+        if style == "linear":
+            return start + (end - start) * ratio
+        if style == "cosine":
+            coeff = 0.5 * (math.cos(math.pi * ratio) + 1.0)
+            return end + (start - end) * coeff
+        if style == "exponential":
+            if start == 0.0:
+                return 0.0
+            if end == 0.0:
+                return start * (1.0 - ratio)
+            return start * ((end / start) ** ratio)
+        if style == "constant":
+            return start
+        raise ValueError(f"Unsupported scheduler decay style: {style!r}")
+
+
 def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
     """Build a Megatron-style LR scheduler for Megatron Lite's optimizer."""
     total_steps = opt.total_training_steps
     if total_steps <= 0:
         return None
-
-    from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
     warmup_steps = opt.lr_warmup_steps if opt.lr_warmup_steps is not None else -1
     if warmup_steps <= 0 and opt.lr_warmup_steps_ratio > 0:
@@ -66,7 +176,7 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
         if param_group.get("min_lr") is None:
             param_group["min_lr"] = min_lr
 
-    return OptimizerParamScheduler(
+    return _MegatronLiteLRScheduler(
         optimizer,
         init_lr=opt.lr_warmup_init,
         max_lr=opt.lr,
@@ -78,8 +188,6 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
         end_wd=opt.weight_decay,
         wd_incr_steps=total_steps,
         wd_incr_style=opt.weight_decay_incr_style,
-        use_checkpoint_opt_param_scheduler=opt.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=not opt.use_checkpoint_opt_param_scheduler,
         wsd_decay_steps=opt.lr_wsd_decay_steps,
         lr_wsd_decay_style=opt.lr_wsd_decay_style,
     )

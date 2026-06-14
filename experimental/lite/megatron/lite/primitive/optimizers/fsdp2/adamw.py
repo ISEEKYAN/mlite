@@ -368,10 +368,7 @@ def maybe_build_te_fused_adam_optimizer(
 ) -> Any | None:
     if not get_bool_opt(opt, "fsdp2_use_te_fused_adam", default=False):
         return None
-    try:
-        from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
-    except ImportError:
-        return None
+    from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
 
     all_param_list = list(all_params)
     master_weights = get_bool_opt(

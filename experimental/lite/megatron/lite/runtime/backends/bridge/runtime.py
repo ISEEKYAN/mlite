@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_optimizer_config
+from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_optimizer_config
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
 from megatron.lite.runtime.contracts.data import Batch, ForwardResult, ModelOutputs
@@ -92,7 +92,12 @@ def _bridge_hf_config(bridge):
 
 def _lower_provider_value(key: str, value: Any) -> Any:
     if key == "attention_backend" and isinstance(value, str):
-        from megatron.core.transformer.enums import AttnBackend
+        try:
+            from megatron.core.transformer.enums import AttnBackend
+        except ModuleNotFoundError as exc:
+            if exc.name != "megatron.core":
+                raise
+            return value
 
         return AttnBackend[value]
     return value
@@ -414,7 +419,7 @@ def _build_optimizer(model_list: list, cfg: BridgeConfig):
     from megatron.core.optimizer import get_megatron_optimizer
 
     return get_megatron_optimizer(
-        config=build_mc_optimizer_config(
+        config=build_dist_opt_optimizer_config(
             cfg.optimizer, override_optimizer_config=cfg.override_optimizer_config
         ),
         model_chunks=model_list,
@@ -574,7 +579,7 @@ class BridgeRuntime(RuntimeBase):
                 "mpu": mpu,
                 "model_cfg": _bridge_hf_config(bridge),
                 "protocol": _resolve_benchmark_protocol(rt_cfg, bridge),
-                "optimizer_backend": "distopt" if optimizer is not None else "none",
+                "optimizer_backend": "dist_opt" if optimizer is not None else "none",
                 "world_size": dist.get_world_size(),
             },
         )
@@ -621,7 +626,7 @@ class BridgeRuntime(RuntimeBase):
             if isinstance(output_tensor, tuple):
                 output_tensor = output_tensor[0]
 
-            def _mc_loss_fn(output_tensor, non_loss_data=False):
+            def _bridge_loss_fn(output_tensor, non_loss_data=False):
                 if loss_fn is not None:
                     loss, _metrics = loss_fn({"output_tensor": output_tensor}, sample)
                 else:
@@ -629,7 +634,7 @@ class BridgeRuntime(RuntimeBase):
                 last_loss[0] = float(loss.detach().item())
                 return loss, {}
 
-            return output_tensor, _mc_loss_fn
+            return output_tensor, _bridge_loss_fn
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
         if vpp_size is not None and vpp_size > 1:
