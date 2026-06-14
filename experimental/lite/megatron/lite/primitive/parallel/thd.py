@@ -9,7 +9,42 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+@dataclass
+class PackedSeqParams:
+    """Parameters for THD-format packed-sequence attention.
+
+    Mirrors the fields consumed by TE's ``DotProductAttention.forward()``
+    when ``qkv_format="thd"`` is used (total-tokens x heads x dim).
+
+    Typical construction::
+
+        params = PackedSeqParams.from_cu_seqlens(batch.cu_seqlens, batch.max_seqlen)
+    """
+
+    qkv_format: str = "thd"
+    cu_seqlens_q: torch.Tensor | None = None
+    cu_seqlens_kv: torch.Tensor | None = None
+    max_seqlen_q: int | None = None
+    max_seqlen_kv: int | None = None
+    cu_seqlens_q_padded: torch.Tensor | None = None
+    cu_seqlens_kv_padded: torch.Tensor | None = None
+    local_cp_size: int | None = None
+    cp_group: Any | None = None
+    cp_rank: int | None = None
+
+    @staticmethod
+    def from_cu_seqlens(cu_seqlens: torch.Tensor, max_seqlen: int) -> PackedSeqParams:
+        """Build from shared Q/KV cu_seqlens (self-attention)."""
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+        )
 
 
 @dataclass(frozen=True)
@@ -42,17 +77,34 @@ def _make_packed_seq_params(
         extra_args["local_cp_size"] = cp_size
         if cp_group is not None:
             extra_args["cp_group"] = cp_group
-    return PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        cp_rank=cp_rank,
-        **extra_args,
-    )
+    try:
+        from megatron.core.packed_seq_params import PackedSeqParams as MCorePackedSeqParams
+
+        params = MCorePackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            **extra_args,
+        )
+        # MCore's PackedSeqParams does not carry rank, but local rolling needs it.
+        params.cp_rank = cp_rank
+        return params
+    except Exception:
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            cp_rank=cp_rank,
+            **extra_args,
+        )
 
 
 def _slice_along_dim(tensor: torch.Tensor, dim: int, start: int, end: int) -> torch.Tensor:
@@ -351,7 +403,7 @@ def pack_nested_thd(
     return PackedTHDBatch(
         input_ids=packed_input.unsqueeze(0),
         labels=packed_labels.unsqueeze(0) if packed_labels is not None else None,
-        loss_mask=(packed_loss_mask.unsqueeze(0) if packed_loss_mask is not None else None),
+        loss_mask=packed_loss_mask.unsqueeze(0) if packed_loss_mask is not None else None,
         position_ids=position_ids.unsqueeze(0),
         packed_seq_params=_make_packed_seq_params(
             cu_seqlens_padded=cu_seqlens_padded,

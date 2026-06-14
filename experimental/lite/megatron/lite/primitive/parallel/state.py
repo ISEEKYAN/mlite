@@ -47,8 +47,6 @@ class ParallelState:
     pp_is_last: bool = True
     pp_next_rank: int = -1
     pp_prev_rank: int = -1
-    virtual_pipeline_size: int | None = None
-    virtual_pipeline_rank: int | None = None
 
 
 def init_parallel(config) -> ParallelState:

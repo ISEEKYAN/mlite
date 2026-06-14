@@ -173,12 +173,7 @@ def _resolve_step_checkpoint_path(path: str) -> str:
 
 
 def _supports_distopt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:
-    try:
-        from megatron.lite.primitive.ckpt.distckpt import supports_distopt_distckpt
-    except ModuleNotFoundError as exc:
-        if exc.name != "megatron.core":
-            raise
-        return False
+    from megatron.lite.primitive.ckpt.distckpt import supports_distopt_distckpt
 
     return supports_distopt_distckpt(model, optimizer)
 

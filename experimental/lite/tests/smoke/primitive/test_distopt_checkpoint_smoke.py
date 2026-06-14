@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
@@ -22,6 +21,7 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig as LiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
@@ -64,36 +64,12 @@ def _single_node_cuda_distopt():
     if int(os.environ.get("WORLD_SIZE", "1")) > 8:
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29541")
-
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    created_pg = False
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
-        created_pg = True
-
-    from megatron.core import parallel_state as mpu
-
-    created_mpu = False
-    if not mpu.is_initialized():
-        mpu.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            virtual_pipeline_model_parallel_size=None,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-            expert_tensor_parallel_size=1,
-        )
-        created_mpu = True
+    Utils.set_world_size(
+        int(os.environ.get("WORLD_SIZE", "1")), int(os.environ.get("LOCAL_RANK", "0"))
+    )
+    Utils.initialize_model_parallel()
     yield
-    if created_mpu:
-        mpu.destroy_model_parallel()
-    if created_pg and dist.is_initialized():
-        dist.destroy_process_group()
+    Utils.destroy_model_parallel()
 
 
 def _global_tensor(shape: tuple[int, ...], offset: float) -> torch.Tensor:

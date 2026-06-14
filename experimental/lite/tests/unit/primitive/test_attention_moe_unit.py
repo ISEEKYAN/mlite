@@ -22,10 +22,14 @@ def _moe_aux_scaler():
 
 
 def _router_and_parallel_state(monkeypatch):
+    from megatron.core.transformer.moe import moe_utils
+
+    if not hasattr(moe_utils, "te_general_gemm"):
+        monkeypatch.setattr(moe_utils, "te_general_gemm", None, raising=False)
+
     from megatron.lite.primitive.modules.router import TopKRouter
     from megatron.lite.primitive.parallel import ParallelState
 
-    del monkeypatch
     return TopKRouter, ParallelState
 
 

@@ -502,13 +502,18 @@ def _pipeline_stage_barrier(ps: ParallelState) -> None:
         dist.barrier(group=ps.pp_cpu_group)
 
 
-def _set_virtual_pipeline_rank(ps: ParallelState, chunk_id: int | None, num_chunks: int) -> None:
+def _set_virtual_pipeline_rank(chunk_id: int | None, num_chunks: int) -> None:
     if chunk_id is None or num_chunks <= 1:
-        ps.virtual_pipeline_size = None
-        ps.virtual_pipeline_rank = None
         return
-    ps.virtual_pipeline_size = num_chunks
-    ps.virtual_pipeline_rank = chunk_id
+    try:
+        from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
+    except Exception:
+        return
+    if not mpu.is_initialized():
+        return
+    vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+    if vpp_size is not None and vpp_size > 1:
+        mpu.set_virtual_pipeline_model_parallel_rank(chunk_id)
 
 
 def _run_pipeline_chunk_forward(
@@ -574,7 +579,7 @@ def _forward_only_pipeline_schedule(
             hidden: torch.Tensor | None = None
             if is_local_stage:
                 chunk_id = stage_id // ps.pp_size
-                _set_virtual_pipeline_rank(ps, chunk_id, num_chunks)
+                _set_virtual_pipeline_rank(chunk_id, num_chunks)
                 model = model_chunks[chunk_id]
                 is_first_stage = stage_id == 0
                 is_last_stage = stage_id == total_stages - 1
@@ -614,7 +619,6 @@ def _forward_only_pipeline_schedule(
 
         outputs.append(_compact_pipeline_output(last_output) if last_output is not None else {})
 
-    _set_virtual_pipeline_rank(ps, None, num_chunks)
     return outputs
 
 
@@ -671,7 +675,7 @@ def _interleaved_1f1b_schedule(
             hidden: torch.Tensor | None = None
             if is_local_stage:
                 chunk_id = stage_id // ps.pp_size
-                _set_virtual_pipeline_rank(ps, chunk_id, num_chunks)
+                _set_virtual_pipeline_rank(chunk_id, num_chunks)
                 model = model_chunks[chunk_id]
                 is_first_stage = stage_id == 0
                 is_last_stage = stage_id == total_stages - 1
@@ -743,7 +747,7 @@ def _interleaved_1f1b_schedule(
             inp_grad: torch.Tensor | None = None
             if is_local_stage:
                 chunk_id = stage_id // ps.pp_size
-                _set_virtual_pipeline_rank(ps, chunk_id, num_chunks)
+                _set_virtual_pipeline_rank(chunk_id, num_chunks)
                 is_first_stage = stage_id == 0
                 is_last_stage = stage_id == total_stages - 1
                 inp, out_t, loss, _out = saved[stage_id]
@@ -784,7 +788,6 @@ def _interleaved_1f1b_schedule(
         if _dbg:
             print(f"[VPP r{rank}] mb={mb_id} complete", flush=True)
 
-    _set_virtual_pipeline_rank(ps, None, num_chunks)
     return outputs
 
 
