@@ -433,6 +433,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist_opt=not forward_only,
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=loss_fn,
+                forward_only=forward_only,
             )
 
         if not forward_only:
