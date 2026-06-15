@@ -83,10 +83,13 @@ def register_training_hooks(model_list: list, optimizer) -> None:
 
 
 def _is_megatron_ddp(model_chunk: Any) -> bool:
-    cls = model_chunk.__class__
+    try:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+    except Exception:
+        return False
+
     return (
-        cls.__name__ == "DistributedDataParallel"
-        and cls.__module__.startswith("megatron.core.")
+        isinstance(model_chunk, DDP)
         and hasattr(model_chunk, "buffers")
         and hasattr(model_chunk, "expert_parallel_buffers")
         and hasattr(model_chunk, "module")
