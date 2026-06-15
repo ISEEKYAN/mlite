@@ -308,6 +308,7 @@ class CompressedSparseAttention(nn.Module):
         if (
             use_sparse_backend
             and self.compress_ratio == 4
+            and self.ps.cp_size == 1
             and self.compressor is not None
             and self.indexer is not None
         ):

@@ -127,8 +127,8 @@ def _write_deepseek_v4_config(path) -> None:
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
         "num_hash_layers": 1,
-        "num_nextn_predict_layers": 0,
-        "compress_ratios": [4, 4],
+        "num_nextn_predict_layers": 1,
+        "compress_ratios": [4, 4, 4],
         "compress_rope_theta": 160000.0,
         "hc_mult": 2,
         "hc_eps": 1e-6,
@@ -178,7 +178,7 @@ def _optimizer_config() -> SimpleNamespace:
     ],
 )
 def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
-    tmp_path, model_name, model_type, write_config, vocab_size, lengths
+    tmp_path, monkeypatch, model_name, model_type, write_config, vocab_size, lengths
 ):
     torch = pytest.importorskip("torch")
     dist = pytest.importorskip("torch.distributed")
@@ -221,6 +221,26 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     engine._build_mlite_config = MethodType(_build_config_without_loading_weights, engine)
     engine.initialize()
     engine.optimizer_zero_grad()
+    route_hits = None
+    if model_name == "deepseek_v4":
+        from megatron.lite.primitive.modules.attention import csa as csa_module
+
+        route_hits = SimpleNamespace(compress_cp_calls=0, cp1_fast_path_calls=0)
+        original_compress_cp = csa_module.compress_contiguous_chunks_for_cp
+        original_cp1 = csa_module.CompressedSparseAttention._forward_fused_dsa_cp1
+
+        def _trace_compress_cp(*args, **kwargs):
+            route_hits.compress_cp_calls += 1
+            return original_compress_cp(*args, **kwargs)
+
+        def _trace_cp1(self, *args, **kwargs):
+            route_hits.cp1_fast_path_calls += 1
+            return original_cp1(self, *args, **kwargs)
+
+        monkeypatch.setattr(csa_module, "compress_contiguous_chunks_for_cp", _trace_compress_cp)
+        monkeypatch.setattr(
+            csa_module.CompressedSparseAttention, "_forward_fused_dsa_cp1", _trace_cp1
+        )
 
     input_ids = torch.nested.as_nested_tensor(
         [
@@ -247,7 +267,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
 
     runtime_batch = engine._make_runtime_batch(
         micro_batch=micro_batch,
-        inputs=model_inputs,
+        model_inputs=model_inputs,
         loss_scale=1.0,
     )
     assert isinstance(runtime_batch, PackedBatch)
@@ -264,6 +284,9 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
 
     assert torch.isfinite(result.model_output.loss)
     assert result.model_output.log_probs is not None
+    if route_hits is not None:
+        assert route_hits.cp1_fast_path_calls == 0
+        assert route_hits.compress_cp_calls > 0
     grad_norm = torch.zeros((), dtype=torch.float32, device=device)
     for param in engine.module.parameters():
         if param.grad is not None:
@@ -281,6 +304,12 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
 
     if rank == 0:
+        if route_hits is not None:
+            print(
+                "NON_FALLBACK_DS4_FUSED_INDEXER_CP_ROUTE_HIT "
+                f"compress_contiguous_chunks_for_cp_calls={route_hits.compress_cp_calls} "
+                f"cp1_fast_path_calls={route_hits.cp1_fast_path_calls}"
+            )
         print(
             "NON_SKIP_VERL_MLITE_RUNTIME_THD_CP_SMOKE_PASSED "
             f"model={model_name} "
