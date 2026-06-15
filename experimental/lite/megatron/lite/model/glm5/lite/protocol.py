@@ -20,6 +20,7 @@ from megatron.lite.model.glm5.lite.checkpoint import (
 from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.thd import prepare_packed_thd_kwargs_for_context_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec, wrap_checkpoint
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
@@ -75,6 +76,7 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
     for key in ("loss_mask", "temperature", "calculate_entropy"):
         if key in batch:
             kwargs[key] = batch[key]
+    prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
     return model(**kwargs)
 
 
