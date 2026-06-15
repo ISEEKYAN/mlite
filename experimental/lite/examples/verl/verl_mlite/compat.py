@@ -76,7 +76,15 @@ def _load_verl_file(relative_path: str, module_name: str):
 
 
 def load_verl_engine_api():
+    # Prefer the canonical package import so the MLite engine registers into the
+    # SAME EngineRegistry that verl's trainers resolve against. Loading base.py as
+    # a standalone module (below) creates a *duplicate* registry, which silently
+    # drops the mlite backend ("Unknown backend: mlite"). The file-load path is
+    # only a fallback for environments where verl isn't importable as a package.
     try:
+        from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
+        from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
+    except (ModuleNotFoundError, ImportError):
         base = _load_verl_file("workers/engine/base.py", "_verl_mlite_verl_engine_base")
         utils = _load_verl_file("workers/engine/utils.py", "_verl_mlite_verl_engine_utils")
         BaseEngine = base.BaseEngine
@@ -84,8 +92,5 @@ def load_verl_engine_api():
         EngineRegistry = base.EngineRegistry
         postprocess_batch_func = utils.postprocess_batch_func
         prepare_micro_batches = utils.prepare_micro_batches
-    except (FileNotFoundError, ModuleNotFoundError, ImportError):
-        from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
-        from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 
     return BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches

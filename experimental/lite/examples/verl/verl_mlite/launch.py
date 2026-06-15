@@ -15,6 +15,10 @@ def main() -> None:
     module = sys.argv[1]
     sys.argv = [module, *sys.argv[2:]]
     apply_runtime_patches()
+    # Import the engine so its EngineRegistry.register decorator runs before the
+    # verl trainer resolves the "mlite" backend.
+    import verl_mlite.engine  # noqa: F401
+
     runpy.run_module(module, run_name="__main__", alter_sys=True)
 
 
