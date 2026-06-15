@@ -3,73 +3,13 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.nn.functional import all_gather
 
-from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
-
-
-def _group_global_rank(group, rank):
-    if hasattr(dist, "get_global_rank"):
-        return dist.get_global_rank(group, rank)
-    return rank
+from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 
 
-def _send_recv_ring(tensor, *, send_rank, recv_rank, group):
-    recv = torch.empty_like(tensor)
-    ops = [
-        dist.P2POp(dist.isend, tensor.contiguous(), _group_global_rank(group, send_rank), group),
-        dist.P2POp(dist.irecv, recv, _group_global_rank(group, recv_rank), group),
-    ]
-    for req in dist.batch_isend_irecv(ops):
-        req.wait()
-    return recv
-
-
-class _RingExchangeForCP(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup):
-        cp_size = group.size()
-        cp_rank = group.rank()
-        ctx.group = group
-        ctx.cp_rank = cp_rank
-        return _send_recv_ring(
-            tensor,
-            send_rank=(cp_rank + 1) % cp_size,
-            recv_rank=(cp_rank - 1) % cp_size,
-            group=group,
-        )
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        cp_rank = ctx.cp_rank
-        cp_size = ctx.group.size()
-        return (
-            _send_recv_ring(
-                grad_output,
-                send_rank=(cp_rank - 1) % cp_size,
-                recv_rank=(cp_rank + 1) % cp_size,
-                group=ctx.group,
-            ),
-            None,
-        )
-
-
-def _ring_exchange_for_cp(tensor, group):
-    return tensor if group is None or group.size() <= 1 else _RingExchangeForCP.apply(tensor, group)
-
-
-def split_zigzag_local_chunks(
-    tensor, cp_rank: int, cp_size: int, seq_dim: int = 1
-) -> tuple[tuple[int, torch.Tensor], ...]:
-    if cp_size <= 1:
-        return ((0, tensor),)
-    local_len = tensor.shape[seq_dim]
-    assert local_len % 2 == 0, f"local seq_len={local_len} must be even for zigzag CP"
-    chunk_len = local_len // 2
-    chunk_ids = (cp_rank, 2 * cp_size - cp_rank - 1)
-    return tuple(
-        (chunk_id, tensor.narrow(seq_dim, offset * chunk_len, chunk_len))
-        for offset, chunk_id in enumerate(chunk_ids)
-    )
+def _all_gather_cp(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
+    return list(all_gather(tensor.contiguous(), group=group))
 
 
 def local_position_ids_for_cp(position_ids, *, batch, local_seq_len, cp_rank, cp_size):
@@ -83,18 +23,16 @@ def local_position_ids_for_cp(position_ids, *, batch, local_seq_len, cp_rank, cp
         raise ValueError(
             f"position_ids batch={position_ids.size(0)} does not match input batch={batch}."
         )
-    if cp_size <= 1:
+    if cp_size <= 1 or position_ids.size(1) == local_seq_len:
         return position_ids
 
     full_seq_len = local_seq_len * cp_size
-    if position_ids.size(1) == local_seq_len:
-        return position_ids
-    if position_ids.size(1) == full_seq_len:
-        return zigzag_slice_for_cp(position_ids, cp_rank, cp_size, seq_dim=1)
-    raise ValueError(
-        "CP expects position_ids to be either CP-local or full-length; "
-        f"got {position_ids.size(1)} for local_seq_len={local_seq_len}, cp={cp_size}."
-    )
+    if position_ids.size(1) != full_seq_len:
+        raise ValueError(
+            "CP expects position_ids to be either CP-local or full-length; "
+            f"got {position_ids.size(1)} for local_seq_len={local_seq_len}, cp={cp_size}."
+        )
+    return contiguous_slice_for_cp(position_ids, cp_rank, cp_size, seq_dim=1)
 
 
 def local_sequence_tensor_for_cp(
@@ -115,12 +53,12 @@ def local_sequence_tensor_for_cp(
     seq_len = tensor.size(seq_dim)
     if seq_len == local_seq_len:
         return tensor
-    if seq_len == full_seq_len:
-        return zigzag_slice_for_cp(tensor, cp_rank, cp_size, seq_dim=seq_dim)
-    raise ValueError(
-        f"CP expects {name} to be either CP-local or full-length; "
-        f"got {seq_len} for local_seq_len={local_seq_len}, cp={cp_size}."
-    )
+    if seq_len != full_seq_len:
+        raise ValueError(
+            f"CP expects {name} to be either CP-local or full-length; "
+            f"got {seq_len} for local_seq_len={local_seq_len}, cp={cp_size}."
+        )
+    return contiguous_slice_for_cp(tensor, cp_rank, cp_size, seq_dim=seq_dim)
 
 
 def iter_cp_sources(tensor, position_ids, *, cp_rank, cp_size, cp_group):
@@ -129,51 +67,24 @@ def iter_cp_sources(tensor, position_ids, *, cp_rank, cp_size, cp_group):
         return
     if cp_group is None:
         raise RuntimeError("CP source iteration requires a context-parallel process group.")
-    source_rank = cp_rank
-    source_tensor = tensor
-    source_positions = position_ids
-    for step in range(cp_size):
-        yield source_rank, source_tensor, source_positions
-        if step + 1 < cp_size:
-            source_tensor = _ring_exchange_for_cp(source_tensor, cp_group)
-            source_positions = _ring_exchange_for_cp(source_positions.contiguous(), cp_group)
-            source_rank = (source_rank - 1) % cp_size
+    tensor_parts = _all_gather_cp(tensor, cp_group)
+    position_parts = _all_gather_cp(position_ids.to(dtype=torch.long), cp_group)
+    for rank, (source_tensor, source_positions) in enumerate(zip(tensor_parts, position_parts)):
+        yield rank, source_tensor, source_positions
 
 
-def _gather_zigzag_chunk_tails(
-    tensor,
-    *,
-    tail_len,
-    cp_rank,
-    cp_size,
-    cp_group,
-    seq_dim=1,
-):
+def _gather_contiguous_tail(tensor, *, tail_len, cp_size, cp_group, seq_dim):
     if cp_size <= 1 or tail_len <= 0:
         return None
     if cp_group is None:
         raise RuntimeError("CP chunk-tail gather requires a context-parallel process group.")
-    chunks = split_zigzag_local_chunks(tensor, cp_rank, cp_size, seq_dim=seq_dim)
-    tails = []
-    for _chunk_id, chunk in chunks:
-        if chunk.size(seq_dim) < tail_len:
-            raise ValueError(f"CP chunk tail needs len >= {tail_len}, got {chunk.size(seq_dim)}.")
-        tails.append(chunk.narrow(seq_dim, chunk.size(seq_dim) - tail_len, tail_len).contiguous())
-    packed = torch.stack(tails, dim=1)
-    from torch.distributed.nn.functional import all_gather
-
-    return list(all_gather(packed, group=cp_group))
+    if tensor.size(seq_dim) < tail_len:
+        raise ValueError(f"CP chunk tail needs len >= {tail_len}, got {tensor.size(seq_dim)}.")
+    tail = tensor.narrow(seq_dim, tensor.size(seq_dim) - tail_len, tail_len)
+    return _all_gather_cp(tail.contiguous(), cp_group)
 
 
-def _zigzag_chunk_owner(chunk_id, cp_size):
-    if cp_size <= 1:
-        return 0, 0
-    owner = min(chunk_id, 2 * cp_size - 1 - chunk_id)
-    owner_chunks = (owner, 2 * cp_size - 1 - owner)
-    return owner, owner_chunks.index(chunk_id)
-
-
-def compress_zigzag_chunks_for_cp(
+def compress_contiguous_chunks_for_cp(
     compressor,
     tensor,
     *,
@@ -195,50 +106,39 @@ def compress_zigzag_chunks_for_cp(
         comp_pos = position_ids[:, :cutoff:compress_ratio]
         return compressed, comp_pos
 
-    boundary_tails = (
-        _gather_zigzag_chunk_tails(
+    drop_prefix = 0
+    tail_parts = None
+    if compressor.overlap:
+        tail_parts = _gather_contiguous_tail(
             tensor,
             tail_len=compress_ratio,
-            cp_rank=cp_rank,
             cp_size=cp_size,
             cp_group=cp_group,
             seq_dim=seq_dim,
         )
-        if compressor.overlap
-        else None
-    )
-    comp_parts: list[torch.Tensor] = []
-    pos_parts: list[torch.Tensor] = []
-    tensor_chunks = split_zigzag_local_chunks(tensor, cp_rank, cp_size, seq_dim=seq_dim)
-    pos_chunks = dict(split_zigzag_local_chunks(position_ids, cp_rank, cp_size, seq_dim=1))
-    for chunk_id, chunk in tensor_chunks:
-        chunk_pos = pos_chunks[chunk_id]
-        drop_prefix = 0
-        if compressor.overlap and chunk_id > 0:
-            if boundary_tails is None:
-                raise RuntimeError("CP compressor boundary tails are missing.")
-            owner, slot = _zigzag_chunk_owner(chunk_id - 1, cp_size)
-            prefix = boundary_tails[owner][:, slot].to(device=tensor.device, dtype=tensor.dtype)
-            prefix_pos = chunk_pos[:, :compress_ratio] - compress_ratio
-            chunk = torch.cat([prefix, chunk], dim=seq_dim)
-            chunk_pos = torch.cat([prefix_pos, chunk_pos], dim=1)
-            drop_prefix = 1
-        compressed = compressor(chunk, position_ids=chunk_pos, **kwargs)
-        if compressed is None:
-            continue
-        cutoff = (chunk.size(seq_dim) // compress_ratio) * compress_ratio
-        comp_pos = chunk_pos[:, :cutoff:compress_ratio]
-        if drop_prefix:
-            compressed = compressed.narrow(
-                compressed_seq_dim,
-                drop_prefix,
-                compressed.size(compressed_seq_dim) - drop_prefix,
-            )
-            comp_pos = comp_pos[:, drop_prefix:]
-        if compressed.size(compressed_seq_dim) == 0:
-            continue
-        comp_parts.append(compressed)
-        pos_parts.append(comp_pos)
-    if not comp_parts:
+        zero_tail = tensor.new_zeros(())
+        for tail in tail_parts:
+            zero_tail = zero_tail + tail.to(dtype=tensor.dtype).sum() * 0.0
+        tensor = tensor + zero_tail
+    if tail_parts is not None and cp_rank > 0:
+        prefix = tail_parts[cp_rank - 1].to(device=tensor.device, dtype=tensor.dtype)
+        prefix_pos = position_ids[:, :compress_ratio] - compress_ratio
+        tensor = torch.cat([prefix, tensor], dim=seq_dim)
+        position_ids = torch.cat([prefix_pos, position_ids], dim=1)
+        drop_prefix = 1
+
+    compressed = compressor(tensor, position_ids=position_ids, **kwargs)
+    if compressed is None:
         return None
-    return torch.cat(comp_parts, dim=compressed_seq_dim), torch.cat(pos_parts, dim=1)
+    cutoff = (tensor.size(seq_dim) // compress_ratio) * compress_ratio
+    comp_pos = position_ids[:, :cutoff:compress_ratio]
+    if drop_prefix:
+        compressed = compressed.narrow(
+            compressed_seq_dim,
+            drop_prefix,
+            compressed.size(compressed_seq_dim) - drop_prefix,
+        )
+        comp_pos = comp_pos[:, drop_prefix:]
+    if compressed.size(compressed_seq_dim) == 0:
+        return None
+    return compressed, comp_pos

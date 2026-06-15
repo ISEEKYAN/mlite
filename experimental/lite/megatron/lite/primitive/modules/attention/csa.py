@@ -7,7 +7,7 @@ import torch.nn as nn
 import transformer_engine.pytorch as te
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.modules.attention.cp import (
-    compress_zigzag_chunks_for_cp,
+    compress_contiguous_chunks_for_cp,
     iter_cp_sources,
 )
 from megatron.lite.primitive.parallel.state import ParallelState
@@ -384,7 +384,7 @@ class CompressedSparseAttention(nn.Module):
         value_parts = [torch.cat(dense_value_parts, dim=2)]
 
         if self.compressor is not None:
-            compressed_pack = compress_zigzag_chunks_for_cp(
+            compressed_pack = compress_contiguous_chunks_for_cp(
                 self.compressor,
                 x,
                 position_ids=position_ids,
@@ -412,7 +412,7 @@ class CompressedSparseAttention(nn.Module):
             compressed_scores = compressed_scores.masked_fill(~compressed_valid, -float("inf"))
 
             if self.indexer is not None:
-                index_comp_pack = compress_zigzag_chunks_for_cp(
+                index_comp_pack = compress_contiguous_chunks_for_cp(
                     self.indexer.compressor,
                     x,
                     position_ids=position_ids,

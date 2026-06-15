@@ -12,7 +12,10 @@ from megatron.lite.primitive.parallel.state import ParallelState
 
 
 class DeepseekV4MoE(nn.Module):
-    """Model-specific assembly over shared router, Experts, dispatcher, and shared MLP."""
+    """Model-specific assembly over shared router, Experts, dispatcher, and shared MLP.
+
+    Allowlist reason: this owns DS4 hash routing wiring, while expert compute stays shared.
+    """
 
     def __init__(
         self,

@@ -20,11 +20,11 @@ from megatron.lite.primitive.modules.attention.cp import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp
-from megatron.lite.primitive.parallel.thd import (
-    pack_nested_thd,
-    prepare_packed_thd_kwargs_for_context_parallel,
+from megatron.lite.primitive.parallel.cp import (
+    contiguous_position_ids_for_cp,
+    contiguous_slice_for_cp,
 )
+from megatron.lite.primitive.parallel.thd import pack_nested_thd
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import Batch, OptimizerConfig, PackedBatch, ParallelConfig
 
@@ -172,7 +172,7 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         value = _batch_value(batch, key, _MISSING)
         if value is not _MISSING:
             kwargs[key] = value
-    prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
+    _prepare_packed_contiguous_cp_kwargs(model, kwargs)
     kwargs.pop("packed_seq_params", None)
     return {key: value for key, value in kwargs.items() if key in _MODEL_FORWARD_KEYS}
 
@@ -199,7 +199,18 @@ def _base_model_forward_kwargs(batch):
     return kwargs
 
 
-def _prepare_zigzag_cp_kwargs(model, kwargs):
+def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
+    ps = getattr(model, "ps", ParallelState())
+    if ps.cp_size <= 1:
+        return kwargs
+    for key in ("input_ids", "labels", "loss_mask", "position_ids"):
+        tensor = kwargs.get(key)
+        if tensor is not None:
+            kwargs[key] = contiguous_slice_for_cp(tensor, ps.cp_rank, ps.cp_size, seq_dim=1)
+    return kwargs
+
+
+def _prepare_contiguous_cp_kwargs(model, kwargs):
     ps = getattr(model, "ps", ParallelState())
     local_seq_len = _infer_cp_local_seq_len(
         input_ids=kwargs["input_ids"],
@@ -215,7 +226,7 @@ def _prepare_zigzag_cp_kwargs(model, kwargs):
     )
     if kwargs.get("position_ids") is None:
         full_seq_len = local_seq_len * ps.cp_size
-        position_ids = zigzag_position_ids_for_cp(
+        position_ids = contiguous_position_ids_for_cp(
             full_seq_len,
             cp_rank=ps.cp_rank,
             cp_size=ps.cp_size,
@@ -246,7 +257,7 @@ def _prepare_model_forward_kwargs(model, batch):
     if isinstance(batch, PackedBatch):
         return _prepare_packed_batch_kwargs(model, batch)
     kwargs = _base_model_forward_kwargs(batch)
-    return _prepare_zigzag_cp_kwargs(model, kwargs)
+    return _prepare_contiguous_cp_kwargs(model, kwargs)
 
 
 def _forward_step(model, batch) -> dict:

@@ -89,6 +89,35 @@ def zigzag_slice_for_cp(
     return torch.cat((first, second), dim=seq_dim).contiguous()
 
 
+def contiguous_slice_for_cp(
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int = 1
+) -> torch.Tensor:
+    """Return one rank's contiguous CP shard from a full sequence tensor."""
+    if cp_size <= 1:
+        return tensor
+    seq_len = tensor.shape[seq_dim]
+    if seq_len % cp_size != 0:
+        raise ValueError(f"seq_len={seq_len} must be divisible by cp_size={cp_size}")
+    local_len = seq_len // cp_size
+    return tensor.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
+
+
+def contiguous_position_ids_for_cp(
+    seq_len: int,
+    cp_rank: int,
+    cp_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return global position IDs for this CP rank under contiguous splitting."""
+    if cp_size <= 1:
+        return torch.arange(seq_len, device=device).unsqueeze(0)
+    if seq_len % cp_size != 0:
+        raise ValueError(f"seq_len={seq_len} must be divisible by cp_size={cp_size}")
+    local_len = seq_len // cp_size
+    start = cp_rank * local_len
+    return torch.arange(start, start + local_len, device=device).unsqueeze(0)
+
+
 def zigzag_to_contiguous_chunks(
     tensor: torch.Tensor,
     cp_group: dist.ProcessGroup | None,
@@ -271,6 +300,8 @@ def split_packed_for_cp(
 
 
 __all__ = [
+    "contiguous_position_ids_for_cp",
+    "contiguous_slice_for_cp",
     "contiguous_to_zigzag_chunks",
     "split_packed_for_cp",
     "zigzag_to_contiguous_chunks",
