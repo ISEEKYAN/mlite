@@ -7,9 +7,9 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 
 def run_microbatch_loop(
@@ -44,15 +44,19 @@ def run_microbatch_loop(
     last_out = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
-        batch = next(data_iter)
+        batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
             scale = torch.tensor(1.0 / num_microbatches, device="cuda")
             pre_forward_hook(scale)
-        out = forward_fn(model, batch)
+        with use_loss_context(loss_context):
+            out = forward_fn(model, batch)
         if dist_opt and optimizer is not None and mb == num_microbatches - 1:
             optimizer.grad_sync_enabled = True
         if loss_fn is not None:
-            loss, metrics = loss_fn(out, batch)
+            if loss_context is None:
+                loss, metrics = loss_fn(out, batch)
+            else:
+                loss, metrics = loss_fn(out, batch, loss_context)
             (loss / num_microbatches).backward()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)

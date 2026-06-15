@@ -10,21 +10,20 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from megatron.lite.model import resolve_model_type_from_hf
+from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.runtime import create_runtime
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+from megatron.lite.runtime.contracts import LossContext, PackedBatch
+from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
+from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 from tensordict import TensorDict
+
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.workers.config import HFModelConfig, OptimizerConfig
-
-from megatron.lite.model import resolve_model_type_from_hf
-from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
-from megatron.lite.primitive.parallel import pack_nested_thd, unpack_packed_thd_to_nested
-from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
-from megatron.lite.runtime import create_runtime
-from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts import PackedBatch
-from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
-from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 from verl_mlite.compat import load_verl_engine_api
 
 from .config import MegatronLiteEngineConfig
@@ -350,72 +349,15 @@ class MegatronLiteEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
-        if self._use_runtime_forward_backward():
-            return self._forward_backward_batch_with_runtime(
-                data=data,
-                micro_batches=micro_batches,
-                indices=indices,
-                loss_function=loss_function,
-                forward_only=forward_only,
-            )
-
-        outputs = []
-        num_micro_batches = len(micro_batches)
-        for micro_idx, micro_batch in enumerate(micro_batches):
-            tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
-            micro_batch = micro_batch.to(get_device_id())
-            model_inputs = self._make_model_inputs(micro_batch)
-
-            pre_forward_hook = self.handle._extras.get("pre_forward_hook")
-            if pre_forward_hook is not None:
-                pre_forward_hook(torch.tensor(1.0 / num_micro_batches, device=get_device_id()))
-
-            with torch.no_grad() if forward_only else torch.enable_grad():
-                raw_output = self.module(
-                    input_ids=model_inputs["input_ids"],
-                    position_ids=model_inputs["position_ids"],
-                    packed_seq_params=model_inputs["packed_seq_params"],
-                    labels=model_inputs["labels"],
-                    loss_mask=model_inputs.get("loss_mask"),
-                    temperature=model_inputs["temperature"],
-                    use_fused_kernels=model_inputs["use_fused_kernels"],
-                    calculate_entropy=model_inputs["calculate_entropy"],
-                )
-
-                model_output = self._build_verl_model_output(
-                    raw_output=raw_output, micro_batch=micro_batch, inputs=model_inputs
-                )
-
-                if loss_function is not None:
-                    loss, metrics = loss_function(
-                        model_output=model_output,
-                        data=micro_batch,
-                        dp_group=self.get_data_parallel_group(),
-                    )
-                else:
-                    loss = torch.zeros((), device=get_device_id(), dtype=torch.float32)
-                    metrics = {}
-                if raw_output.get("mtp_loss") is not None:
-                    metrics = dict(metrics)
-                    mtp_loss = self._reduce_mtp_metric(raw_output["mtp_loss"])
-                    metrics["mtp_losses/mtp_1_loss"] = (
-                        float(mtp_loss.item()) if mtp_loss.numel() == 1 else mtp_loss.cpu().tolist()
-                    )
-
-            if not forward_only and loss_function is not None:
-                loss.backward()
-
-            outputs.append(
-                {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
-            )
-
-        if not forward_only:
-            finalize_grads = self.handle._extras.get("finalize_grads")
-            if finalize_grads is not None:
-                finalize_grads()
-
-        result = postprocess_batch_func(output_lst=outputs, indices=indices, data=data)
-        return result
+        # Megatron drives every forward through the runtime's forward_backward
+        # callback; the engine never calls the module directly.
+        return self._forward_backward_batch_with_runtime(
+            data=data,
+            micro_batches=micro_batches,
+            indices=indices,
+            loss_function=loss_function,
+            forward_only=forward_only,
+        )
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
@@ -601,6 +543,10 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True."
             )
         impl_cfg["use_thd"] = True
+        cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
+        if cross_entropy_fusion is None:
+            cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
+        impl_cfg.setdefault("cross_entropy_fusion", bool(cross_entropy_fusion))
         mtp_cfg = getattr(self.model_config, "mtp", None)
         if mtp_cfg is not None:
             mtp_enable = bool(getattr(mtp_cfg, "enable", False))
@@ -686,10 +632,6 @@ class MegatronLiteEngine(BaseEngine):
             return model[0]
         return model
 
-    def _use_runtime_forward_backward(self) -> bool:
-        ps = self.handle._parallel_state
-        return ps.pp_size > 1 or ps.cp_size > 1
-
     def _forward_backward_batch_with_runtime(
         self,
         *,
@@ -712,9 +654,11 @@ class MegatronLiteEngine(BaseEngine):
         for micro_idx, micro_batch in enumerate(micro_batches):
             tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
             micro_batch = micro_batch.to(get_device_id())
-            model_inputs = self._make_model_inputs(micro_batch)
             runtime_batches.append(
-                self._make_runtime_batch(micro_batch, model_inputs, loss_scale=loss_scale)
+                (
+                    self._make_runtime_batch(micro_batch),
+                    self._make_runtime_loss_context(micro_batch, loss_scale=loss_scale),
+                )
             )
 
         runtime_loss_fn = None
@@ -739,82 +683,41 @@ class MegatronLiteEngine(BaseEngine):
             "metrics": {key: [value] for key, value in metrics.items()},
         }
 
-    def _make_model_inputs(self, micro_batch: TensorDict) -> dict[str, torch.Tensor]:
+    def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
+        """Flatten a jagged no-padding batch to a model-agnostic ``PackedBatch``.
+
+        No CP split, no padding, no ``PackedSeqParams`` here: each model's
+        protocol owns its pack/unpack pair (zigzag vs contiguous). ``labels`` are
+        the unrolled tokens; the protocol rolls them while packing.
+        """
         input_ids = micro_batch["input_ids"]
         if not getattr(input_ids, "is_nested", False):
             raise NotImplementedError(
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
-
-        ps = self.handle._parallel_state
-        loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
-        packed_batch = pack_nested_thd(
-            input_ids,
-            tp_size=ps.tp_size,
-            cp_size=ps.cp_size,
-            cp_rank=ps.cp_rank,
-            cp_group=ps.cp_group if ps.cp_size > 1 else None,
-            split_cp=False,
-            labels=input_ids,
-            roll_labels=True,
-            loss_mask=loss_mask,
-            roll_loss_mask=True,
-        )
-        use_fused_kernels = tu.get_non_tensor_data(
-            data=micro_batch, key="use_fused_kernels", default=self.engine_config.use_fused_kernels
-        )
-
-        return {
-            "input_ids": packed_batch.input_ids,
-            "labels": packed_batch.labels,
-            "loss_mask": packed_batch.loss_mask,
-            "position_ids": packed_batch.position_ids,
-            "packed_seq_params": packed_batch.packed_seq_params,
-            "packed_batch": packed_batch,
-            "temperature": self._scalar_temperature(micro_batch),
-            "use_fused_kernels": use_fused_kernels,
-            "calculate_entropy": tu.get_non_tensor_data(
-                data=micro_batch, key="calculate_entropy", default=False
-            ),
-        }
-
-    def _make_runtime_batch(
-        self,
-        micro_batch: TensorDict,
-        model_inputs: dict[str, Any],
-        *,
-        loss_scale: float,
-    ) -> PackedBatch:
-        input_ids = micro_batch["input_ids"]
-        seq_lens = input_ids.offsets().diff().to(dtype=torch.int64)
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
-            labels=self._roll_nested_values_left(input_ids),
-            loss_mask=(
-                None if loss_mask is None else self._roll_nested_values_left(loss_mask).float()
-            ),
-            seq_lens=seq_lens,
-            extras={
-                "temperature": model_inputs["temperature"],
-                "use_fused_kernels": model_inputs["use_fused_kernels"],
-                "calculate_entropy": model_inputs["calculate_entropy"],
-                "loss_scale": loss_scale,
-                "_verl_micro_batch": micro_batch,
-                "_verl_inputs": model_inputs,
-            },
+            labels=input_ids.values().contiguous(),
+            loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
+            seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
         )
 
-    @staticmethod
-    def _roll_nested_values_left(nested: torch.Tensor) -> torch.Tensor:
-        offsets = nested.offsets()
-        values = nested.values()
-        rolled = torch.zeros_like(values)
-        for start_t, end_t in zip(offsets[:-1], offsets[1:], strict=True):
-            start, end = int(start_t.item()), int(end_t.item())
-            if end - start > 1:
-                rolled[start : end - 1] = values[start + 1 : end]
-        return rolled
+    def _make_runtime_loss_context(
+        self,
+        micro_batch: TensorDict,
+        *,
+        loss_scale: float,
+    ) -> LossContext:
+        return LossContext(
+            temperature=float(self._scalar_temperature(micro_batch)),
+            calculate_entropy=bool(
+                tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+            ),
+            return_log_probs=True,
+            loss_scale=loss_scale,
+            source_batch=micro_batch,
+        )
 
     @staticmethod
     def _loss_mask_for_packing(
@@ -845,26 +748,32 @@ class MegatronLiteEngine(BaseEngine):
         self,
         *,
         raw_output: dict[str, torch.Tensor],
-        micro_batch: TensorDict,
-        inputs: dict[str, torch.Tensor],
+        runtime_batch: PackedBatch,
     ) -> dict[str, torch.Tensor]:
-        del micro_batch
         log_probs = raw_output.get("log_probs")
         if log_probs is None:
             raise ValueError("Megatron Lite THD model output must contain token log_probs.")
-        nested_log_probs = unpack_packed_thd_to_nested(log_probs, inputs["packed_batch"])
-        output = {"log_probs": nested_log_probs}
+        proto = self.handle._extras.get("protocol")
+        unpack = getattr(proto, "unpack_forward_output", None)
+        if unpack is None:
+            raise ValueError(
+                "Model protocol must expose unpack_forward_output to reverse THD outputs."
+            )
+        output = {"log_probs": unpack(self.module, runtime_batch, log_probs)}
         entropy = raw_output.get("entropy")
         if entropy is not None:
-            output["entropy"] = unpack_packed_thd_to_nested(entropy, inputs["packed_batch"])
+            output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
     def _make_runtime_loss_fn(self, loss_function, *, forward_only: bool):
-        def _loss_fn(raw_output: dict[str, torch.Tensor], runtime_batch: PackedBatch):
-            micro_batch = runtime_batch.extras["_verl_micro_batch"]
-            inputs = runtime_batch.extras["_verl_inputs"]
+        def _loss_fn(
+            raw_output: dict[str, torch.Tensor],
+            runtime_batch: PackedBatch,
+            loss_context: LossContext,
+        ):
+            micro_batch = loss_context.source_batch
             model_output = self._build_verl_model_output(
-                raw_output=raw_output, micro_batch=micro_batch, inputs=inputs
+                raw_output=raw_output, runtime_batch=runtime_batch
             )
             raw_output["_verl_model_output"] = model_output
             if loss_function is not None:

@@ -12,17 +12,20 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
+from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from megatron.lite.runtime.contracts.loss import split_loss_context
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
-    impl_cfg_kwargs = {**rt_cfg.impl_cfg, "parallel": rt_cfg.parallel}
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
+    # Only forward impl_cfg keys this model's ImplConfig declares: the connector
+    # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
+    impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
+    impl_cfg_kwargs["parallel"] = rt_cfg.parallel
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
@@ -64,13 +67,13 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     os.environ["NVTE_UNFUSED_ATTN"] = unfused
 
 
-def _infer_pipeline_tensor_shape(batch: Any, model_cfg: Any, ps) -> tuple[int, int, int]:
+def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tuple[int, int, int]:
     if model_cfg is None or not hasattr(model_cfg, "hidden_size"):
         raise ValueError("Megatron Lite pipeline runtime requires model_cfg.hidden_size.")
-    if not isinstance(batch, dict) or "input_ids" not in batch:
-        raise TypeError("Megatron Lite pipeline runtime requires dict batches with input_ids.")
+    if not isinstance(batch, PackedBatch):
+        raise TypeError("Megatron Lite pipeline runtime requires PackedBatch inputs.")
 
-    input_ids = batch["input_ids"]
+    input_ids = batch.input_ids
     if input_ids.dim() == 1:
         batch_size = 1
         local_seq_len = int(input_ids.size(0))
@@ -195,8 +198,8 @@ class MegatronLiteRuntime(RuntimeBase):
             if callable(reload_model_params):
                 reload_model_params()
 
-        # ── forward_step default ──
-        forward_fn = bundle.forward_step or (lambda m, b: m(**b))
+        if bundle.forward_step is None:
+            raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
@@ -209,7 +212,7 @@ class MegatronLiteRuntime(RuntimeBase):
             _extras={
                 "model_chunks": bundle.chunks,
                 "model_cfg": model_cfg,
-                "forward_step": forward_fn,
+                "forward_step": bundle.forward_step,
                 "protocol": proto,
                 "finalize_grads": bundle.finalize_grads,
                 "world_size": dist.get_world_size(),
@@ -391,8 +394,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
             from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 
-            first_batch = next(data_iter)
-            data_iter = chain([first_batch], data_iter)
+            first_item = next(data_iter)
+            first_batch, _loss_context = split_loss_context(first_item)
+            data_iter = chain([first_item], data_iter)
             tensor_shape = _infer_pipeline_tensor_shape(
                 first_batch, handle._extras.get("model_cfg"), ps
             )

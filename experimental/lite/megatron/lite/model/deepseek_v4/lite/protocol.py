@@ -14,6 +14,7 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
+from megatron.lite.model.protocol_utils import add_loss_context_kwargs
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
@@ -22,9 +23,9 @@ from megatron.lite.primitive.parallel.cp import (
     local_position_ids_for_cp,
     local_sequence_tensor_for_cp,
 )
-from megatron.lite.primitive.parallel.thd import pack_nested_thd
+from megatron.lite.primitive.parallel.thd import pack_nested_thd, thd_pack_meta, unpack_thd_to_nested
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
-from megatron.lite.runtime.contracts import Batch, OptimizerConfig, PackedBatch, ParallelConfig
+from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
 def is_expert_param(name: str) -> bool:
@@ -61,7 +62,6 @@ MODULE_MAP = {
     "ffn_norm": lambda layer: layer.post_attention_layernorm,
 }
 
-_OPTIONAL_MODEL_KWARGS = ("attention_mask", "loss_mask", "temperature", "calculate_entropy")
 _MODEL_FORWARD_KEYS = (
     "input_ids",
     "position_ids",
@@ -72,7 +72,6 @@ _MODEL_FORWARD_KEYS = (
     "calculate_entropy",
     "enable_mtp",
 )
-_MISSING = object()
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> DeepseekV4Config:
@@ -119,14 +118,6 @@ def _infer_cp_local_seq_len(
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
 
-def _batch_value(batch, key, default=None):
-    if hasattr(batch, key):
-        value = getattr(batch, key)
-        return default if value is None and default is _MISSING else value
-    extras = getattr(batch, "extras", None)
-    return extras.get(key, default) if isinstance(extras, dict) else default
-
-
 def _nested_from_packed_tensor(tensor, seq_lens):
     if tensor is None:
         return None
@@ -166,32 +157,20 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         "packed_seq_params": packed.packed_seq_params,
         "enable_mtp": False,
     }
-    for key in ("attention_mask", "temperature", "calculate_entropy"):
-        value = _batch_value(batch, key, _MISSING)
-        if value is not _MISSING:
-            kwargs[key] = value
+    add_loss_context_kwargs(kwargs)
     _prepare_packed_contiguous_cp_kwargs(model, kwargs)
     kwargs.pop("packed_seq_params", None)
     return {key: value for key, value in kwargs.items() if key in _MODEL_FORWARD_KEYS}
 
 
-def _base_model_forward_kwargs(batch):
-    input_ids = _batch_value(batch, "input_ids", _MISSING)
-    if input_ids is _MISSING:
-        raise KeyError("DeepSeek V4 forward batch requires input_ids.")
-    input_ids = _as_batch_row(input_ids)
-    kwargs: dict[str, Any] = {
-        "input_ids": input_ids,
-        "labels": _as_batch_row(_batch_value(batch, "labels")),
-    }
-    for key in _OPTIONAL_MODEL_KWARGS:
-        value = _batch_value(batch, key, _MISSING)
-        if value is not _MISSING:
-            if key == "loss_mask":
-                value = _as_batch_row(value)
-            kwargs[key] = value
-    position_ids = _batch_value(batch, "position_ids")
-    position_ids = _normalize_ds4_position_ids(position_ids)
+def _base_model_forward_kwargs(batch: PackedBatch):
+    kwargs: dict[str, Any] = {"input_ids": _as_batch_row(batch.input_ids)}
+    if batch.labels is not None:
+        kwargs["labels"] = _as_batch_row(batch.labels)
+    if batch.loss_mask is not None:
+        kwargs["loss_mask"] = _as_batch_row(batch.loss_mask)
+    add_loss_context_kwargs(kwargs)
+    position_ids = _normalize_ds4_position_ids(batch.position_ids)
     if position_ids is not None:
         kwargs["position_ids"] = position_ids
     return kwargs
@@ -251,15 +230,34 @@ def _prepare_contiguous_cp_kwargs(model, kwargs):
     return kwargs
 
 
-def _prepare_model_forward_kwargs(model, batch):
-    if isinstance(batch, PackedBatch):
+def _prepare_model_forward_kwargs(model, batch: PackedBatch):
+    # THD-packed inputs (1-D values, or a single padded [1, S] row) carry their own
+    # cu_seqlens and go through the packed builder. A dense multi-row [B, S] batch is
+    # split per row under contiguous CP, where contiguous_position_ids_for_cp rebuilds
+    # the per-rank global position ids.
+    input_ids = batch.input_ids
+    is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
+    if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
     kwargs = _base_model_forward_kwargs(batch)
     return _prepare_contiguous_cp_kwargs(model, kwargs)
 
 
-def _forward_step(model, batch) -> dict:
+def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     return model(**_prepare_model_forward_kwargs(model, batch))
+
+
+def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
+    # DeepSeek-V4 packs each sequence to the (zigzag) TE alignment but slices CP
+    # contiguously for the fused DSA indexer, so reconstruct contiguously.
+    ps = getattr(model, "ps", ParallelState())
+    meta = thd_pack_meta(
+        batch.seq_lens,
+        tp_size=ps.tp_size,
+        cp_size=ps.cp_size,
+        cp_group=ps.cp_group if ps.cp_size > 1 else None,
+    )
+    return unpack_thd_to_nested(output, meta, contiguous=True)
 
 
 def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:

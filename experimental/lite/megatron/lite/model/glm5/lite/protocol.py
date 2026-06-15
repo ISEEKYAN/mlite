@@ -9,20 +9,30 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.model.glm5.lite.checkpoint import (
     EXPERT_CLASSIFIER,
+)
+from megatron.lite.model.glm5.lite.checkpoint import (
     export_hf_weights as _export_hf_weights_impl,
-    save_hf_weights as _save_hf_weights_impl,
-    save_weights as _save_weights_impl,
 )
 from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.glm5.lite.checkpoint import (
+    save_hf_weights as _save_hf_weights_impl,
+)
+from megatron.lite.model.glm5.lite.checkpoint import (
+    save_weights as _save_weights_impl,
+)
+from megatron.lite.model.protocol_utils import (
+    add_loss_context_kwargs,
+    pack_thd_forward_kwargs,
+    unpack_thd_forward_output,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.parallel.thd import prepare_packed_thd_kwargs_for_context_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec, wrap_checkpoint
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 
 MODULE_MAP = {
     "self_attn": lambda layer: layer.self_attn,
@@ -66,18 +76,14 @@ def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
     return cfg
 
 
-def _forward_step(model: nn.Module, batch: dict) -> dict:
-    kwargs: dict[str, Any] = {"input_ids": batch["input_ids"], "labels": batch.get("labels")}
-    if kwargs["input_ids"].dim() == 1:
-        kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(0)
-    for key in ("position_ids", "attention_mask", "packed_seq_params"):
-        if key in batch:
-            kwargs[key] = batch[key]
-    for key in ("loss_mask", "temperature", "calculate_entropy"):
-        if key in batch:
-            kwargs[key] = batch[key]
-    prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
+def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
+    kwargs = pack_thd_forward_kwargs(model, batch)
+    add_loss_context_kwargs(kwargs)
     return model(**kwargs)
+
+
+def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
+    return unpack_thd_forward_output(model, batch, output)
 
 
 def _apply_glm5_recompute(

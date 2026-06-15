@@ -7,8 +7,6 @@ Supports sequence parallel, context parallel, and THD (packed sequences).
 
 from __future__ import annotations
 
-import inspect
-
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
@@ -33,16 +31,6 @@ _KEPT_PSP_FIELDS = (
     "max_seqlen_q",
     "max_seqlen_kv",
 )
-
-
-def _callable_accepts_kwarg(fn, kwarg: str) -> bool:
-    try:
-        parameters = inspect.signature(fn).parameters.values()
-    except (TypeError, ValueError):
-        return False
-    return any(
-        param.kind is inspect.Parameter.VAR_KEYWORD or param.name == kwarg for param in parameters
-    )
 
 
 class GQAttention(nn.Module):
@@ -162,10 +150,6 @@ class GQAttention(nn.Module):
                 rotary_base=rope_theta,
                 cp_group=ps.cp_group if ps.cp_size > 1 else None,
             )
-        self._rotary_accepts_packed_seq = self._mrope_section is None and _callable_accepts_kwarg(
-            self.rotary.forward, "packed_seq"
-        )
-
         cp_kwargs = {}
         if ps.cp_size > 1:
             if GQAttention._cp_stream is None:
@@ -226,10 +210,7 @@ class GQAttention(nn.Module):
                 seq_len_for_rope = int(max(max_q, max_kv))
             # Packed THD uses max per-sequence padded length, not total packed tokens.
             # The THD apply helper handles CP-zigzag frequency slicing per sequence.
-            if self._rotary_accepts_packed_seq:
-                freqs = self.rotary(seq_len_for_rope, packed_seq=True)
-            else:
-                freqs = self.rotary(seq_len_for_rope)
+            freqs = self.rotary(seq_len_for_rope, packed_seq=True)
             q = _apply_rotary_pos_emb_thd(
                 q,
                 packed_seq_params.cu_seqlens_q,

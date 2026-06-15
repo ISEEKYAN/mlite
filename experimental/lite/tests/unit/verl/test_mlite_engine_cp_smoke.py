@@ -205,7 +205,12 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
         engine_config=MegatronLiteEngineConfig(
             model_name=model_name,
             cp=world,
-            impl_cfg={"use_thd": True, "optimizer": None, "deterministic": False},
+            impl_cfg={
+                "use_thd": True,
+                "optimizer": None,
+                "deterministic": False,
+                "mtp_enable": False,
+            },
             use_fused_kernels=False,
         ),
         optimizer_config=_optimizer_config(),
@@ -239,24 +244,18 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
         device=device,
     )
 
-    model_inputs = engine._make_model_inputs(micro_batch)
-    assert model_inputs["packed_seq_params"].local_cp_size is None
-    assert model_inputs["input_ids"].shape[-1] == int(
-        model_inputs["packed_batch"].cu_seqlens_padded[-1].item()
-    )
-
-    runtime_batch = engine._make_runtime_batch(
-        micro_batch=micro_batch,
-        inputs=model_inputs,
-        loss_scale=1.0,
-    )
+    runtime_batch = engine._make_runtime_batch(micro_batch)
+    loss_context = engine._make_runtime_loss_context(micro_batch, loss_scale=1.0)
     assert isinstance(runtime_batch, PackedBatch)
-    assert "packed_seq_params" not in runtime_batch.extras
+    # Connector batch is model-agnostic: true seq lengths, no padding, no extras.
+    assert runtime_batch.seq_lens.tolist() == lengths
+    assert int(runtime_batch.input_ids.numel()) == sum(lengths)
+    assert not runtime_batch.extras
 
     with engine.train_mode():
         result = engine.runtime.forward_backward(
             engine.handle,
-            iter([runtime_batch]),
+            iter([(runtime_batch, loss_context)]),
             loss_fn=None,
             num_microbatches=1,
             forward_only=False,
@@ -274,8 +273,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
 
     verl_output = engine._build_verl_model_output(
         raw_output={"log_probs": result.model_output.log_probs},
-        micro_batch=micro_batch,
-        inputs=model_inputs,
+        runtime_batch=runtime_batch,
     )
     nested_log_probs = verl_output["log_probs"]
     assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths

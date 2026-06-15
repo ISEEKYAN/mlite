@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 
 import torch
@@ -46,28 +45,10 @@ _KEPT_PSP_FIELDS = (
 )
 
 
-def _accepts_kwarg(fn, name: str) -> bool:
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-    return name in params or any(
-        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
-    )
-
-
-_ROPE_BSHD_ACCEPTS_MLA = _accepts_kwarg(_apply_rotary_pos_emb_bshd, "mla_rotary_interleaved")
-_ROPE_THD_ACCEPTS_MLA = _accepts_kwarg(_apply_rotary_pos_emb_thd, "mla_rotary_interleaved")
-_TE_DPA_ACCEPTS_SOFTMAX_SCALE = _accepts_kwarg(te.DotProductAttention, "softmax_scale")
-
-
 def _apply_mla_rope_bshd(t: torch.Tensor, freqs: torch.Tensor, *, mscale: float) -> torch.Tensor:
-    kwargs = dict(rotary_interleaved=False, mscale=mscale)
-    if _ROPE_BSHD_ACCEPTS_MLA:
-        kwargs["mla_rotary_interleaved"] = True
-    else:
-        kwargs["multi_latent_attention"] = True
-    return _apply_rotary_pos_emb_bshd(t, freqs, **kwargs)
+    return _apply_rotary_pos_emb_bshd(
+        t, freqs, rotary_interleaved=False, mscale=mscale, mla_rotary_interleaved=True
+    )
 
 
 def _apply_mla_rope_thd(
@@ -78,16 +59,15 @@ def _apply_mla_rope_thd(
     mscale: float,
     cp_group,
 ) -> torch.Tensor:
-    kwargs = dict(
+    return _apply_rotary_pos_emb_thd(
+        t,
+        cu_seqlens,
+        freqs,
         rotary_interleaved=False,
         mscale=mscale,
         cp_group=cp_group,
+        mla_rotary_interleaved=True,
     )
-    if _ROPE_THD_ACCEPTS_MLA:
-        kwargs["mla_rotary_interleaved"] = True
-    else:
-        kwargs["multi_latent_attention"] = True
-    return _apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, **kwargs)
 
 
 class MultiLatentAttention(nn.Module):
@@ -181,7 +161,7 @@ class MultiLatentAttention(nn.Module):
         else:
             raise ValueError(f"Unsupported MLA rope type: {rope_type!r}")
         self._softmax_scale = attn_mscale * attn_mscale / math.sqrt(self.q_head_dim)
-        self._query_scale = 1.0 if _TE_DPA_ACCEPTS_SOFTMAX_SCALE else attn_mscale * attn_mscale
+        self._query_scale = 1.0
 
         cp_kwargs = {}
         if ps.cp_size > 1:
@@ -195,9 +175,7 @@ class MultiLatentAttention(nn.Module):
         self._use_torch_core = ps.cp_size > 1 and v_head_dim != self.q_head_dim
         self.core_attn = None
         if not self._use_torch_core:
-            dpa_kwargs = dict(cp_kwargs)
-            if _TE_DPA_ACCEPTS_SOFTMAX_SCALE:
-                dpa_kwargs["softmax_scale"] = self._softmax_scale
+            dpa_kwargs = dict(cp_kwargs, softmax_scale=self._softmax_scale)
             kv_channels = (
                 (self.q_head_dim, v_head_dim) if v_head_dim != self.q_head_dim else self.q_head_dim
             )
