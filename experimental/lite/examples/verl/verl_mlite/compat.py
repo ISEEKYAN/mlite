@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from collections.abc import Iterable
 from functools import wraps
 from pathlib import Path
@@ -55,8 +56,44 @@ def _patch_transformers_rope_ignore_keys() -> None:
         cls._verl_mlite_rope_ignore_keys_patch = True
 
 
+def _patch_transformers_auto_model_aliases() -> None:
+    try:
+        import transformers
+        from transformers.models.auto import modeling_auto
+    except Exception:
+        return
+
+    image_text = getattr(transformers, "AutoModelForImageTextToText", None)
+    vision2seq = getattr(transformers, "AutoModelForVision2Seq", None)
+    fallback = image_text or getattr(transformers, "AutoModel", None)
+    if vision2seq is None and fallback is not None:
+        transformers.AutoModelForVision2Seq = fallback
+        modeling_auto.AutoModelForVision2Seq = fallback
+    if image_text is None and vision2seq is not None:
+        transformers.AutoModelForImageTextToText = vision2seq
+        modeling_auto.AutoModelForImageTextToText = vision2seq
+
+    for name, value in (
+        ("AutoModelForVision2Seq", getattr(transformers, "AutoModelForVision2Seq", None)),
+        (
+            "AutoModelForImageTextToText",
+            getattr(transformers, "AutoModelForImageTextToText", None),
+        ),
+    ):
+        if value is None:
+            continue
+        objects = getattr(transformers, "_objects", None)
+        if isinstance(objects, dict):
+            objects[name] = value
+        class_to_module = getattr(transformers, "_class_to_module", None)
+        if isinstance(class_to_module, dict):
+            class_to_module[name] = "models.auto.modeling_auto"
+
+
 def apply_runtime_patches() -> None:
+    _patch_transformers_auto_model_aliases()
     _patch_transformers_rope_ignore_keys()
+    _patch_verl_engine_package_import()
 
 
 def _load_verl_file(relative_path: str, module_name: str):
@@ -73,6 +110,24 @@ def _load_verl_file(relative_path: str, module_name: str):
     sys.modules[module_name] = module
     file_spec.loader.exec_module(module)
     return module
+
+
+def _patch_verl_engine_package_import() -> None:
+    if "verl.workers.engine" in sys.modules:
+        return
+    try:
+        base = _load_verl_file("workers/engine/base.py", "_verl_mlite_verl_engine_base")
+    except (FileNotFoundError, ModuleNotFoundError, ImportError):
+        return
+
+    module = types.ModuleType("verl.workers.engine")
+    for name in ("BaseEngine", "BaseEngineCtx", "EngineRegistry"):
+        if hasattr(base, name):
+            setattr(module, name, getattr(base, name))
+    module.__file__ = getattr(base, "__file__", None)
+    module.__package__ = "verl.workers.engine"
+    module.__path__ = []
+    sys.modules["verl.workers.engine"] = module
 
 
 def load_verl_engine_api():

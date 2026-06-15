@@ -105,6 +105,10 @@ def _has(reader: SafeTensorReader, name: str) -> bool:
     return True
 
 
+def _is_native_metadata_key(name: str) -> bool:
+    return name.endswith("._extra_state")
+
+
 def _scale_name_for_hf_name(name: str) -> str:
     return f"{name[:-7] if name.endswith('.weight') else name}.scale"
 
@@ -236,6 +240,8 @@ def load_hf_weights(
     loaded = 0
     missing: list[str] = []
     for name, target in state.items():
+        if _is_native_metadata_key(name):
+            continue
         hf_names = _hf_names_for_state_key(name, config, ps)
         if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
             missing.append(name)
@@ -281,6 +287,8 @@ def _local_hf_state(
     exported: dict[str, torch.Tensor] = {}
     for chunk in _iter_unwrapped_chunks(model):
         for native_name, tensor in chunk.state_dict().items():
+            if _is_native_metadata_key(native_name):
+                continue
             hf_names = _hf_names_for_state_key(native_name, config, ps)
             if not hf_names:
                 raise KeyError(f"DeepSeek V4 native state key has no HF mapping: {native_name}")

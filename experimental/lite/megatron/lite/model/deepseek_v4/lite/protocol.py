@@ -14,13 +14,17 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.primitive.parallel.cp import (
-    contiguous_position_ids_for_cp,
-    local_contiguous_sequence_tensor_for_cp,
-    split_packed_contiguous_for_cp,
+from megatron.lite.primitive.modules.attention.cp import (
+    local_position_ids_for_cp,
+    local_sequence_tensor_for_cp,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    prepare_packed_thd_kwargs_for_context_parallel,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import Batch, OptimizerConfig, PackedBatch, ParallelConfig
 
@@ -60,7 +64,7 @@ MODULE_MAP = {
 }
 
 _OPTIONAL_MODEL_KWARGS = ("attention_mask", "loss_mask", "temperature", "calculate_entropy")
-_PACKED_MODEL_KWARGS = {
+_MODEL_FORWARD_KEYS = (
     "input_ids",
     "position_ids",
     "attention_mask",
@@ -69,7 +73,7 @@ _PACKED_MODEL_KWARGS = {
     "temperature",
     "calculate_entropy",
     "enable_mtp",
-}
+)
 _MISSING = object()
 
 
@@ -84,7 +88,7 @@ def build_model_config(source: str | Path | dict, **overrides) -> DeepseekV4Conf
     return cfg
 
 
-def _normalize_ds4_position_ids(position_ids: torch.Tensor | None) -> torch.Tensor | None:
+def _normalize_ds4_position_ids(position_ids):
     if position_ids is None:
         return None
     if position_ids.dim() == 3:
@@ -97,7 +101,7 @@ def _normalize_ds4_position_ids(position_ids: torch.Tensor | None) -> torch.Tens
     return position_ids
 
 
-def _as_batch_row(tensor: torch.Tensor | None) -> torch.Tensor | None:
+def _as_batch_row(tensor):
     if tensor is not None and tensor.dim() == 1:
         return tensor.unsqueeze(0)
     return tensor
@@ -105,25 +109,19 @@ def _as_batch_row(tensor: torch.Tensor | None) -> torch.Tensor | None:
 
 def _infer_cp_local_seq_len(
     *,
-    input_ids: torch.Tensor,
-    position_ids: torch.Tensor | None,
-    cp_size: int,
-) -> int:
+    input_ids,
+    position_ids,
+    cp_size,
+):
     seq_len = input_ids.size(1)
     if cp_size <= 1:
         return seq_len
-    if position_ids is not None:
-        pos_len = position_ids.size(-1)
-        if pos_len == seq_len * cp_size:
-            return seq_len
-        if pos_len == seq_len:
-            return seq_len
-    if seq_len % cp_size == 0:
-        return seq_len // cp_size
-    return seq_len
+    if position_ids is not None and position_ids.size(-1) in (seq_len, seq_len * cp_size):
+        return seq_len
+    return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
 
-def _batch_value(batch: Batch, key: str, default: Any = None) -> Any:
+def _batch_value(batch, key, default=None):
     if hasattr(batch, key):
         value = getattr(batch, key)
         return default if value is None and default is _MISSING else value
@@ -131,37 +129,55 @@ def _batch_value(batch: Batch, key: str, default: Any = None) -> Any:
     return extras.get(key, default) if isinstance(extras, dict) else default
 
 
-def _prepare_packed_contiguous_cp_kwargs(
-    model: nn.Module,
-    kwargs: dict[str, Any],
-    batch: PackedBatch,
-) -> dict[str, Any]:
+def _nested_from_packed_tensor(tensor, seq_lens):
+    if tensor is None:
+        return None
+    if tensor.dim() == 2 and tensor.size(0) == 1:
+        tensor = tensor.squeeze(0)
+    if tensor.dim() != 1:
+        raise ValueError(f"PackedBatch tensor must be 1-D, got {tuple(tensor.shape)}.")
+
+    pieces = []
+    offset = 0
+    for length_t in seq_lens:
+        length = int(length_t.item())
+        pieces.append(tensor.narrow(0, offset, length))
+        offset += length
+    if offset != tensor.numel():
+        raise ValueError(f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens.")
+    return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
+
+
+def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     ps = getattr(model, "ps", ParallelState())
-    cu_seqlens = batch.cu_seqlens
-    if cu_seqlens is None:
-        raise ValueError("Packed DS4 CP requires PackedBatch.cu_seqlens.")
+    seq_lens = batch.sizes().to(device=batch.input_ids.device)
+    packed = pack_nested_thd(
+        _nested_from_packed_tensor(batch.input_ids, seq_lens),
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        cp_group=ps.cp_group,
+        split_cp=False,
+        labels=_nested_from_packed_tensor(batch.labels, seq_lens),
+        loss_mask=_nested_from_packed_tensor(batch.loss_mask, seq_lens),
+    )
+    kwargs: dict[str, Any] = {
+        "input_ids": packed.input_ids,
+        "labels": packed.labels,
+        "loss_mask": packed.loss_mask,
+        "position_ids": packed.position_ids,
+        "packed_seq_params": packed.packed_seq_params,
+        "enable_mtp": False,
+    }
+    for key in ("attention_mask", "temperature", "calculate_entropy"):
+        value = _batch_value(batch, key, _MISSING)
+        if value is not _MISSING:
+            kwargs[key] = value
+    prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
+    kwargs.pop("packed_seq_params", None)
+    return {key: value for key, value in kwargs.items() if key in _MODEL_FORWARD_KEYS}
 
-    if kwargs.get("position_ids") is None:
-        total_tokens = int(cu_seqlens[-1].item())
-        kwargs["position_ids"] = torch.arange(
-            total_tokens,
-            device=kwargs["input_ids"].device,
-        ).unsqueeze(0)
 
-    for key in ("input_ids", "labels", "loss_mask", "position_ids"):
-        if kwargs.get(key) is not None:
-            kwargs[key] = split_packed_contiguous_for_cp(
-                kwargs[key],
-                cu_seqlens,
-                cp_rank=ps.cp_rank,
-                cp_size=ps.cp_size,
-                name=key,
-            )
-    kwargs["enable_mtp"] = False
-    return {key: value for key, value in kwargs.items() if key in _PACKED_MODEL_KWARGS}
-
-
-def _base_model_forward_kwargs(batch: Batch) -> dict[str, Any]:
+def _base_model_forward_kwargs(batch):
     input_ids = _batch_value(batch, "input_ids", _MISSING)
     if input_ids is _MISSING:
         raise KeyError("DeepSeek V4 forward batch requires input_ids.")
@@ -177,22 +193,20 @@ def _base_model_forward_kwargs(batch: Batch) -> dict[str, Any]:
                 value = _as_batch_row(value)
             kwargs[key] = value
     position_ids = _batch_value(batch, "position_ids")
-    if isinstance(batch, PackedBatch) and position_ids is None:
-        position_ids = batch.make_position_ids()
     position_ids = _normalize_ds4_position_ids(position_ids)
     if position_ids is not None:
         kwargs["position_ids"] = position_ids
     return kwargs
 
 
-def _prepare_contiguous_cp_kwargs(model: nn.Module, kwargs: dict[str, Any]) -> dict[str, Any]:
+def _prepare_zigzag_cp_kwargs(model, kwargs):
     ps = getattr(model, "ps", ParallelState())
     local_seq_len = _infer_cp_local_seq_len(
         input_ids=kwargs["input_ids"],
         position_ids=kwargs.get("position_ids"),
         cp_size=ps.cp_size,
     )
-    kwargs["input_ids"] = local_contiguous_sequence_tensor_for_cp(
+    kwargs["input_ids"] = local_sequence_tensor_for_cp(
         kwargs["input_ids"],
         local_seq_len=local_seq_len,
         cp_rank=ps.cp_rank,
@@ -201,24 +215,24 @@ def _prepare_contiguous_cp_kwargs(model: nn.Module, kwargs: dict[str, Any]) -> d
     )
     if kwargs.get("position_ids") is None:
         full_seq_len = local_seq_len * ps.cp_size
-        position_ids = contiguous_position_ids_for_cp(
+        position_ids = zigzag_position_ids_for_cp(
             full_seq_len,
             cp_rank=ps.cp_rank,
             cp_size=ps.cp_size,
             device=kwargs["input_ids"].device,
         ).expand(kwargs["input_ids"].size(0), -1)
     else:
-        position_ids = local_contiguous_sequence_tensor_for_cp(
+        position_ids = local_position_ids_for_cp(
             kwargs["position_ids"],
+            batch=kwargs["input_ids"].size(0),
             local_seq_len=kwargs["input_ids"].size(1),
             cp_rank=ps.cp_rank,
             cp_size=ps.cp_size,
-            name="position_ids",
         )
     kwargs["position_ids"] = position_ids
     for key in ("labels", "loss_mask"):
         if kwargs.get(key) is not None:
-            kwargs[key] = local_contiguous_sequence_tensor_for_cp(
+            kwargs[key] = local_sequence_tensor_for_cp(
                 kwargs[key],
                 local_seq_len=kwargs["input_ids"].size(1),
                 cp_rank=ps.cp_rank,
@@ -228,15 +242,14 @@ def _prepare_contiguous_cp_kwargs(model: nn.Module, kwargs: dict[str, Any]) -> d
     return kwargs
 
 
-def _prepare_model_forward_kwargs(model: nn.Module, batch: Batch) -> dict[str, Any]:
-    kwargs = _base_model_forward_kwargs(batch)
+def _prepare_model_forward_kwargs(model, batch):
     if isinstance(batch, PackedBatch):
-        kwargs["enable_mtp"] = False
-        return _prepare_packed_contiguous_cp_kwargs(model, kwargs, batch)
-    return _prepare_contiguous_cp_kwargs(model, kwargs)
+        return _prepare_packed_batch_kwargs(model, batch)
+    kwargs = _base_model_forward_kwargs(batch)
+    return _prepare_zigzag_cp_kwargs(model, kwargs)
 
 
-def _forward_step(model: nn.Module, batch: Batch) -> dict:
+def _forward_step(model, batch) -> dict:
     return model(**_prepare_model_forward_kwargs(model, batch))
 
 

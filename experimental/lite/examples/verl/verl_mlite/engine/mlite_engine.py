@@ -22,6 +22,7 @@ from megatron.lite.primitive.parallel import pack_nested_thd, unpack_packed_thd_
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+from megatron.lite.runtime.contracts import PackedBatch
 from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 from verl_mlite.compat import load_verl_engine_api
@@ -713,19 +714,7 @@ class MegatronLiteEngine(BaseEngine):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = self._make_model_inputs(micro_batch)
             runtime_batches.append(
-                {
-                    "input_ids": model_inputs["input_ids"],
-                    "position_ids": model_inputs["position_ids"],
-                    "packed_seq_params": model_inputs["packed_seq_params"],
-                    "labels": model_inputs["labels"],
-                    "loss_mask": model_inputs.get("loss_mask"),
-                    "loss_scale": loss_scale,
-                    "temperature": model_inputs["temperature"],
-                    "use_fused_kernels": model_inputs["use_fused_kernels"],
-                    "calculate_entropy": model_inputs["calculate_entropy"],
-                    "_verl_micro_batch": micro_batch,
-                    "_verl_inputs": model_inputs,
-                }
+                self._make_runtime_batch(micro_batch, model_inputs, loss_scale=loss_scale)
             )
 
         runtime_loss_fn = None
@@ -789,6 +778,44 @@ class MegatronLiteEngine(BaseEngine):
             ),
         }
 
+    def _make_runtime_batch(
+        self,
+        micro_batch: TensorDict,
+        model_inputs: dict[str, Any],
+        *,
+        loss_scale: float,
+    ) -> PackedBatch:
+        input_ids = micro_batch["input_ids"]
+        seq_lens = input_ids.offsets().diff().to(dtype=torch.int64)
+        loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
+        return PackedBatch(
+            input_ids=input_ids.values().contiguous(),
+            labels=self._roll_nested_values_left(input_ids),
+            loss_mask=(
+                None if loss_mask is None else self._roll_nested_values_left(loss_mask).float()
+            ),
+            seq_lens=seq_lens,
+            extras={
+                "temperature": model_inputs["temperature"],
+                "use_fused_kernels": model_inputs["use_fused_kernels"],
+                "calculate_entropy": model_inputs["calculate_entropy"],
+                "loss_scale": loss_scale,
+                "_verl_micro_batch": micro_batch,
+                "_verl_inputs": model_inputs,
+            },
+        )
+
+    @staticmethod
+    def _roll_nested_values_left(nested: torch.Tensor) -> torch.Tensor:
+        offsets = nested.offsets()
+        values = nested.values()
+        rolled = torch.zeros_like(values)
+        for start_t, end_t in zip(offsets[:-1], offsets[1:], strict=True):
+            start, end = int(start_t.item()), int(end_t.item())
+            if end - start > 1:
+                rolled[start : end - 1] = values[start + 1 : end]
+        return rolled
+
     @staticmethod
     def _loss_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
@@ -833,9 +860,9 @@ class MegatronLiteEngine(BaseEngine):
         return output
 
     def _make_runtime_loss_fn(self, loss_function, *, forward_only: bool):
-        def _loss_fn(raw_output: dict[str, torch.Tensor], runtime_batch: dict[str, Any]):
-            micro_batch = runtime_batch["_verl_micro_batch"]
-            inputs = runtime_batch["_verl_inputs"]
+        def _loss_fn(raw_output: dict[str, torch.Tensor], runtime_batch: PackedBatch):
+            micro_batch = runtime_batch.extras["_verl_micro_batch"]
+            inputs = runtime_batch.extras["_verl_inputs"]
             model_output = self._build_verl_model_output(
                 raw_output=raw_output, micro_batch=micro_batch, inputs=inputs
             )

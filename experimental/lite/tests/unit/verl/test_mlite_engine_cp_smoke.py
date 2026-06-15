@@ -104,6 +104,48 @@ def _write_glm5_config(path) -> None:
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def _write_deepseek_v4_config(path) -> None:
+    config = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "vocab_size": 128,
+        "max_position_embeddings": 128,
+        "initializer_range": 0.02,
+        "q_lora_rank": 64,
+        "qk_rope_head_dim": 16,
+        "o_lora_rank": 64,
+        "o_groups": 4,
+        "index_head_dim": 16,
+        "index_n_heads": 4,
+        "index_topk": 4,
+        "moe_intermediate_size": 32,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "num_hash_layers": 1,
+        "num_nextn_predict_layers": 0,
+        "compress_ratios": [4, 4],
+        "compress_rope_theta": 160000.0,
+        "hc_mult": 2,
+        "hc_eps": 1e-6,
+        "hc_sinkhorn_iters": 4,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "sliding_window": 128,
+        "swiglu_limit": 10.0,
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 1.0,
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 def _optimizer_config() -> SimpleNamespace:
     return SimpleNamespace(
         optimizer="adam",
@@ -132,9 +174,10 @@ def _optimizer_config() -> SimpleNamespace:
     [
         ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [5, 7, 9]),
         ("glm5", "glm_moe_dsa", _write_glm5_config, 32, [16, 20, 24]),
+        ("deepseek_v4", "deepseek_v4", _write_deepseek_v4_config, 128, [16, 20, 24]),
     ],
 )
-def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(
+def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     tmp_path, model_name, model_type, write_config, vocab_size, lengths
 ):
     torch = pytest.importorskip("torch")
@@ -145,6 +188,7 @@ def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(
     apply_runtime_patches()
     from verl_mlite.engine.config import MegatronLiteEngineConfig
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+    from megatron.lite.runtime.contracts import PackedBatch
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
@@ -201,16 +245,13 @@ def test_mlite_engine_runtime_thd_cp_uses_plain_verl_packed_seq_params(
         model_inputs["packed_batch"].cu_seqlens_padded[-1].item()
     )
 
-    runtime_batch = {
-        "input_ids": model_inputs["input_ids"],
-        "position_ids": model_inputs["position_ids"],
-        "packed_seq_params": model_inputs["packed_seq_params"],
-        "labels": model_inputs["labels"],
-        "loss_mask": model_inputs["loss_mask"],
-        "temperature": model_inputs["temperature"],
-        "use_fused_kernels": model_inputs["use_fused_kernels"],
-        "calculate_entropy": model_inputs["calculate_entropy"],
-    }
+    runtime_batch = engine._make_runtime_batch(
+        micro_batch=micro_batch,
+        inputs=model_inputs,
+        loss_scale=1.0,
+    )
+    assert isinstance(runtime_batch, PackedBatch)
+    assert "packed_seq_params" not in runtime_batch.extras
 
     with engine.train_mode():
         result = engine.runtime.forward_backward(
