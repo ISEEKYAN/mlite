@@ -14,15 +14,13 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.primitive.modules.attention.cp import (
-    local_position_ids_for_cp,
-    local_sequence_tensor_for_cp,
-)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
     contiguous_slice_for_cp,
+    local_position_ids_for_cp,
+    local_sequence_tensor_for_cp,
 )
 from megatron.lite.primitive.parallel.thd import pack_nested_thd
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec

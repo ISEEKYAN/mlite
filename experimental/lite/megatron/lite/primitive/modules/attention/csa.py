@@ -11,6 +11,10 @@ from megatron.lite.primitive.modules.attention.cp import (
     iter_cp_sources,
 )
 from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.utils.rotary import (
+    _yarn_find_correction_range,
+    _yarn_linear_ramp_mask,
+)
 
 
 class GroupedLinear(nn.Module):
@@ -45,24 +49,6 @@ def build_rope_cos_sin(
     return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
 
-def _yarn_find_correction_dim(
-    num_rotations: float,
-    dim: int,
-    rotary_base: float,
-    max_position_embeddings: int,
-) -> float:
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-        2 * math.log(rotary_base)
-    )
-
-
-def _yarn_linear_ramp_mask(low: int, high: int, dim: int, *, device: torch.device) -> torch.Tensor:
-    if low == high:
-        high += 1
-    ramp = (torch.arange(dim, device=device, dtype=torch.float32) - low) / (high - low)
-    return torch.clamp(ramp, 0, 1)
-
-
 def build_yarn_rope_cos_sin(
     position_ids: torch.Tensor,
     rope_head_dim: int,
@@ -80,25 +66,14 @@ def build_yarn_rope_cos_sin(
         config.rotary_scaling_factor
         * rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
-    low = math.floor(
-        _yarn_find_correction_dim(
-            config.beta_fast,
-            dim,
-            rope_theta,
-            config.original_max_position_embeddings,
-        )
+    low, high = _yarn_find_correction_range(
+        config.beta_fast,
+        config.beta_slow,
+        dim,
+        rope_theta,
+        config.original_max_position_embeddings,
     )
-    high = math.ceil(
-        _yarn_find_correction_dim(
-            config.beta_slow,
-            dim,
-            rope_theta,
-            config.original_max_position_embeddings,
-        )
-    )
-    low = max(low, 0)
-    high = min(high, dim - 1)
-    inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2, device=device)
+    inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2, device)
     inv_freq = inv_freq_inter * (1 - inv_freq_mask) + inv_freq_extra * inv_freq_mask
     freqs = torch.einsum("bs,d->bsd", position_ids.to(torch.float32), inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)

@@ -5,60 +5,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed.nn.functional import all_gather
 
-from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
-
 
 def _all_gather_cp(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
     return list(all_gather(tensor.contiguous(), group=group))
-
-
-def local_position_ids_for_cp(position_ids, *, batch, local_seq_len, cp_rank, cp_size):
-    if position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-    if position_ids.dim() != 2:
-        raise ValueError("position_ids must have shape (S,) or (B, S).")
-    if position_ids.size(0) == 1 and batch > 1:
-        position_ids = position_ids.expand(batch, -1)
-    if position_ids.size(0) != batch:
-        raise ValueError(
-            f"position_ids batch={position_ids.size(0)} does not match input batch={batch}."
-        )
-    if cp_size <= 1 or position_ids.size(1) == local_seq_len:
-        return position_ids
-
-    full_seq_len = local_seq_len * cp_size
-    if position_ids.size(1) != full_seq_len:
-        raise ValueError(
-            "CP expects position_ids to be either CP-local or full-length; "
-            f"got {position_ids.size(1)} for local_seq_len={local_seq_len}, cp={cp_size}."
-        )
-    return contiguous_slice_for_cp(position_ids, cp_rank, cp_size, seq_dim=1)
-
-
-def local_sequence_tensor_for_cp(
-    tensor,
-    *,
-    local_seq_len,
-    cp_rank,
-    cp_size,
-    seq_dim=1,
-    name: str = "tensor",
-    unsqueeze_1d: bool = True,
-):
-    if tensor is None or cp_size <= 1:
-        return tensor
-    if unsqueeze_1d and tensor.dim() == 1:
-        tensor = tensor.unsqueeze(0)
-    full_seq_len = local_seq_len * cp_size
-    seq_len = tensor.size(seq_dim)
-    if seq_len == local_seq_len:
-        return tensor
-    if seq_len != full_seq_len:
-        raise ValueError(
-            f"CP expects {name} to be either CP-local or full-length; "
-            f"got {seq_len} for local_seq_len={local_seq_len}, cp={cp_size}."
-        )
-    return contiguous_slice_for_cp(tensor, cp_rank, cp_size, seq_dim=seq_dim)
 
 
 def iter_cp_sources(tensor, position_ids, *, cp_rank, cp_size, cp_group):
