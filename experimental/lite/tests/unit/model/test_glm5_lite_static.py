@@ -130,12 +130,13 @@ def test_glm5_lite_does_not_import_wrappers_or_sibling_models():
 def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     model_text = (root / "model" / "glm5" / "lite" / "model.py").read_text()
-    primitive_text = (root / "primitive" / "attention" / "dsa.py").read_text()
+    primitive_text = (root / "primitive" / "modules" / "attention" / "dsa.py").read_text()
     kernel_text = (root / "primitive" / "kernels" / "dsa_kernels.py").read_text()
 
     assert "DynamicSparseAttention" in model_text
     assert (
-        "from megatron.lite.primitive.attention.mla import MultiLatentAttention" in primitive_text
+        "from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention"
+        in primitive_text
     )
     assert "class DynamicSparseAttention" in primitive_text
     assert "class MultiLatentAttention" not in primitive_text
@@ -177,8 +178,8 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
 def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import torch
 
-    from megatron.lite.primitive.attention import dsa
-    from megatron.lite.primitive.attention import DynamicSparseAttention, build_rope_cache
+    from megatron.lite.primitive.modules.attention import dsa
+    from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
 
     calls = {}
 
@@ -259,8 +260,8 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
 def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import torch
 
-    from megatron.lite.primitive.attention import dsa
-    from megatron.lite.primitive.attention import DynamicSparseAttention, build_rope_cache
+    from megatron.lite.primitive.modules.attention import dsa
+    from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
 
     calls = {}
 
@@ -642,7 +643,7 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
-    from megatron.lite.primitive.attention import dsa
+    from megatron.lite.primitive.modules.attention import dsa
 
     def fake_fused_indexer_sparse_attn(
         query,

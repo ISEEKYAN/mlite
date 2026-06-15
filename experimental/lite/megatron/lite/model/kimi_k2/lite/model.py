@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.kimi_k2.config import KimiK2Config
-from megatron.lite.primitive.attention import MultiLatentAttention
+from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler

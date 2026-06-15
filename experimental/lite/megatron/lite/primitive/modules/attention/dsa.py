@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import transformer_engine.pytorch as te
 
 from megatron.lite.primitive.parallel.cp import (
     zigzag_reconstruct_from_cp_parts,
@@ -24,7 +25,7 @@ from megatron.lite.primitive.parallel.thd import (
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 
 if TYPE_CHECKING:
-    from megatron.lite.primitive.attention.mla import MultiLatentAttention
+    from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
 
 
 def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
@@ -65,17 +66,7 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        y = x.float()
-        y = y * torch.rsqrt(y.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight.to(input_dtype) * y.to(input_dtype)
+RMSNorm = te.RMSNorm
 
 
 def _hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:
@@ -330,7 +321,7 @@ class DynamicSparseAttention(nn.Module):
 
     @staticmethod
     def dense_attention_cls() -> type[MultiLatentAttention]:
-        from megatron.lite.primitive.attention.mla import MultiLatentAttention
+        from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
 
         return MultiLatentAttention
 

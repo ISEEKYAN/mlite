@@ -194,7 +194,7 @@ def test_kimi_k2_mla_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch.distributed as dist
 
     device = _init_dist_or_skip()
-    from megatron.lite.primitive.attention import MultiLatentAttention
+    from megatron.lite.primitive.modules.attention import MultiLatentAttention
     from megatron.lite.primitive.parallel import ParallelState
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import init_parallel

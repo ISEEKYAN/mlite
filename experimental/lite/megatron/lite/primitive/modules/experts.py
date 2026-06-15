@@ -37,8 +37,18 @@ def _expert_nvtx_range(name: str):
         torch.cuda.nvtx.range_pop()
 
 
-def swiglu_with_probs(y: torch.Tensor, probs: torch.Tensor | None) -> torch.Tensor:
+def swiglu_with_probs(
+    y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0
+) -> torch.Tensor:
     """SwiGLU with optional expert probability scaling."""
+    if swiglu_limit > 0:
+        gate, up = y.chunk(2, dim=-1)
+        up = torch.clamp(up.float(), min=-swiglu_limit, max=swiglu_limit)
+        gate = torch.clamp(gate.float(), max=swiglu_limit)
+        out = torch.nn.functional.silu(gate) * up
+        if probs is not None:
+            out = out * probs
+        return out.to(dtype=y.dtype)
     if probs is not None:
         return weighted_bias_swiglu_impl(y, bias=None, weights=probs)
     return bias_swiglu_impl(y, bias=None)
@@ -74,6 +84,7 @@ class Experts(nn.Module):
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
+        self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
 
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
@@ -174,7 +185,7 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs)
+                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -183,7 +194,7 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = swiglu_with_probs(fc1_out, probs)
+                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)

@@ -133,13 +133,6 @@ def _batch_get(batch, key: str):
     return getattr(batch, key, None)
 
 
-def _batch_input_ids(batch):
-    input_ids = _batch_get(batch, "input_ids")
-    if input_ids is not None and input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    return input_ids
-
-
 def _apply_external_loss(
     out: dict, batch, loss_fn
 ) -> tuple[torch.Tensor, dict] | tuple[None, None]:
@@ -155,15 +148,15 @@ def _compact_pipeline_output(out: dict | None) -> dict:
     if not out:
         return {}
     compact: dict = {}
-    if "_verl_model_output" in out:
-        compact["model_output"] = out["_verl_model_output"]
+    if "model_output" in out:
+        compact["model_output"] = out["model_output"]
     if "loss" in out and out["loss"] is not None:
         loss = out["loss"]
         compact["loss"] = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
     if "_loss_fn_metrics" in out:
         compact["metrics"] = out["_loss_fn_metrics"]
-    elif "_verl_metrics" in out:
-        compact["metrics"] = out["_verl_metrics"]
+    elif "metrics" in out:
+        compact["metrics"] = out["metrics"]
     return compact
 
 
@@ -258,29 +251,12 @@ def _1f1b_schedule(
 
     def _run_forward(input_tensor, batch):
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-        position_ids = _batch_get(batch, "position_ids")
-        packed_seq_params = _batch_get(batch, "packed_seq_params")
-        if ps.pp_is_first:
-            return forward_step_fn(model, batch)
+        if not ps.pp_is_first:
+            model.set_input_tensor(input_tensor)
+        out = forward_step_fn(model, batch)
         if ps.pp_is_last:
-            out = model(
-                input_ids=_batch_input_ids(batch),
-                hidden_states=input_tensor,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-                labels=_batch_get(batch, "labels"),
-                loss_mask=_batch_get(batch, "loss_mask"),
-                temperature=_batch_get(batch, "temperature") or 1.0,
-                use_fused_kernels=bool(_batch_get(batch, "use_fused_kernels") or False),
-                calculate_entropy=bool(_batch_get(batch, "calculate_entropy") or False),
-            )
             _apply_external_loss(out, batch, loss_fn)
-            return out
-        return model(
-            hidden_states=input_tensor,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-        )
+        return out
 
     def _run_backward(inp_t, hid_t, loss_t, grad_t):
         if ps.pp_is_last:
@@ -524,27 +500,12 @@ def _run_pipeline_chunk_forward(
     loss_fn=None,
 ) -> dict:
     _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-    position_ids = _batch_get(batch, "position_ids")
-    packed_seq_params = _batch_get(batch, "packed_seq_params")
-    if is_first_stage:
-        return forward_step_fn(model, batch)
+    if not is_first_stage:
+        model.set_input_tensor(input_tensor)
+    out = forward_step_fn(model, batch)
     if is_last_stage:
-        out = model(
-            input_ids=_batch_input_ids(batch),
-            hidden_states=input_tensor,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            labels=_batch_get(batch, "labels"),
-            loss_mask=_batch_get(batch, "loss_mask"),
-            temperature=_batch_get(batch, "temperature") or 1.0,
-            use_fused_kernels=bool(_batch_get(batch, "use_fused_kernels") or False),
-            calculate_entropy=bool(_batch_get(batch, "calculate_entropy") or False),
-        )
         _apply_external_loss(out, batch, loss_fn)
-        return out
-    return model(
-        hidden_states=input_tensor, position_ids=position_ids, packed_seq_params=packed_seq_params
-    )
+    return out
 
 
 def _forward_only_pipeline_schedule(
