@@ -294,9 +294,9 @@ _TP1_ONLY = {"glm5", "deepseek_v4"}
 
 def _topology(model_name: str, backend: str) -> ParallelConfig:
     if backend == "fsdp2":
-        # fsdp2 shards over the full data-parallel mesh (pure DP); etp must be a
-        # concrete int because init_parallel computes expert_dp = world/(etp*ep*pp).
-        return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
+        # fsdp2 + pp2: FSDP2 shards over dp(=4) within each of 2 pipeline stages,
+        # so save/load is exercised with pipeline parallelism (not just pure DP).
+        return ParallelConfig(tp=1, ep=1, etp=1, pp=2, cp=1)
     # Diagnostic hook: MLITE_FORCE_TOPO="tp,ep,etp,pp,cp" overrides any model's
     # topology to isolate which parallel dim triggers a hang.
     forced = os.environ.get("MLITE_FORCE_TOPO")
@@ -389,26 +389,15 @@ def _random_packed_batch(vocab_size: int) -> PackedBatch:
 
 
 def _train_step(handle: ModelHandle, backend: str, cfg) -> None:
+    # Unified path for both backends: the runtime routes pp>1 through the
+    # pipeline schedule regardless of optimizer backend, so fsdp2 also exercises
+    # pipeline parallelism here (not just pure DP).
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    if backend == "dist_opt":
-        batch = _random_packed_batch(cfg.vocab_size)
-        runtime.zero_grad(handle)
-        runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
-        runtime.optimizer_step(handle)
-        runtime.zero_grad(handle)
-    else:
-        # fsdp2: pure-DP path, drive the model + optimizer directly.
-        model = handle._extras["model_chunks"][0]
-        model.train()
-        input_ids = torch.randint(0, cfg.vocab_size, (1, 2048), device="cuda")
-        handle._optimizer.zero_grad()
-        out = model(input_ids=input_ids)
-        logits = out["logits"] if isinstance(out, dict) else out
-        loss = logits.float().square().mean()
-        loss.backward()
-        success, grad_norm, _ = handle._optimizer.step()
-        assert success
-        assert torch.isfinite(torch.tensor(float(grad_norm)))
+    batch = _random_packed_batch(cfg.vocab_size)
+    runtime.zero_grad(handle)
+    runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
+    runtime.optimizer_step(handle)
+    runtime.zero_grad(handle)
 
 
 def _local_named_params(handle: ModelHandle) -> dict[str, torch.Tensor]:
