@@ -455,11 +455,24 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
     shards = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
     assert shards, f"no safetensors exported to {out_dir}"
     keys: set[str] = set()
+    # The shared exporter casts EVERY floating tensor to bf16 (``_cast_export_tensor``
+    # with export_dtype=bf16) and leaves integers untouched.  So every float weight
+    # — including the router correction bias — must be bf16, while integer auxiliary
+    # buffers (e.g. DS4 hash-routing ``tid2eid`` index tables; casting them would
+    # corrupt the indices) keep their native integral dtype.  Excluding such buffers
+    # from the export would be a de-scope; we keep them and check their dtype.
     for shard in shards:
         with safe_open(os.path.join(out_dir, shard), framework="pt") as fh:
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
-                assert tensor.dtype == torch.bfloat16, f"{key} exported as {tensor.dtype}, want bf16"
+                if tensor.dtype.is_floating_point:
+                    assert tensor.dtype == torch.bfloat16, (
+                        f"{key} exported as {tensor.dtype}, want bf16"
+                    )
+                else:
+                    assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
+                        f"{key} exported as unexpected non-float dtype {tensor.dtype}"
+                    )
                 assert torch.isfinite(tensor.float()).all(), f"{key} has non-finite values"
                 assert key.startswith("model.") or key in ("lm_head.weight",), (
                     f"unexpected non-HF export key: {key}"
