@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 from megatron.lite.primitive.utils.moe import (
     compute_routing_scores_for_aux_loss,
@@ -44,7 +43,7 @@ class RouterReplay:
     gate while the routing selection is held fixed.
     """
 
-    global_router_replay_instances: list["RouterReplay"] = []
+    global_router_replay_instances: list[RouterReplay] = []
 
     # ── global controls (one call fans out to every layer) ──
     @staticmethod

@@ -391,100 +391,111 @@ class MegatronLiteRuntime(RuntimeBase):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        router_replay: Any = None,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
+        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
 
-        if hasattr(data, "__next__"):
-            data_iter = data
-        elif hasattr(data, "__iter__"):
-            data_iter = iter(data)
-        else:
-            data_iter = iter([data])
+        replay_driver = RouterReplayDriver.maybe_create(handle, router_replay)
+        if replay_driver is not None:
+            replay_driver.begin()
+            forward_step = replay_driver.wrap(forward_step)
 
-        ps = handle._parallel_state
-        if ps.pp_size > 1:
-            from types import SimpleNamespace
-
-            from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
-
-            first_item = next(data_iter)
-            first_batch, _loss_context = split_loss_context(first_item)
-            data_iter = chain([first_item], data_iter)
-            tensor_shape = _infer_pipeline_tensor_shape(
-                first_batch, handle._extras.get("model_cfg"), ps
-            )
-            outputs = forward_backward_pipelining(
-                forward_step,
-                handle._extras.get("model_chunks", [handle._model]),
-                data_iter,
-                SimpleNamespace(num_microbatches=num_microbatches),
-                ps,
-                tensor_shape=tensor_shape,
-                pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=loss_fn,
-                forward_only=forward_only,
-            )
-            out = _last_loss_output(outputs)
-            loss_obj = out.get("loss") if out else None
-            if isinstance(loss_obj, torch.Tensor):
-                loss_float = float(loss_obj.detach().item())
-            elif loss_obj is not None:
-                loss_float = float(loss_obj)
+        try:
+            if hasattr(data, "__next__"):
+                data_iter = data
+            elif hasattr(data, "__iter__"):
+                data_iter = iter(data)
             else:
-                loss_float = 0.0
-            loss_t = torch.tensor([loss_float], device="cuda")
-            if ps.pp_group is not None and ps.pp_global_ranks is not None:
-                dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
-            out = {"loss": loss_t.squeeze(0)}
-        else:
-            out = run_microbatch_loop(
-                handle._model,
-                data_iter,
-                num_microbatches,
-                forward_step,
-                optimizer=handle._optimizer if not forward_only else None,
-                dist_opt=not forward_only,
-                pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=loss_fn,
-                forward_only=forward_only,
+                data_iter = iter([data])
+
+            ps = handle._parallel_state
+            if ps.pp_size > 1:
+                from types import SimpleNamespace
+
+                from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+
+                first_item = next(data_iter)
+                first_batch, _loss_context = split_loss_context(first_item)
+                data_iter = chain([first_item], data_iter)
+                tensor_shape = _infer_pipeline_tensor_shape(
+                    first_batch, handle._extras.get("model_cfg"), ps
+                )
+                outputs = forward_backward_pipelining(
+                    forward_step,
+                    handle._extras.get("model_chunks", [handle._model]),
+                    data_iter,
+                    SimpleNamespace(num_microbatches=num_microbatches),
+                    ps,
+                    tensor_shape=tensor_shape,
+                    pre_forward_hook=handle._extras.get("pre_forward_hook"),
+                    loss_fn=loss_fn,
+                    forward_only=forward_only,
+                )
+                out = _last_loss_output(outputs)
+                loss_obj = out.get("loss") if out else None
+                if isinstance(loss_obj, torch.Tensor):
+                    loss_float = float(loss_obj.detach().item())
+                elif loss_obj is not None:
+                    loss_float = float(loss_obj)
+                else:
+                    loss_float = 0.0
+                loss_t = torch.tensor([loss_float], device="cuda")
+                if ps.pp_group is not None and ps.pp_global_ranks is not None:
+                    dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
+                out = {"loss": loss_t.squeeze(0)}
+            else:
+                out = run_microbatch_loop(
+                    handle._model,
+                    data_iter,
+                    num_microbatches,
+                    forward_step,
+                    optimizer=handle._optimizer if not forward_only else None,
+                    dist_opt=not forward_only,
+                    pre_forward_hook=handle._extras.get("pre_forward_hook"),
+                    loss_fn=loss_fn,
+                    forward_only=forward_only,
+                )
+
+            if not forward_only:
+                finalize_grads = handle._extras.get("finalize_grads")
+                if finalize_grads is not None:
+                    finalize_grads()
+
+            loss_tensor = out.get("loss") if out else None
+            loss_val = (
+                loss_tensor.item()
+                if isinstance(loss_tensor, torch.Tensor)
+                else float(loss_tensor or 0.0)
             )
-
-        if not forward_only:
-            finalize_grads = handle._extras.get("finalize_grads")
-            if finalize_grads is not None:
-                finalize_grads()
-
-        loss_tensor = out.get("loss") if out else None
-        loss_val = (
-            loss_tensor.item()
-            if isinstance(loss_tensor, torch.Tensor)
-            else float(loss_tensor or 0.0)
-        )
-        metrics: dict = {"loss": loss_val}
-        for m in out.get("_loss_fn_metrics", []) if out else []:
-            for k, v in m.items():
-                if k not in metrics:
-                    metrics[k] = v
-        if ps.pp_size > 1:
-            for item in outputs:
-                for k, v in item.get("metrics", {}).items():
+            metrics: dict = {"loss": loss_val}
+            for m in out.get("_loss_fn_metrics", []) if out else []:
+                for k, v in m.items():
                     if k not in metrics:
                         metrics[k] = v
-            metrics["_micro_outputs"] = outputs
+            if ps.pp_size > 1:
+                for item in outputs:
+                    for k, v in item.get("metrics", {}).items():
+                        if k not in metrics:
+                            metrics[k] = v
+                metrics["_micro_outputs"] = outputs
 
-        return ForwardResult(
-            model_output=ModelOutputs(
-                loss=loss_tensor,
-                vocab_parallel_logits=out.get("logits") if out else None,
-                log_probs=out.get("log_probs") if out else None,
-                routed_experts=out.get("routed_experts") if out else None,
-            ),
-            metrics=metrics,
-        )
+            return ForwardResult(
+                model_output=ModelOutputs(
+                    loss=loss_tensor,
+                    vocab_parallel_logits=out.get("logits") if out else None,
+                    log_probs=out.get("log_probs") if out else None,
+                    routed_experts=out.get("routed_experts") if out else None,
+                ),
+                metrics=metrics,
+            )
+        finally:
+            if replay_driver is not None:
+                replay_driver.end()
 
     def is_mp_src_rank_with_outputs(self, handle: ModelHandle) -> bool:
         ps = handle._parallel_state
