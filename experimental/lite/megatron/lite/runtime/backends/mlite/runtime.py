@@ -87,13 +87,25 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
         raise ValueError("Pipeline tensor shape requires non-empty sequence.")
 
     tp_size = int(getattr(ps, "tp_size", 1) or 1)
-    if tp_size > 1:
+    cp_size = int(getattr(ps, "cp_size", 1) or 1)
+    # The model scatters THD activations into Megatron sequence-parallel + context-parallel form
+    # before the first layer, so PP-communicated hidden states carry padded_S / (CP * TP) per rank.
+    # The raw input_ids length is UNPADDED and not CP-divided; sizing the P2P buffer from it makes the
+    # receiver wait for CP*TP-too-many elements -> NCCL recv hang. Replicate thd.pack_nested_thd padding
+    # (each sequence padded to align = tp * (2*cp if cp>1 else 1)) then divide by CP*TP.
+    seq_lens = getattr(batch, "seq_lens", None)
+    if seq_lens is not None and cp_size * tp_size > 1:
+        sl = seq_lens if isinstance(seq_lens, torch.Tensor) else torch.as_tensor(seq_lens)
+        sl = sl.to(torch.int64).reshape(-1)
+        align = tp_size * (2 * cp_size if cp_size > 1 else 1)
+        padded = sl + (align - sl % align) % align
+        total_padded = int(padded.sum().item())
+        local_seq_len = total_padded // (cp_size * tp_size)
+    elif tp_size > 1:
         if local_seq_len % tp_size != 0:
             raise ValueError(
                 f"Pipeline tensor sequence length {local_seq_len} is not divisible by TP={tp_size}."
             )
-        # Megatron Lite Qwen3.5 scatters embeddings into Megatron sequence-parallel form
-        # before the first layer, so PP activations carry S / (CP * TP).
         local_seq_len //= tp_size
 
     return (local_seq_len, batch_size, int(model_cfg.hidden_size))
@@ -433,6 +445,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist_opt=not forward_only,
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=loss_fn,
+                forward_only=forward_only,
             )
 
         if not forward_only:

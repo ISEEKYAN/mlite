@@ -21,6 +21,7 @@ def run_microbatch_loop(
     dist_opt: bool = False,
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
+    forward_only: bool = False,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -40,6 +41,10 @@ def run_microbatch_loop(
             ``loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)``.
             When provided, ``forward_fn`` output is passed to ``loss_fn`` instead of
             reading ``out["loss"]`` directly. This enables RLHF policy/value losses.
+        forward_only: When True, run forward without backward (e.g. validation /
+            ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
+            loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
+            pipeline path, which already threads ``forward_only`` to skip backward.
     """
     last_out = None
     all_metrics: list[dict] = []
@@ -57,10 +62,11 @@ def run_microbatch_loop(
                 loss, metrics = loss_fn(out, batch)
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
-            (loss / num_microbatches).backward()
+            if not forward_only:
+                (loss / num_microbatches).backward()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
-        else:
+        elif not forward_only:
             (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:

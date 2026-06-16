@@ -35,9 +35,13 @@ def PLACEMENT_FN(param_name: str) -> list:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "qkv" in param_name and "layer_norm" not in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
-    if ("proj" in param_name or "o_proj" in param_name) and (
-        "full_attn" in param_name or "linear_attn" in param_name
+    if (
+        ("proj" in param_name or "o_proj" in param_name)
+        and ("full_attn" in param_name or "linear_attn" in param_name)
+        and "layer_norm" not in param_name
     ):
+        # Row-parallel output proj weight: TP-shard on dim 1. Exclude layer_norm_weight (1-D, replicated
+        # under TP) which otherwise matches here ("in_proj" contains "proj") and gets an invalid Shard(1).
         return [Replicate(), Replicate(), Replicate(), Shard(1)]
     if "gate_up" in param_name and "shared" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
