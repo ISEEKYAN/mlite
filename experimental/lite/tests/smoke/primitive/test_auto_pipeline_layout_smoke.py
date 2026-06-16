@@ -1,22 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Auto pipeline-layout smoke: non-divisible layer counts run end-to-end on PP>1.
 
-The claim under test: when ``num_hidden_layers`` is *not* divisible
-by the pipeline width, ``build_pipeline_chunk_layout`` auto-balances the layers
-across PP stages (Megatron-style uneven split, accounting for embedding / head /
-MTP overhead) instead of raising "not divisible" — so no hand-tuning of TP/PP is
-required.
+The claim under test: when ``num_hidden_layers`` is *not* divisible by the
+pipeline width, ``build_pipeline_chunk_layout`` auto-balances the layers across PP
+stages — by wiring to Megatron's embedding/loss pipeline-split accounting — instead
+of raising "not divisible", so no hand-tuning of TP/PP is required.
 
-Matrix: {qwen3_5, qwen3_moe, kimi_k2, glm5, deepseek_v4}, each built with an
-odd ``num_hidden_layers`` (3) on a pp=2 topology so the split is necessarily
-uneven ([2, 1]). DeepSeek-V4 additionally carries an MTP layer on the last
-stage, exercising the MTP-aware balancing.
+Matrix: {qwen3_5, qwen3_moe, kimi_k2, glm5, deepseek_v4}, each built with
+``num_hidden_layers=6`` on a pp=4 topology. 6 is not divisible by 4; Megatron's
+embedding/loss accounting balances it to a [1, 2, 2, 1] decoder split (the
+embedding pulls one layer off the first stage, the loss/head off the last).
+DeepSeek-V4 additionally carries an MTP head on the last stage.
 
-PP is the variable under test and is fixed at 2 for every model; the remaining
-dims match the save/load/export smoke's proven dist_opt topology so an orthogonal
-limitation cannot mask the layout result:
-  * tp2/pp2/cp1/ep2 for the TP-capable models (qwen3_5, qwen3_moe, kimi_k2);
-  * tp1/pp2/cp1/ep2 for glm5 / deepseek_v4 (native lite is TP=1 only).
+PP is the variable under test and is fixed at 4 for every model (pp=2 cannot show
+a non-divisible accounting split — an odd count is unrepresentable there). The
+remaining dims follow the save/load/export smoke's validated dist_opt capability:
+  * tp2/cp1/ep2 for the TP-capable models (qwen3_5, qwen3_moe, kimi_k2);
+  * tp1/cp1/ep2 for glm5 / deepseek_v4 (native lite is TP=1 only).
 CP is held at 1: cp>1 with these tiny proxy sequences makes Transformer Engine
 report "no dot product attention backend available" (and risks the known
 fused-DSA CP+tiny-seq hang) — both orthogonal to pipeline layout. CP fidelity
@@ -38,16 +38,17 @@ import torch.distributed as dist
 
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.deterministic import set_deterministic
-from megatron.lite.primitive.parallel.pp import auto_pipeline_layer_counts
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
-# pp=2 with an odd layer count forces an uneven split; small enough to stay fast.
-_NUM_LAYERS = 3
-_PP = 2
+# 6 layers over pp=4 is not divisible; Megatron's embedding/loss accounting
+# balances it to a [1, 2, 2, 1] decoder split. Small enough to stay fast.
+_NUM_LAYERS = 6
+_PP = 4
+_EXPECTED_SPLIT = [[0], [1, 2], [3, 4], [5]]
 
 # GLM5 / DeepSeek-V4 native lite support TP=1 only (matches the save/load smoke).
 _TP1_ONLY = {"glm5", "deepseek_v4"}
@@ -108,7 +109,7 @@ def _qwen3_5():
         linear_num_value_heads=2,
         linear_value_head_dim=4,
         linear_conv_kernel_dim=4,
-        layer_types=["full_attention", "linear_attention", "full_attention"],
+        layer_types=["full_attention", "linear_attention"] * (_NUM_LAYERS // 2),
         partial_rotary_factor=1.0,
         max_position_embeddings=4096,
     )
@@ -131,7 +132,7 @@ def _qwen3_moe():
         num_experts_per_tok=1,
         moe_intermediate_size=8,
         max_position_embeddings=4096,
-        layer_types=["full_attention", "full_attention", "full_attention"],
+        layer_types=["full_attention"] * _NUM_LAYERS,
     )
     return cfg, protocol
 
@@ -303,8 +304,8 @@ def _reset_parallel_state_between_tests():
 
 
 def _proxy_topology(model_name: str) -> ParallelConfig:
-    # PP is held at 2 (the layout axis under test); the rest match the save/load
-    # smoke's proven dist_opt topology. CP=1 — see module docstring.
+    # PP is held at 4 (the layout axis under test); the rest follow the save/load
+    # smoke's validated dist_opt capability. CP=1 — see module docstring.
     if model_name in _TP1_ONLY:  # glm5 / deepseek_v4: native lite is TP=1 only.
         return ParallelConfig(tp=1, ep=2, etp=1, pp=_PP, cp=1)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=_PP, cp=1)
@@ -364,22 +365,14 @@ def test_non_divisible_layers_auto_balance_and_train(model_name):
     handle, cfg = _build_handle(model_name, seed=4242)
     ps = handle._parallel_state
     assert ps.pp_size == _PP
+    assert cfg.num_hidden_layers == _NUM_LAYERS
 
-    # The non-divisible count must produce the balanced uneven split, not raise.
-    expected_counts = auto_pipeline_layer_counts(
-        cfg.num_hidden_layers,
-        ps.pp_size,
-        extra_first=1,
-        extra_last=1 + (getattr(cfg, "num_nextn_predict_layers", 0) or 0),
-    )
+    # The non-divisible count must produce Megatron's balanced uneven split, not raise.
     local = _local_layer_indices(handle)
-    start = sum(expected_counts[: ps.pp_rank])
-    assert local == list(range(start, start + expected_counts[ps.pp_rank])), (
+    assert local == _EXPECTED_SPLIT[ps.pp_rank], (
         f"{model_name} rank{ps.pp_rank}: layer_indices {local} "
-        f"!= expected balanced split {expected_counts}"
+        f"!= expected balanced split {_EXPECTED_SPLIT}"
     )
-    assert sum(expected_counts) == cfg.num_hidden_layers
-    assert max(expected_counts) - min(expected_counts) <= 1  # balanced
 
     # End-to-end: one real train step over the uneven pipeline must produce a
     # finite loss (proves PP P2P across stages of unequal depth actually runs).
