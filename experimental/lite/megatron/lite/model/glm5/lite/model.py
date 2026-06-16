@@ -243,7 +243,6 @@ class Glm5MoE(nn.Module):
                 config.hidden_size,
                 ps,
                 use_deepep=use_deepep,
-                fuse_score_alltoall=True,
             )
         self.experts = Glm5RoutedExperts(
             config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, ps
