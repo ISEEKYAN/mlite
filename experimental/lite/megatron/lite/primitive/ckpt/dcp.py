@@ -74,12 +74,17 @@ def save_training_checkpoint(
         raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     dense_mesh, expert_mesh = _build_meshes(config)
     state_dict: dict = {"step": step}
+    # Pipeline stages own DIFFERENT parameters but their local layers re-index
+    # to 0..N, so without a per-stage prefix the DCP FQNs collide across pp ranks
+    # (stage0 layer0 and stage1 layer1 both -> "model.0.layers.0..."), corrupting
+    # the round-trip. Mirror distckpt's pp-aware keying: disjoint keyspace per stage.
+    model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if save_model:
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -133,18 +138,23 @@ def load_training_checkpoint(
     dense_mesh, expert_mesh = _build_meshes(config)
 
     state_dict: dict = {"step": 0}
+    # Same pp-aware keying as save (see save_training_checkpoint): per-stage
+    # disjoint keyspace so pp ranks don't read each other's colliding FQNs.
+    model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if load_model:
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = _empty_dcp_tensor_like_param(param, mesh, placements)
+            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
+                param, mesh, placements
+            )
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
         for name, param in model.named_parameters():
-            key = f"model.{name}"
+            key = f"{model_prefix}.{name}"
             if key in state_dict:
                 t = state_dict[key]
                 with torch.no_grad():

@@ -108,7 +108,12 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
             )
         local_seq_len //= tp_size
 
-    return (local_seq_len, batch_size, int(model_cfg.hidden_size))
+    # Models with multi-head hyper-connections (e.g. DeepSeek V4) carry hc_mult
+    # parallel residual streams across pipeline stages. The inter-stage tensor folds
+    # hc_mult into the hidden dim ([B, S, hc_mult * H]); size the P2P buffer to match.
+    # hc_mult defaults to 1, so this is a no-op for every other model.
+    hc_mult = int(getattr(model_cfg, "hc_mult", 1) or 1)
+    return (local_seq_len, batch_size, int(model_cfg.hidden_size) * hc_mult)
 
 
 def _last_loss_output(outputs: list[dict]) -> dict:

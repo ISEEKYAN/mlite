@@ -1,289 +1,170 @@
-"""Native GLM-5 model assembled from Megatron Lite primitives."""
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""GLM-5 (deepseek_v3_2) lite native model.
+
+This model is a near-verbatim clone of the Kimi-K2 (deepseek_v3) lite model
+(``megatron/lite/model/kimi_k2/lite/model.py``).  It inherits ALL of Kimi's
+Megatron plumbing unchanged: SBHD ``[S, B, H]`` layout, sequence-parallel
+scatter/gather, ``VocabParallelEmbedding`` / ``VocabParallelOutput``,
+``share_embeddings_and_output_weights``, ``set_input_tensor``,
+``build_pipeline_chunk_layout``-based pipeline boundaries, MTP, and the
+dist-opt / distckpt integration.
+
+The ONLY functional difference from Kimi is the attention module: where Kimi
+uses ``MultiLatentAttention`` (MLA), GLM-5 uses Dynamic Sparse Attention (DSA).
+The DSA primitive is hard-wired batch-first ``[B, S, H]`` and expects explicit
+``cos`` / ``sin`` / ``position_ids`` + ``packed_seq_params``, so it is wrapped
+by ``Glm5DSAAttention`` which transposes ``[S, B, H] -> [B, S, H]`` before DSA
+and back after, and builds the rotary embeddings / position ids locally.  The
+surrounding Kimi skeleton therefore stays byte-for-byte SBHD and untouched.
+
+NOTE: DSA is NOT tensor-parallel-capable, so GLM-5 is a documented TP=1 special
+case (the protocol gate raises for TP>1 / ETP>1).  VPP / PP / EP / CP work,
+inherited from Kimi.
+"""
 
 from __future__ import annotations
 
-import math
+import inspect
+import os
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.primitive.modules.attention import (
     DynamicSparseAttention,
-    RMSNorm,
     build_rotary_embeddings,
 )
-from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
+from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
+from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
+from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
+from megatron.lite.primitive.ops.sp_ops import ReduceScatterDim0
+from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
+from megatron.lite.primitive.parallel import (
+    ColumnParallelLinear,
+    ParallelState,
+    RowParallelLinear,
+    VanillaColumnParallelLinear,
+    VocabParallelEmbedding,
+    VocabParallelOutput,
+    build_pipeline_chunk_layout,
+    gather_from_sequence_parallel,
+    roll_packed_thd_left,
+    scatter_to_sequence_parallel,
+)
+from megatron.lite.primitive.utils import build_fp8_recipe
+from megatron.lite.primitive.utils.moe import (
+    compute_routing_scores_for_aux_loss,
+    router_gating_linear,
+    switch_load_balancing_loss_func,
+    topk_routing_with_score_function,
+)
+
+# -- GLM-5 ONLY: SP-grad parameter suffixes for the DSA attention (Kimi's MLA
+# suffixes -- linear_q_down_proj / linear_kv_down_proj / *_up_proj.linear.* --
+# are replaced by the DSA module's parameter names).  These tag the
+# layernorm-fronted columns whose grads must be all-reduced across SP ranks.
+# (At GLM-5's enforced TP=1 this list is unused, but is kept structurally so
+# the model stays a faithful Kimi clone.)
+_SP_GRAD_SUFFIXES: tuple[str, ...] = (
+    ".input_layernorm.weight",
+    ".self_attention.q_a_proj.weight",
+    ".self_attention.q_a_layernorm.weight",
+    ".self_attention.kv_a_proj_with_mqa.weight",
+    ".self_attention.kv_a_layernorm.weight",
+    ".mlp_norm.weight",
+    ".mlp.gate_up.linear.layer_norm_weight",
+    ".moe.router.gate.weight",
+    ".norm.weight",
+)
 
 
-class Glm5MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
+    return [
+        param
+        for name, param in model.named_parameters()
+        if any(name.endswith(suffix) for suffix in _SP_GRAD_SUFFIXES) or name == "norm.weight"
+    ]
+
+
+def _swiglu(x: torch.Tensor) -> torch.Tensor:
+    if x.is_cuda:
+        return bias_swiglu_impl(x, None, False, False)
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    return F.silu(x1) * x2
+
+
+def _reduce_scatter_to_sequence_parallel(x: torch.Tensor, ps: ParallelState) -> torch.Tensor:
+    if ps.tp_size == 1:
+        return x
+    return ReduceScatterDim0.apply(x, ps.tp_size, ps.tp_rank, ps.tp_group)
+
+
+def _ordered_topk_from_routing_map(
+    probs_dense: torch.Tensor, routing_map: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    expert_ids = torch.arange(
+        probs_dense.size(-1), device=probs_dense.device, dtype=torch.long
+    ).expand_as(routing_map)
+    masked_ids = torch.where(
+        routing_map, expert_ids, torch.full_like(expert_ids, probs_dense.size(-1))
+    )
+    topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk]
+    topk_scores = torch.gather(probs_dense, dim=-1, index=topk_indices)
+    return topk_scores, topk_indices
+
+
+def _router_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    router_dtype: torch.dtype,
+) -> torch.Tensor:
+    if x.is_cuda:
+        return router_gating_linear(x, weight, bias, router_dtype)
+    return F.linear(
+        x.to(router_dtype),
+        weight.to(router_dtype),
+        None if bias is None else bias.to(router_dtype),
+    )
+
+
+def _topk_routing_supports_groups() -> bool:
+    params = inspect.signature(topk_routing_with_score_function).parameters
+    return "num_groups" in params and "group_topk" in params
+
+
+# -- GLM-5 ONLY: DSA attention wrapper.  Holds ``DynamicSparseAttention`` and
+# adapts it to Kimi's SBHD-in / SBHD-out attention contract.  Everything outside
+# this class (norms, residual, MoE, MTP, embed, head, SP scatter/gather) is
+# identical to Kimi.
+class Glm5DSAAttention(nn.Module):
+    """SBHD ``[S, B, H]`` shim around the batch-first DSA primitive.
+
+    Kimi's decoder layer calls ``self.self_attention(x_sbhd, packed_seq_params=)``
+    where ``x_sbhd`` is ``[S, B, H]``.  DSA is hard-wired ``[B, S, H]`` and needs
+    explicit ``cos`` / ``sin`` / ``position_ids``.  This wrapper:
+      1. transposes ``[S, B, H] -> [B, S, H]``,
+      2. builds ``position_ids`` (local sequence) and the rotary ``cos`` / ``sin``,
+      3. runs DSA,
+      4. transposes the ``[B, S, H]`` output back to ``[S, B, H]``.
+    The Kimi skeleton therefore never observes the batch-first interior.
+    """
+
+    def __init__(self, config: Glm5Config, ps: ParallelState):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class Glm5RoutedExperts(nn.Module):
-    def __init__(
-        self,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        ps: ParallelState | None = None,
-    ):
-        super().__init__()
-        ps = ps or ParallelState()
-        self.num_global_experts = num_experts
-        self.num_experts = ensure_divisible(num_experts, ps.ep_size)
-        self.local_start = ps.ep_rank * self.num_experts
-        self.intermediate_size = intermediate_size
-        self.hidden_size = hidden_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * intermediate_size, hidden_size)
-        )
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, hidden_size, intermediate_size))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.gate_up_proj, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.down_proj, a=math.sqrt(5))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
-        permuted_probs: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if hidden_states.size(0) == 0:
-            output = hidden_states.reshape(0, self.hidden_size)
-            if permuted_probs is not None:
-                output = output + permuted_probs.sum().to(output.dtype) * 0.0
-            return output
-
-        output = hidden_states.new_empty(hidden_states.size(0), self.hidden_size)
-        offset = 0
-        for expert_idx, count in enumerate(tokens_per_expert.tolist()):
-            if count == 0:
-                continue
-            end = offset + count
-            expert_input = hidden_states[offset:end]
-            gate_up = F.linear(expert_input, self.gate_up_proj[expert_idx])
-            gate_proj, up_proj = gate_up.chunk(2, dim=-1)
-            expert_hidden = F.silu(gate_proj) * up_proj
-            expert_out = F.linear(expert_hidden, self.down_proj[expert_idx])
-            if permuted_probs is not None:
-                expert_out = expert_out * permuted_probs[offset:end].unsqueeze(-1)
-            output[offset:end] = expert_out.to(hidden_states.dtype)
-            offset = end
-        return output
-
-    def forward_topk(
-        self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor
-    ) -> torch.Tensor:
-        num_topk = topk_indices.size(-1)
-        num_tokens = hidden_states.size(0)
-        hidden_dim = hidden_states.size(-1)
-
-        token_idx = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            .unsqueeze(1)
-            .expand(-1, num_topk)
-            .reshape(-1)
-        )
-        sample_weights = topk_weights.reshape(-1)
-        expert_ids = topk_indices.reshape(-1)
-        invalid_mask = expert_ids >= self.num_experts
-        expert_ids = expert_ids.clamp(0, self.num_experts - 1)
-        selected_hidden = hidden_states[token_idx]
-
-        selected_gate_up = self.gate_up_proj[expert_ids]
-        gate_up = torch.bmm(selected_gate_up, selected_hidden.unsqueeze(-1)).squeeze(-1)
-        gate_proj, up_proj = gate_up.chunk(2, dim=-1)
-        expert_hidden = F.silu(gate_proj) * up_proj
-
-        selected_down = self.down_proj[expert_ids]
-        expert_out = torch.bmm(selected_down, expert_hidden.unsqueeze(-1)).squeeze(-1)
-        weighted = expert_out * sample_weights.unsqueeze(-1)
-        weighted.masked_fill_(invalid_mask.unsqueeze(-1), 0.0)
-        return weighted.view(num_tokens, num_topk, hidden_dim).sum(dim=1).to(hidden_states.dtype)
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        for expert_idx in range(self.num_experts):
-            gate_proj = self.gate_up_proj[expert_idx, : self.intermediate_size]
-            up_proj = self.gate_up_proj[expert_idx, self.intermediate_size :]
-            down_proj = self.down_proj[expert_idx]
-            if not keep_vars:
-                gate_proj = gate_proj.detach()
-                up_proj = up_proj.detach()
-                down_proj = down_proj.detach()
-            expert_prefix = f"{prefix}{expert_idx}."
-            destination[expert_prefix + "gate_proj.weight"] = gate_proj
-            destination[expert_prefix + "up_proj.weight"] = up_proj
-            destination[expert_prefix + "down_proj.weight"] = down_proj
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-    ) -> None:
-        del local_metadata
-
-        def _copy(key: str, target: torch.Tensor) -> bool:
-            tensor = state_dict.get(key)
-            if tensor is None:
-                if strict:
-                    missing_keys.append(key)
-                return False
-            if tensor.shape != target.shape:
-                error_msgs.append(
-                    f"size mismatch for {key}: copying a param with shape {tuple(tensor.shape)} "
-                    f"from checkpoint, the shape in current model is {tuple(target.shape)}."
-                )
-                return False
-            with torch.no_grad():
-                target.copy_(tensor)
-            return True
-
-        gate_up_key = prefix + "gate_up_proj"
-        if gate_up_key in state_dict:
-            _copy(gate_up_key, self.gate_up_proj)
-        else:
-            for expert_idx in range(self.num_experts):
-                expert_prefix = f"{prefix}{expert_idx}."
-                _copy(
-                    expert_prefix + "gate_proj.weight",
-                    self.gate_up_proj[expert_idx, : self.intermediate_size],
-                )
-                _copy(
-                    expert_prefix + "up_proj.weight",
-                    self.gate_up_proj[expert_idx, self.intermediate_size :],
-                )
-        down_key = prefix + "down_proj"
-        if down_key in state_dict:
-            _copy(down_key, self.down_proj)
-        else:
-            for expert_idx in range(self.num_experts):
-                _copy(f"{prefix}{expert_idx}.down_proj.weight", self.down_proj[expert_idx])
-
-
-class Glm5Router(nn.Module):
-    def __init__(self, config: Glm5Config):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
-        self.register_buffer(
-            "e_score_correction_bias", torch.zeros(config.n_routed_experts, dtype=torch.float32)
-        )
-        self.topk = config.num_experts_per_tok
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.route_scale = config.routed_scaling_factor
-        self.norm_topk_prob = config.norm_topk_prob
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = F.linear(x.float(), self.weight.float()).sigmoid()
-        original_scores = scores
-        scores_for_choice = scores + self.e_score_correction_bias.to(scores.dtype)
-
-        if self.n_group > 1:
-            grouped = scores_for_choice.view(x.size(0), self.n_group, -1)
-            group_scores = grouped.topk(2, dim=-1, sorted=False).values.sum(dim=-1)
-            group_idx = group_scores.topk(self.topk_group, dim=-1, sorted=False).indices
-            group_mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
-                1, group_idx, True
-            )
-            scores_for_choice = scores_for_choice.masked_fill(
-                ~group_mask.unsqueeze(-1).expand_as(grouped).flatten(1), 0.0
-            )
-
-        indices = scores_for_choice.topk(self.topk, dim=-1, sorted=False).indices
-        weights = original_scores.gather(1, indices)
-        if self.norm_topk_prob and self.topk > 1:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        return weights * self.route_scale, indices
-
-
-def _build_glm5_pipeline_layers(num_hidden_layers: int, ps: ParallelState) -> list[int]:
-    if ps.pp_size > 2 and num_hidden_layers % ps.pp_size:
-        middle_layers = -(-num_hidden_layers // ps.pp_size)
-        edge_layers = num_hidden_layers - middle_layers * (ps.pp_size - 2)
-        first_layers = edge_layers // 2
-        last_layers = edge_layers - first_layers
-        counts = [first_layers, *([middle_layers] * (ps.pp_size - 2)), last_layers]
-        start = sum(counts[: ps.pp_rank])
-        return list(range(start, start + counts[ps.pp_rank]))
-
-    layers_per_stage = num_hidden_layers // ps.pp_size
-    remainder = num_hidden_layers % ps.pp_size
-    local_count = layers_per_stage + (1 if ps.pp_rank < remainder else 0)
-    start = ps.pp_rank * layers_per_stage + min(ps.pp_rank, remainder)
-    return list(range(start, start + local_count))
-
-
-class Glm5MoE(nn.Module):
-    def __init__(
-        self, config: Glm5Config, ps: ParallelState | None = None, *, use_deepep: bool = False
-    ):
-        super().__init__()
-        ps = ps or ParallelState()
-        self.hidden_size = config.hidden_size
-        self.gate = Glm5Router(config)
-        self.dispatcher = None
-        if ps.ep_size > 1:
-            from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-
-            self.dispatcher = TokenDispatcher(
-                config.n_routed_experts,
-                config.hidden_size,
-                ps,
-                use_deepep=use_deepep,
-                fuse_score_alltoall=True,
-            )
-        self.experts = Glm5RoutedExperts(
-            config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, ps
-        )
-        shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
-        self.shared_experts = (
-            Glm5MLP(config.hidden_size, shared_intermediate)
-            if config.n_shared_experts > 0
-            else None
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shape = x.shape
-        residual = x
-        x_flat = x.reshape(-1, self.hidden_size)
-        weights, indices = self.gate(x_flat)
-        if self.dispatcher is None:
-            y = self.experts.forward_topk(x_flat, indices, weights).view(shape)
-        else:
-            dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_flat, weights, indices)
-            self.dispatcher.wait_dispatch_event()
-            expert_out = self.experts(dispatched, tpe, permuted_probs)
-            y = self.dispatcher.combine(expert_out).view(shape)
-        if self.shared_experts is not None:
-            y = y + self.shared_experts(residual)
-        return y
-
-
-class Glm5Layer(nn.Module):
-    def __init__(
-        self,
-        config: Glm5Config,
-        layer_idx: int,
-        ps: ParallelState | None = None,
-        *,
-        use_deepep: bool = False,
-    ):
-        super().__init__()
-        ps = ps or ParallelState()
-        self.self_attn = DynamicSparseAttention(
+        self.ps = ps
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.rope_theta = config.rope_theta
+        self.self_attention = DynamicSparseAttention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             q_lora_rank=config.q_lora_rank,
@@ -308,106 +189,382 @@ class Glm5Layer(nn.Module):
             cp_rank=ps.cp_rank,
             cp_group=ps.cp_group,
         )
-        self.mlp = (
-            Glm5MoE(config, ps, use_deepep=use_deepep)
-            if config.is_moe_layer(layer_idx)
-            else Glm5MLP(config.hidden_size, config.intermediate_size)
-        )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        packed_seq_params=None,
-    ) -> torch.Tensor:
-        attn_out = self.self_attn(
-            self.input_layernorm(x),
+    def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
+        # Kimi feeds SBHD [S, B, H]; DSA needs batch-first [B, S, H].
+        x_bsh = x.transpose(0, 1).contiguous()
+        batch, seq_len, _ = x_bsh.shape
+        # Local (this-rank) position ids; DSA reconstructs the full sequence
+        # itself when CP > 1.
+        position_ids = (
+            torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(batch, -1)
+        )
+        cos, sin = build_rotary_embeddings(
+            position_ids=position_ids,
+            dim=self.qk_rope_head_dim,
+            rope_theta=self.rope_theta,
+            dtype=x_bsh.dtype,
+        )
+        out_bsh = self.self_attention(
+            x_bsh,
             cos=cos,
             sin=sin,
             position_ids=position_ids,
-            attention_mask=attention_mask,
+            attention_mask=None,
             packed_seq_params=packed_seq_params,
         )
-        x = x + attn_out
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        # Back to SBHD [S, B, H] for the Kimi skeleton.
+        return out_bsh.transpose(0, 1).contiguous()
 
 
-def _roll_mtp_sequence(
-    tensor: torch.Tensor, *, seq_dim: int = 1, packed_seq_params=None
-) -> torch.Tensor:
+class Glm5SigmoidTopKRouter(nn.Module):
+    """GLM-5 sigmoid router with group-limited routing and persistent expert bias.
+
+    Byte-identical to Kimi's ``KimiK2SigmoidTopKRouter`` except for the config
+    type and that GLM-5 has no ``aux_loss_alpha`` HF field -- the aux coefficient
+    therefore defaults to 0 (aux loss contributes 0).
+    """
+
+    def __init__(
+        self,
+        config: Glm5Config,
+        ps: ParallelState,
+        *,
+        router_bias_rate: float = 0.0,
+        compute_aux_loss: bool = True,
+        use_pre_softmax: bool = False,
+        moe_router_fusion: bool = False,
+    ):
+        super().__init__()
+        if router_bias_rate > 0:
+            raise NotImplementedError(
+                "GLM-5 expert-bias EMA update is not implemented in lite yet."
+            )
+        self.topk = config.num_experts_per_tok
+        self.num_experts = config.n_routed_experts
+        # GLM-5 has no aux_loss_alpha HF field; default the coefficient to 0.
+        self.aux_loss_coeff = getattr(config, "aux_loss_alpha", 0.0)
+        self.scaling_factor = config.routed_scaling_factor
+        self.num_groups = config.n_group if (config.n_group and config.n_group > 1) else None
+        self.group_topk = config.topk_group if self.num_groups is not None else None
+        self.router_bias_rate = router_bias_rate
+        self.compute_aux_loss = compute_aux_loss
+        self.use_pre_softmax = use_pre_softmax
+        self.moe_router_fusion = moe_router_fusion
+
+        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.register_buffer(
+            "expert_bias",
+            torch.zeros(config.n_routed_experts, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "local_tokens_per_expert",
+            torch.zeros(config.n_routed_experts, dtype=torch.float32),
+            persistent=False,
+        )
+        self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.expert_bias.data = self.expert_bias.data.float()
+        self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.float()
+        return self
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = _router_linear(x, self.gate.weight, None, torch.float32)
+        logits = logits.view(-1, self.num_experts)
+        num_tokens = logits.size(0)
+        routing_kwargs = {}
+        if self.num_groups is not None and self.group_topk is not None:
+            if not _topk_routing_supports_groups():
+                raise NotImplementedError(
+                    "topk_routing_with_score_function does not support group-limited routing."
+                )
+            routing_kwargs = dict(num_groups=self.num_groups, group_topk=self.group_topk)
+        probs_dense, routing_map = topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=self.use_pre_softmax,
+            score_function="sigmoid",
+            expert_bias=self.expert_bias.to(logits.dtype),
+            scaling_factor=(self.scaling_factor or None),
+            fused=self.moe_router_fusion,
+            **routing_kwargs,
+        )
+        if torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
+        topk_scores, topk_indices = _ordered_topk_from_routing_map(
+            probs_dense, routing_map, self.topk
+        )
+        topk_scores = topk_scores.to(logits.dtype)
+
+        if self.compute_aux_loss and self.training and torch.is_grad_enabled():
+            _, aux_scores = compute_routing_scores_for_aux_loss(
+                logits, self.topk, score_function="sigmoid", fused=self.moe_router_fusion
+            )
+            tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
+            total_num_tokens = num_tokens
+            if self._aux_loss_group is not None:
+                dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+            aux_loss = switch_load_balancing_loss_func(
+                aux_scores,
+                tokens_per_expert,
+                total_num_tokens,
+                self.topk,
+                self.num_experts,
+                self.aux_loss_coeff,
+                fused=False,
+            )
+            topk_scores = MoEAuxLossAutoScaler.apply(topk_scores, aux_loss)
+
+        return topk_scores, topk_indices
+
+
+class DenseMLP(nn.Module):
+    def __init__(self, config: Glm5Config, ps: ParallelState):
+        super().__init__()
+        self.gate_up = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size * 2,
+            ps,
+            bias=False,
+            normalization="RMSNorm",
+            eps=config.rms_norm_eps,
+        )
+        self.down = RowParallelLinear(config.intermediate_size, config.hidden_size, ps, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(_swiglu(self.gate_up(x)))
+
+
+class SharedExpert(nn.Module):
+    def __init__(self, config: Glm5Config, ps: ParallelState):
+        super().__init__()
+        self.ps = ps
+        # GLM-5 has no shared_expert_intermediate_size property; compute it from
+        # n_shared_experts * moe_intermediate_size (matches Kimi's property).
+        ffn = config.n_shared_experts * config.moe_intermediate_size
+        self.gate_up = _LocalLinear(config.hidden_size, ffn * 2 // ps.tp_size)
+        self.down = _LocalLinear(ffn // ps.tp_size, config.hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze_batch = x.dim() == 2
+        if squeeze_batch:
+            x = x.unsqueeze(1)
+        full_x = gather_from_sequence_parallel(x, self.ps)
+        partial_out = self.down(_swiglu(self.gate_up(full_x)))
+        out = _reduce_scatter_to_sequence_parallel(partial_out, self.ps)
+        return out.squeeze(1) if squeeze_batch else out
+
+
+class _LocalLinear(nn.Module):
+    """TE linear without built-in TP collectives; weight remains TP-local."""
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.linear = te.Linear(
+            in_features,
+            out_features,
+            bias=False,
+            params_dtype=torch.bfloat16,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+class MoELayer(nn.Module):
+    def __init__(
+        self,
+        config: Glm5Config,
+        ps: ParallelState,
+        *,
+        use_deepep: bool,
+        router_bias_rate: float,
+        fp8: bool,
+        moe_act_recompute: bool,
+    ):
+        super().__init__()
+        if fp8:
+            raise NotImplementedError("GLM-5 lite MoE fp8 training is not implemented yet.")
+        self.router = Glm5SigmoidTopKRouter(
+            config,
+            ps,
+            router_bias_rate=router_bias_rate,
+            compute_aux_loss=True,
+            use_pre_softmax=True,
+        )
+        self.experts = Experts(
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+        )
+        self.dispatcher = TokenDispatcher(
+            config.num_experts,
+            config.hidden_size,
+            ps,
+            use_deepep=use_deepep,
+        )
+        self.shared_expert = SharedExpert(config, ps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape
+
+        flat_x = x.view(-1, x.size(-1))
+        scores, indices = self.router(flat_x)
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(flat_x, scores, indices)
+        del scores, indices
+        self.dispatcher.wait_dispatch_event()
+        expert_out = self.experts(
+            dispatched,
+            tpe,
+            permuted_probs,
+            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+        )
+        routed_out = self.dispatcher.combine(expert_out)
+        shared_out = self.shared_expert(x)
+        output = routed_out.view(input_shape)
+        output += shared_out
+        return output.to(x.dtype)
+
+
+class Glm5Layer(nn.Module):
+    def __init__(
+        self,
+        config: Glm5Config,
+        ps: ParallelState,
+        layer_idx: int,
+        *,
+        use_deepep: bool = False,
+        router_bias_rate: float = 0.0,
+        fp8: bool = False,
+        moe_act_recompute: bool = False,
+        use_thd: bool = False,
+    ):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # GLM-5 ONLY: DSA attention (Kimi builds MultiLatentAttention here).
+        # The wrapper preserves the SBHD self_attention(x, packed_seq_params=)
+        # contract so this layer's forward stays identical to Kimi's.
+        del use_thd  # DSA derives its own THD handling from packed_seq_params.
+        self.self_attention = Glm5DSAAttention(config, ps)
+        if config.is_moe_layer(layer_idx):
+            self.mlp_norm: nn.Module | None = te.RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.moe: MoELayer | None = MoELayer(
+                config,
+                ps,
+                use_deepep=use_deepep,
+                router_bias_rate=router_bias_rate,
+                fp8=fp8,
+                moe_act_recompute=moe_act_recompute,
+            )
+            self.mlp: DenseMLP | None = None
+        else:
+            self.mlp_norm = None
+            self.moe = None
+            self.mlp = DenseMLP(config, ps)
+
+    def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
+        x = x + self.self_attention(self.input_layernorm(x), packed_seq_params=packed_seq_params)
+        if self.moe is not None:
+            assert self.mlp_norm is not None
+            mlp_input = self.mlp_norm(x)
+            return x + self.moe(mlp_input)
+        assert self.mlp is not None
+        return x + self.mlp(x)
+
+
+def _roll_mtp_left(
+    tensor: torch.Tensor,
+    *,
+    packed_seq_params=None,
+    dims: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if packed_seq_params is not None:
-        rolled, _ = roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=seq_dim)
-        return rolled
-    rolled = torch.roll(tensor, shifts=-1, dims=seq_dim)
-    index = [slice(None)] * rolled.dim()
-    index[seq_dim] = -1
-    rolled[tuple(index)] = 0
-    return rolled
+        return roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=dims)
+    dim = dims if dims >= 0 else tensor.dim() + dims
+    rolled = torch.roll(tensor, shifts=-1, dims=dim)
+    rolled.select(dim, -1).zero_()
+    return rolled, rolled.sum()
 
 
 class Glm5MTPLayer(nn.Module):
     def __init__(
         self,
         config: Glm5Config,
-        layer_idx: int,
         ps: ParallelState,
+        layer_idx: int,
         *,
-        embedding: nn.Embedding,
-        use_deepep: bool = False,
-        detach_encoder: bool = False,
+        embedding: VocabParallelEmbedding,
+        use_deepep: bool,
+        router_bias_rate: float,
+        fp8: bool,
+        moe_act_recompute: bool,
+        use_thd: bool,
+        detach_encoder: bool,
     ):
         super().__init__()
-        self.config = config
         self.ps = ps
         object.__setattr__(self, "embedding", embedding)
         self.detach_encoder = detach_encoder
-        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.transformer_layer = Glm5Layer(config, layer_idx, ps, use_deepep=use_deepep)
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = VanillaColumnParallelLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            ps,
+            sp=ps.tp_size > 1,
+            gather_output=True,
+        )
+        self.transformer_layer = Glm5Layer(
+            config,
+            ps,
+            config.num_hidden_layers + layer_idx,
+            use_deepep=use_deepep,
+            router_bias_rate=router_bias_rate,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            use_thd=use_thd,
+        )
+        self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         *,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        rotary_position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        rotary_position_ids = position_ids
-        input_ids = _roll_mtp_sequence(input_ids, packed_seq_params=packed_seq_params)
-        if packed_seq_params is None or position_ids.shape[-1] == input_ids.shape[-1]:
-            position_ids = _roll_mtp_sequence(position_ids, packed_seq_params=packed_seq_params)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        del rotary_position_ids
+        input_ids, _ = _roll_mtp_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        if position_ids is not None:
+            position_ids, _ = _roll_mtp_left(
+                position_ids, packed_seq_params=packed_seq_params, dims=-1
+            )
         decoder_input = self.embedding(input_ids)
+        decoder_input = scatter_to_sequence_parallel(decoder_input, self.ps)
+
         if self.detach_encoder:
             decoder_input = decoder_input.detach()
             hidden_states = hidden_states.detach()
+
         decoder_input = self.enorm(decoder_input)
         hidden_states = self.hnorm(hidden_states)
-        hidden_states = self.eh_proj(torch.cat((decoder_input, hidden_states), dim=-1))
-        cos, sin = build_rotary_embeddings(
-            position_ids=rotary_position_ids.to(device=hidden_states.device, dtype=torch.long),
-            dim=self.config.qk_rope_head_dim,
-            rope_theta=self.config.rope_theta,
-            dtype=hidden_states.dtype,
-        )
-        hidden_states = self.transformer_layer(
-            hidden_states,
-            cos=cos,
-            sin=sin,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
-        )
+        hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
+        hidden_states = self.eh_proj(hidden_states)
+        hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
+        hidden_states = self.transformer_layer(hidden_states, packed_seq_params=packed_seq_params)
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
 
@@ -418,26 +575,34 @@ class Glm5MTPBlock(nn.Module):
         config: Glm5Config,
         ps: ParallelState,
         *,
-        embedding: nn.Embedding,
-        use_deepep: bool = False,
-        detach_encoder: bool = False,
-        repeated_layer: bool = False,
+        embedding: VocabParallelEmbedding,
+        use_deepep: bool,
+        router_bias_rate: float,
+        fp8: bool,
+        moe_act_recompute: bool,
+        use_thd: bool,
+        detach_encoder: bool,
+        repeated_layer: bool,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
-        self.repeated_layer = bool(repeated_layer)
-        layers_to_build = 1 if self.repeated_layer else self.num_layers
+        self.repeated_layer = repeated_layer
+        layers_to_build = 1 if repeated_layer else self.num_layers
         self.layers = nn.ModuleList(
             [
                 Glm5MTPLayer(
                     config,
-                    config.num_hidden_layers + layer_idx,
                     ps,
+                    idx,
                     embedding=embedding,
                     use_deepep=use_deepep,
+                    router_bias_rate=router_bias_rate,
+                    fp8=fp8,
+                    moe_act_recompute=moe_act_recompute,
+                    use_thd=use_thd,
                     detach_encoder=detach_encoder,
                 )
-                for layer_idx in range(layers_to_build)
+                for idx in range(layers_to_build)
             ]
         )
 
@@ -445,243 +610,243 @@ class Glm5MTPBlock(nn.Module):
         self,
         *,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
         packed_seq_params=None,
     ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor] = []
+        rotary_position_ids = position_ids
         for depth in range(self.num_layers):
             layer = self.layers[0] if self.repeated_layer else self.layers[depth]
             hidden_states, input_ids, position_ids = layer(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                rotary_position_ids=rotary_position_ids,
                 packed_seq_params=packed_seq_params,
             )
             outputs.append(hidden_states)
         return outputs
 
 
+def _temperature_to_float(temperature: float | torch.Tensor) -> float:
+    if isinstance(temperature, torch.Tensor):
+        if temperature.numel() != 1:
+            raise ValueError("Glm5Model supports scalar temperature only.")
+        return float(temperature.detach().float().item())
+    return float(temperature)
+
+
+def _apply_attention_backend_override(backend: str | None) -> None:
+    if backend in (None, "flash"):
+        backend = "fused"
+    env = {
+        "auto": ("1", "1", "1"),
+        "flash": ("1", "0", "0"),
+        "fused": ("0", "1", "0"),
+        "unfused": ("0", "0", "1"),
+        "local": ("0", "0", "1"),
+    }.get(backend)
+    if env is None:
+        raise ValueError(
+            "attention_backend_override must be one of "
+            "{'auto', 'flash', 'fused', 'unfused', 'local'}"
+        )
+    (
+        os.environ["NVTE_FLASH_ATTN"],
+        os.environ["NVTE_FUSED_ATTN"],
+        os.environ["NVTE_UNFUSED_ATTN"],
+    ) = env
+
+
 class Glm5Model(nn.Module):
     def __init__(
         self,
         config: Glm5Config,
-        ps: ParallelState | None = None,
+        train_config,
+        ps: ParallelState,
         *,
-        use_deepep: bool = False,
-        mtp_enable: bool = False,
-        mtp_detach_encoder: bool = False,
-    ):
-        super().__init__()
-        self.config = config
-        self.ps = ps or ParallelState()
-        self.layer_indices = _build_glm5_pipeline_layers(config.num_hidden_layers, self.ps)
-        self.embed_tokens = (
-            nn.Embedding(config.vocab_size, config.hidden_size) if self.ps.pp_is_first else None
-        )
-        self.layers = nn.ModuleList(
-            [Glm5Layer(config, i, self.ps, use_deepep=use_deepep) for i in self.layer_indices]
-        )
-        self.norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if self.ps.pp_is_last else None
-        )
-        self.mtp_embed: nn.Embedding | None = None
-        self.mtp: Glm5MTPBlock | None = None
-        if mtp_enable and config.num_nextn_predict_layers > 0 and self.ps.pp_is_last:
-            mtp_embedding = self.embed_tokens
-            if mtp_embedding is None:
-                mtp_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-                self.mtp_embed = mtp_embedding
-            self.mtp = Glm5MTPBlock(
-                config,
-                self.ps,
-                embedding=mtp_embedding,
-                use_deepep=use_deepep,
-                detach_encoder=mtp_detach_encoder,
-                repeated_layer=config.mtp_use_repeated_layer,
-            )
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        *,
-        hidden_states: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        packed_seq_params=None,
-    ) -> torch.Tensor:
-        if hidden_states is None:
-            if input_ids is None:
-                raise ValueError("input_ids or hidden_states is required")
-            if self.embed_tokens is None:
-                raise ValueError("input_ids are only accepted on the first pipeline stage")
-            hidden_states = self.embed_tokens(input_ids)
-        batch, seq_len, _ = hidden_states.shape
-        if position_ids is None and packed_seq_params is not None:
-            raise ValueError("GLM5 packed THD forward requires explicit position_ids.")
-        if position_ids is None:
-            if self.ps.cp_size > 1:
-                full_seq_len = seq_len * self.ps.cp_size
-                position_ids = (
-                    torch.arange(full_seq_len, device=hidden_states.device)
-                    .unsqueeze(0)
-                    .expand(batch, -1)
-                )
-            else:
-                position_ids = (
-                    torch.arange(seq_len, device=hidden_states.device)
-                    .unsqueeze(0)
-                    .expand(batch, -1)
-                )
-        elif position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0).expand(batch, -1)
-
-        cos, sin = build_rotary_embeddings(
-            position_ids=position_ids.to(device=hidden_states.device, dtype=torch.long),
-            dim=self.config.qk_rope_head_dim,
-            rope_theta=self.config.rope_theta,
-            dtype=hidden_states.dtype,
-        )
-
-        h = hidden_states
-        for layer in self.layers:
-            h = layer(
-                h,
-                cos=cos,
-                sin=sin,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
-            )
-        return self.norm(h) if self.norm is not None else h
-
-
-class Glm5ForCausalLM(nn.Module):
-    def __init__(
-        self,
-        config: Glm5Config,
-        train_cfg: SimpleNamespace | None = None,
-        ps: ParallelState | None = None,
-        *,
+        vpp_chunk_id: int | None = None,
+        router_bias_rate: float = 0.0,
+        use_thd: bool = False,
+        hf_path: str = "",
+        attention_backend_override: str | None = None,
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
     ):
         super().__init__()
+        del hf_path
+        _apply_attention_backend_override(attention_backend_override)
         self.config = config
-        self.train_cfg = train_cfg or SimpleNamespace(fp8=False)
-        self.ps = ps or ParallelState()
-        self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
-        self.model = Glm5Model(
-            config,
-            self.ps,
-            use_deepep=bool(getattr(self.train_cfg, "use_deepep", False)),
-            mtp_enable=mtp_enable,
-            mtp_detach_encoder=mtp_detach_encoder,
-        )
-        self.layer_indices = self.model.layer_indices
-        self.lm_head = (
-            nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-            if self.ps.pp_is_last
-            else None
-        )
+        self.train_config = train_config
+        self.ps = ps
         self._input_tensor: torch.Tensor | None = None
+        self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
+        self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
+
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id
+        )
+        self.layer_indices = layout.layer_indices
+        self.pre_process = layout.has_embed
+        self.post_process = layout.has_head
+        # GLM-5 does not tie embeddings (no tie_word_embeddings HF field); the
+        # attribute is preserved for the dist-opt / distckpt interface.
+        self.share_embeddings_and_output_weights = bool(
+            getattr(config, "tie_word_embeddings", False)
+        )
+        self.vision_model: nn.Module | None = None
+
+        self.embed: VocabParallelEmbedding | None = None
+        if layout.has_embed:
+            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+
+        recompute_modules = getattr(train_config, "recompute_modules", [])
+        moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
+        self.layers = nn.ModuleList(
+            [
+                Glm5Layer(
+                    config,
+                    ps,
+                    idx,
+                    use_deepep=train_config.use_deepep,
+                    router_bias_rate=router_bias_rate,
+                    fp8=train_config.fp8,
+                    moe_act_recompute=moe_act_recompute,
+                    use_thd=use_thd,
+                )
+                for idx in self.layer_indices
+            ]
+        )
+
+        self.norm: nn.Module | None = None
+        self.head: VocabParallelOutput | None = None
+        if layout.has_head:
+            self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
+
+        self.mtp_embed: VocabParallelEmbedding | None = None
+        self.mtp: Glm5MTPBlock | None = None
+        if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
+            mtp_embedding = self.embed
+            if mtp_embedding is None:
+                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                self.mtp_embed = mtp_embedding
+            self.mtp = Glm5MTPBlock(
+                config,
+                ps,
+                embedding=mtp_embedding,
+                use_deepep=train_config.use_deepep,
+                router_bias_rate=router_bias_rate,
+                fp8=train_config.fp8,
+                moe_act_recompute=moe_act_recompute,
+                use_thd=use_thd,
+                detach_encoder=mtp_detach_encoder,
+                repeated_layer=config.mtp_use_repeated_layer,
+            )
+
+        self.sp_params: list[nn.Parameter] = []
+        if ps.tp_size > 1:
+            self.sp_params = _collect_sp_grad_params(self)
 
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
+            if len(input_tensor) > 1:
+                raise ValueError("Glm5Model expects a single pipeline input tensor.")
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
-        *,
         hidden_states: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
         packed_seq_params=None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor = 1.0,
+        use_fused_kernels: bool = False,
         calculate_entropy: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if hidden_states is None:
-            hidden_states = self._input_tensor
-
-        fp8_ctx = nullcontext()
-        with fp8_ctx:
-            hidden = self.model(
-                input_ids,
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
-            )
-            logits = self.lm_head(hidden) if self.lm_head is not None else None
-
-        if isinstance(temperature, torch.Tensor):
-            temperature = float(temperature.detach().float().item())
-        if logits is not None and temperature != 1.0:
-            logits = logits / float(temperature)
-
-        output = {"hidden_states": hidden}
-        if logits is None:
-            return output
-        output["logits"] = logits
-
-        mtp_hidden_states = self._apply_mtp(
-            hidden,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
-        )
-        if mtp_hidden_states is not None:
-            output["mtp_hidden_states"] = tuple(mtp_hidden_states)
-            mtp_logits = tuple(
-                (
-                    self.lm_head(mtp_hidden) / float(temperature)
-                    if temperature != 1.0
-                    else self.lm_head(mtp_hidden)
-                )
-                for mtp_hidden in mtp_hidden_states
-            )
-            output["mtp_logits"] = mtp_logits
-
-        if labels is not None:
-            token_loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                labels.reshape(-1),
-                ignore_index=-100,
-                reduction="none",
-            )
-            output["log_probs"] = (-token_loss).view_as(labels).contiguous()
-            if loss_mask is not None:
-                valid = loss_mask.reshape(-1).float()
-                loss = (token_loss * valid).sum() / valid.sum().clamp_min(1.0)
-            else:
-                loss = token_loss.mean()
-            output["loss"] = loss
-            if calculate_entropy:
-                probs = torch.softmax(logits.float(), dim=-1)
-                output["entropy"] = -(probs * torch.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
-            mtp_loss = self._apply_mtp_loss(
-                output.get("mtp_logits"),
-                labels=labels,
-                loss_mask=loss_mask,
-                packed_seq_params=packed_seq_params,
-            )
-            if mtp_loss is not None:
-                output["mtp_loss"] = mtp_loss
-                output["loss"] = output["loss"] + self.config.mtp_loss_scaling_factor * mtp_loss
+    ) -> dict:
+        if self.embed is not None:
+            assert input_ids is not None
+            h = self.embed(input_ids)
         else:
-            if calculate_entropy:
-                probs = torch.softmax(logits.float(), dim=-1)
-                output["entropy"] = -(probs * torch.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
+            if hidden_states is None:
+                hidden_states = self._input_tensor
+            assert hidden_states is not None
+            h = hidden_states
+
+        fp8_ctx = (
+            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
+            if self.train_config.fp8
+            else nullcontext()
+        )
+        with fp8_ctx:
+            if self.embed is not None:
+                h = scatter_to_sequence_parallel(h, self.ps)
+            for layer in self.layers:
+                h = layer(h, packed_seq_params=packed_seq_params)
+
+        output = {"hidden_states": h}
+        if self.head is not None:
+            assert self.norm is not None
+            hidden_for_head = self.norm(h)
+            mtp_hidden_states = self._apply_mtp(
+                hidden_for_head,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+            )
+            if mtp_hidden_states is not None:
+                output["mtp_hidden_states"] = mtp_hidden_states
+            if labels is not None:
+                temperature_value = _temperature_to_float(temperature)
+                mtp_result = self._apply_mtp_loss(
+                    hidden_for_head,
+                    mtp_hidden_states=mtp_hidden_states,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
+                    temperature=temperature_value,
+                    use_fused_kernels=use_fused_kernels,
+                )
+                if mtp_result is not None:
+                    hidden_for_head, mtp_loss = mtp_result
+                    output["mtp_loss"] = mtp_loss
+                labels_sb = labels.transpose(0, 1).contiguous()
+                if use_fused_kernels:
+                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                    log_probs, entropy = linear_cross_entropy(
+                        hidden_full,
+                        self._head_weight_for_fused_ce(hidden_full),
+                        labels_sb,
+                        temperature_value,
+                        self.ps.tp_group,
+                    )
+                    output["loss"] = (-log_probs).mean()
+                    output["log_probs"] = log_probs.transpose(0, 1).contiguous()
+                    if calculate_entropy:
+                        output["entropy"] = entropy.transpose(0, 1).contiguous()
+                else:
+                    logits = self.head(hidden_for_head)
+                    if temperature_value != 1.0:
+                        logits = logits / temperature_value
+                    loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    output["loss"] = loss.mean()
+                    output["log_probs"] = (-loss).transpose(0, 1).contiguous()
+                    if calculate_entropy:
+                        entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+                        output["entropy"] = entropy.transpose(0, 1).contiguous()
+            else:
+                logits = self.head(hidden_for_head)
+                output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
+                if mtp_hidden_states is not None:
+                    output["mtp_logits"] = [
+                        self.head.gather(self.head(mtp_hidden)).transpose(0, 1).contiguous()
+                        for mtp_hidden in mtp_hidden_states
+                    ]
         return output
 
     def _apply_mtp(
@@ -690,95 +855,108 @@ class Glm5ForCausalLM(nn.Module):
         *,
         input_ids: torch.Tensor | None,
         position_ids: torch.Tensor | None,
-        attention_mask: torch.Tensor | None,
         packed_seq_params,
     ) -> list[torch.Tensor] | None:
-        if self.model.mtp is None:
+        if self.mtp is None:
             return None
         if input_ids is None:
             if self.mtp_enable_train:
                 raise ValueError("MTP training requires input_ids.")
             return None
-        batch, seq_len = input_ids.shape
-        if position_ids is None:
-            if packed_seq_params is not None:
-                raise ValueError("GLM5 MTP packed THD forward requires explicit position_ids.")
-            position_ids = (
-                torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
-                .unsqueeze(0)
-                .expand(batch, -1)
-            )
-        elif position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0).expand(batch, -1)
-        return self.model.mtp(
+        return self.mtp(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
             packed_seq_params=packed_seq_params,
         )
 
     def _apply_mtp_loss(
         self,
-        mtp_logits: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor | None,
+        hidden_states: torch.Tensor,
         *,
+        mtp_hidden_states: list[torch.Tensor] | None,
         labels: torch.Tensor,
         loss_mask: torch.Tensor | None,
-        packed_seq_params=None,
-    ) -> torch.Tensor | None:
-        if mtp_logits is None or not self.mtp_enable_train:
+        packed_seq_params,
+        temperature: float,
+        use_fused_kernels: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if mtp_hidden_states is None:
             return None
-        logits_list = [mtp_logits] if isinstance(mtp_logits, torch.Tensor) else list(mtp_logits)
+        if not self.mtp_enable_train:
+            return None
         if loss_mask is None:
             mtp_loss_mask = torch.ones_like(labels, dtype=torch.float32)
         else:
             mtp_loss_mask = loss_mask.to(dtype=torch.float32).clone()
         mtp_labels = labels.clone()
-        losses = []
-        for logits in logits_list:
-            mtp_labels = _roll_mtp_sequence(mtp_labels, packed_seq_params=packed_seq_params)
-            mtp_loss_mask = _roll_mtp_sequence(mtp_loss_mask, packed_seq_params=packed_seq_params)
-            token_loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                mtp_labels.reshape(-1),
-                ignore_index=-100,
-                reduction="none",
-            ).view_as(mtp_labels)
-            valid = mtp_loss_mask.reshape(-1).float()
-            losses.append((token_loss.reshape(-1) * valid).sum() / valid.sum().clamp_min(1.0))
-        if not losses:
-            return None
-        return torch.stack(losses).mean()
 
-    @torch.no_grad()
-    def initialize_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            elif isinstance(module, RMSNorm | nn.LayerNorm):
-                (
-                    module.reset_parameters()
-                    if hasattr(module, "reset_parameters")
-                    else module.weight.fill_(1.0)
+        mtp_loss_values = []
+        for mtp_hidden in mtp_hidden_states:
+            mtp_labels, _ = _roll_mtp_left(
+                mtp_labels,
+                packed_seq_params=packed_seq_params,
+                dims=-1,
+            )
+            mtp_loss_mask, num_tokens = _roll_mtp_left(
+                mtp_loss_mask,
+                packed_seq_params=packed_seq_params,
+                dims=-1,
+            )
+            labels_sb = mtp_labels.transpose(0, 1).contiguous()
+            mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
+
+            if use_fused_kernels:
+                mtp_hidden_full = gather_from_sequence_parallel(mtp_hidden, self.ps)
+                log_probs, _entropy = linear_cross_entropy(
+                    mtp_hidden_full,
+                    self._head_weight_for_fused_ce(mtp_hidden_full),
+                    labels_sb,
+                    temperature,
+                    self.ps.tp_group,
                 )
-            elif isinstance(module, Glm5Router):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-                module.e_score_correction_bias.zero_()
-            elif isinstance(module, Glm5RoutedExperts):
-                nn.init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
-                nn.init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
+                token_loss = -log_probs
+            else:
+                logits = self.head(mtp_hidden)
+                if temperature != 1.0:
+                    logits = logits / temperature
+                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+
+            token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
+            num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
+            mtp_loss_values.append(token_loss.sum() / num_tokens)
+
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states,
+                mtp_loss_scale * token_loss / num_tokens,
+            )
+
+        if not mtp_loss_values:
+            return None
+        return (
+            hidden_states,
+            torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean(),
+        )
+
+    def _head_weight_for_fused_ce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.head is not None
+        weight = self.head.col.linear.weight
+        return (
+            weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
+        )
 
 
 __all__ = [
-    "Glm5ForCausalLM",
+    "DenseMLP",
+    "DynamicSparseAttention",
+    "Glm5DSAAttention",
     "Glm5Layer",
-    "Glm5MLP",
     "Glm5MTPBlock",
     "Glm5MTPLayer",
-    "Glm5MoE",
     "Glm5Model",
-    "Glm5Router",
-    "Glm5RoutedExperts",
+    "Glm5SigmoidTopKRouter",
+    "MoELayer",
+    "MTPLossAutoScaler",
+    "SharedExpert",
 ]

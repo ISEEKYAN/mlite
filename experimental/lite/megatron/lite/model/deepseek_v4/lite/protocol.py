@@ -10,6 +10,7 @@ import torch.nn as nn
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
     export_hf_weights as _export_hf_weights_impl,
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
@@ -62,10 +63,12 @@ MODULE_MAP = {
     "ffn_norm": lambda layer: layer.post_attention_layernorm,
 }
 
+# The Kimi-derived model has no ``attention_mask`` arg (CSA derives its causal /
+# sliding-window masking from ``position_ids``, as the previous DS4 did with
+# attention_mask=None); keep it out of the forward whitelist.
 _MODEL_FORWARD_KEYS = (
     "input_ids",
     "position_ids",
-    "attention_mask",
     "labels",
     "loss_mask",
     "temperature",
@@ -170,7 +173,7 @@ def _base_model_forward_kwargs(batch: PackedBatch):
     if batch.loss_mask is not None:
         kwargs["loss_mask"] = _as_batch_row(batch.loss_mask)
     add_loss_context_kwargs(kwargs)
-    position_ids = _normalize_ds4_position_ids(batch.position_ids)
+    position_ids = _normalize_ds4_position_ids(getattr(batch, "position_ids", None))
     if position_ids is not None:
         kwargs["position_ids"] = position_ids
     return kwargs
@@ -299,13 +302,34 @@ def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
     return [*layers, *mtp_layers]
 
 
-def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4ForCausalLM
+def _validate_parallel_scope(p: ParallelConfig) -> None:
+    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
 
-    _ = impl_cfg.use_thd
-    _apply_mtp_config(model_cfg, impl_cfg)
-    ps = init_parallel(impl_cfg.parallel)
+    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
+    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
+    """
+    etp = 1 if p.etp is None else p.etp
+    if p.tp > 1:
+        raise NotImplementedError(
+            "DeepSeek V4 native CSA attention does not support tensor parallelism; "
+            f"got tp={p.tp}. Use tp=1 (PP/VPP/EP/CP are supported)."
+        )
+    if etp > 1:
+        raise NotImplementedError(
+            "DeepSeek V4 native CSA attention does not support expert tensor parallelism; "
+            f"got etp={etp}. Use etp=1 (EP is supported)."
+        )
+
+
+def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
+
     p = impl_cfg.parallel
+    _validate_parallel_scope(p)
+    _apply_mtp_config(model_cfg, impl_cfg)
+    mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
+    mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
+    ps = init_parallel(impl_cfg.parallel)
     vpp = None if p.vpp == 1 else p.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
@@ -320,13 +344,18 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
     def _chunk(i: int | None = None):
         return (
-            DeepseekV4ForCausalLM(
+            DeepseekV4Model(
                 model_cfg,
-                train_cfg=train_cfg,
-                ps=ps,
-                vpp=vpp,
+                train_cfg,
+                ps,
                 vpp_chunk_id=i,
                 use_deepep=impl_cfg.use_deepep,
+                use_thd=impl_cfg.use_thd,
+                hf_path=impl_cfg.hf_path,
+                attention_backend_override=impl_cfg.attention_backend_override,
+                mtp_enable=mtp_enable,
+                mtp_enable_train=mtp_enable_train,
+                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
             )
             .to(torch.bfloat16)
             .cuda()
@@ -367,7 +396,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             is_expert=is_expert_param,
             deterministic=impl_cfg.deterministic,
         )
-        attach_model_sharded_state_dict(chunks, ps, is_expert=is_expert_param)
+        attach_model_sharded_state_dict(
+            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+        )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
     elif optimizer_name == "fsdp2":
