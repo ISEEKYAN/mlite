@@ -320,7 +320,13 @@ class TokenDispatcher:
 
         routing_map = torch.zeros(t, e, dtype=torch.bool, device=hidden_states.device)
         routing_map.scatter_(1, topk_indices, True)
-        num_out = t * topk_indices.size(1)
+        # Use the actual number of routed (token, expert) pairs from routing_map
+        # rather than t * topk: hash routing (ds4) can map a token's topk slots to
+        # DUPLICATE experts, which scatter_ dedups, so t*topk would overcount and
+        # leave permuted.size(0) != sum(input_splits) (all-to-all split mismatch).
+        # Unique-topk routers (every other model) have routing_map.sum() == t*topk,
+        # so this is a no-op for them.
+        num_out = int(routing_map.sum().item())
 
         probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
         probs_2d.scatter_(1, topk_indices, topk_scores)
