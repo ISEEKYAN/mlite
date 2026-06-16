@@ -24,7 +24,12 @@ from megatron.lite.primitive.parallel.cp import (
     local_position_ids_for_cp,
     local_sequence_tensor_for_cp,
 )
-from megatron.lite.primitive.parallel.thd import pack_nested_thd, thd_pack_meta, unpack_thd_to_nested
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    parallel_state_from_model,
+    thd_pack_meta,
+    unpack_thd_to_nested,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
@@ -141,7 +146,7 @@ def _nested_from_packed_tensor(tensor, seq_lens):
 
 
 def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
-    ps = getattr(model, "ps", ParallelState())
+    ps = parallel_state_from_model(model) or ParallelState()
     seq_lens = batch.sizes().to(device=batch.input_ids.device)
     packed = pack_nested_thd(
         _nested_from_packed_tensor(batch.input_ids, seq_lens),
@@ -180,7 +185,7 @@ def _base_model_forward_kwargs(batch: PackedBatch):
 
 
 def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
-    ps = getattr(model, "ps", ParallelState())
+    ps = parallel_state_from_model(model) or ParallelState()
     if ps.cp_size <= 1:
         return kwargs
     for key in ("input_ids", "labels", "loss_mask", "position_ids"):
@@ -191,7 +196,7 @@ def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
 
 
 def _prepare_contiguous_cp_kwargs(model, kwargs):
-    ps = getattr(model, "ps", ParallelState())
+    ps = parallel_state_from_model(model) or ParallelState()
     local_seq_len = _infer_cp_local_seq_len(
         input_ids=kwargs["input_ids"],
         position_ids=kwargs.get("position_ids"),
@@ -253,7 +258,7 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     # DeepSeek-V4 packs each sequence to the (zigzag) TE alignment but slices CP
     # contiguously for the fused DSA indexer, so reconstruct contiguously.
-    ps = getattr(model, "ps", ParallelState())
+    ps = parallel_state_from_model(model) or ParallelState()
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,

@@ -314,7 +314,7 @@ def _topology(model_name: str, backend: str) -> ParallelConfig:
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
 
 
-def _optimizer_config() -> OptimizerConfig:
+def _optimizer_config(offload_fraction: float = 0.0) -> OptimizerConfig:
     return OptimizerConfig(
         optimizer="adam",
         lr=1.0e-3,
@@ -323,20 +323,27 @@ def _optimizer_config() -> OptimizerConfig:
         adam_beta2=0.95,
         adam_eps=1.0e-8,
         clip_grad=1.0,
-        offload_fraction=0.0,
+        offload_fraction=offload_fraction,
     )
 
 
-def _build_handle(model_name: str, backend: str, *, seed: int):
+def _build_handle(
+    model_name: str,
+    backend: str,
+    *,
+    seed: int,
+    topology: ParallelConfig | None = None,
+    offload_fraction: float = 0.0,
+):
     cfg, protocol = MODELS[model_name]()
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    parallel = _topology(model_name, backend)
+    parallel = topology or _topology(model_name, backend)
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
         optimizer=backend,
-        optimizer_config=_optimizer_config(),
+        optimizer_config=_optimizer_config(offload_fraction),
         use_deepep=False,
         deterministic=True,
     )
@@ -536,3 +543,152 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
 
     export_dir = _shared_tmp_path(tmp_path, "hf_export")
     _export_and_reload(handle, cfg, protocol, export_dir)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Runtime offload / onload roundtrip (RL Best tier: runtime.to(cpu/cuda))
+#
+# Exercises the real runtime.to() used to reclaim GPU between train and rollout:
+# param + optimizer state move CPU<->GPU as a whole (NOT offload_fraction).
+# 3 delivery models x 2 optimizers on the 8-GPU proxy2 topology.
+# ──────────────────────────────────────────────────────────────────────────
+
+# qwen3_5 offload is validated separately (its GatedDeltaNet linear-attention
+# path and run env differ); the others run here.
+DELIVERY_MODELS = ("deepseek_v4", "glm5", "kimi_k2")
+
+
+def _offload_topology(model_name: str) -> ParallelConfig:
+    # proxy2 = 8-GPU pp2/ep2/cp2.  CSA/DSA (glm5, ds4) are TP=1 only, so they
+    # fill 8 ranks with dp2 (tp1·cp2·pp2·dp2=8); TP-capable MoE models use tp2
+    # (tp2·cp2·pp2·dp1=8).
+    forced = os.environ.get("MLITE_FORCE_TOPO")
+    if forced:
+        tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
+        return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
+    if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
+        return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
+    return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
+
+
+def _iter_opt_state_tensors(handle: ModelHandle, backend: str):
+    """Yield (key, tensor) over optimizer state for either backend — the same
+    tensors runtime.to() offloads, so device / value can be inspected."""
+    opt = handle._optimizer
+    if backend == "fsdp2":
+        from megatron.lite.primitive.optimizers.fsdp2.adamw import iter_torch_optimizers
+
+        for ci, child in enumerate(iter_torch_optimizers(opt.optimizer)):
+            for pi, st in enumerate(getattr(child, "state", {}).values()):
+                if isinstance(st, dict):
+                    for k, v in st.items():
+                        if isinstance(v, torch.Tensor):
+                            yield f"{ci}.{pi}.{k}", v
+    else:
+        from megatron.core.optimizer import ChainedOptimizer
+
+        opts = opt.chained_optimizers if isinstance(opt, ChainedOptimizer) else [opt]
+        for oi, sub in enumerate(opts):
+            inner = getattr(sub, "optimizer", None)
+            if inner is None:
+                continue
+            for pi, st in enumerate(inner.state.values()):
+                for k, v in st.items():
+                    if isinstance(v, torch.Tensor):
+                        yield f"{oi}.{pi}.{k}", v
+
+
+def _opt_state_devices(handle: ModelHandle, backend: str) -> set[str]:
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
+
+    return {to_local_tensor(v).device.type for _, v in _iter_opt_state_tensors(handle, backend)}
+
+
+def _opt_state_snapshot(handle: ModelHandle, backend: str) -> dict[str, torch.Tensor]:
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
+
+    return {
+        k: to_local_tensor(v.detach()).cpu().float().clone()
+        for k, v in _iter_opt_state_tensors(handle, backend)
+    }
+
+
+def _local_param_devices(handle: ModelHandle) -> set[str]:
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
+
+    return {
+        to_local_tensor(p.detach()).device.type
+        for chunk in handle._extras["model_chunks"]
+        for p in chunk.parameters()
+    }
+
+
+def _assert_named_bitwise_equal(lhs: dict, rhs: dict, label: str) -> None:
+    assert lhs.keys() == rhs.keys(), f"{label} keys differ across offload roundtrip."
+    mismatches = []
+    for name in lhs:
+        if not torch.equal(lhs[name], rhs[name]):
+            diff = (lhs[name] - rhs[name]).abs().max().item()
+            mismatches.append(f"{name} (max_abs_diff={diff})")
+    assert not mismatches, f"{label} not bitwise after offload/onload:\n" + "\n".join(mismatches)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("model_name", DELIVERY_MODELS)
+def test_offload_onload_roundtrip(model_name, backend, tmp_path):
+    """runtime.to(cpu) -> to(cuda) restores params + optimizer state exactly and
+    training continues — the RL train<->rollout GPU-reclaim path."""
+    if dist.get_world_size() != 8:
+        pytest.skip("offload/onload proxy smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+    handle, cfg, _ = _build_handle(
+        model_name, backend, seed=4242, topology=_offload_topology(model_name)
+    )
+    _train_step(handle, backend, cfg)  # populate optimizer (exp_avg) state
+
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    params_before = _local_named_params(handle)
+    opt_before = _opt_state_snapshot(handle, backend)
+    assert opt_before, "expected optimizer state after a train step."
+    assert _opt_state_devices(handle, backend) == {"cuda"}
+
+    runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
+    assert _opt_state_devices(handle, backend) == {"cpu"}, "optimizer state not offloaded to CPU."
+    if backend == "fsdp2":
+        # fsdp2 moves params to CPU directly; dist_opt instead frees the GPU
+        # buffer storage (params keep a 0-size cuda handle), so assert only fsdp2.
+        assert _local_param_devices(handle) == {"cpu"}, "params not offloaded to CPU."
+
+    runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
+    assert _opt_state_devices(handle, backend) == {"cuda"}, "optimizer state not back on GPU."
+    assert _local_param_devices(handle) == {"cuda"}, "params not back on GPU."
+
+    _assert_named_bitwise_equal(params_before, _local_named_params(handle), "param")
+    _assert_named_bitwise_equal(opt_before, _opt_state_snapshot(handle, backend), "optimizer-state")
+
+    _train_step(handle, backend, cfg)  # continues training after onload
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("model_name", ["kimi_k2"])
+def test_offload_fraction_keeps_optimizer_state_on_cpu(model_name, backend, tmp_path):
+    """offload_fraction>0 keeps the optimizer update state on CPU and still
+    trains.  One delivery model is enough to guard the real-model wiring
+    (generic TinyModel coverage already exists)."""
+    if dist.get_world_size() != 8:
+        pytest.skip("offload_fraction proxy smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+    handle, cfg, _ = _build_handle(
+        model_name,
+        backend,
+        seed=4242,
+        topology=_offload_topology(model_name),
+        offload_fraction=1.0,
+    )
+    _train_step(handle, backend, cfg)
+    assert "cpu" in _opt_state_devices(handle, backend), (
+        "offload_fraction=1.0 should keep optimizer update state on CPU."
+    )
+    _train_step(handle, backend, cfg)  # trains with the offloaded update state
