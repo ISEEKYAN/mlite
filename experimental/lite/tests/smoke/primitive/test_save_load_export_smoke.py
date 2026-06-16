@@ -163,7 +163,7 @@ def _glm5():
         v_head_dim=256,
         index_head_dim=128,
         index_n_heads=32,
-        index_topk=32,
+        index_topk=512,
         intermediate_size=20,
         moe_intermediate_size=6,
         first_k_dense_replace=1,
@@ -203,7 +203,7 @@ def _deepseek_v4():
         hc_mult=2,
         index_head_dim=64,
         index_n_heads=8,
-        index_topk=32,
+        index_topk=512,
         # DeepSeek-V4 really has MTP; its ImplConfig defaults mtp_enable=True and
         # requires >=1 nextn layer, so give it one (exercises MTP weight IO too).
         num_nextn_predict_layers=1,
