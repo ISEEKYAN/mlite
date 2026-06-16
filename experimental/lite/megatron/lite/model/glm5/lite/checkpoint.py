@@ -16,7 +16,8 @@ from megatron.lite.primitive.utils import log_rank0
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
-    return ".experts." in name
+    # Routed experts only: exclude the shared expert and the router gate.
+    return ".experts." in name and ".shared_experts." not in name and ".gate." not in name
 
 
 def _has(reader: SafeTensorReader, name: str) -> bool:
@@ -94,6 +95,40 @@ _MTP_LAYER_RE = re.compile(r"^(model\.mtp\.layers\.)(\d+)(\..*)$")
 _LOCAL_EXPERT_RE = re.compile(r"^(model\.layers\.\d+\.mlp\.experts\.)(\d+)(\..*)$")
 _PACKED_EXPERT_RE = re.compile(r"^(model\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)$")
 
+# Native (Megatron-lite) param names now come from the SHARED primitives
+# (SwiGLUMLP: gate_up/down; SigmoidTopKRouter: gate.gate.weight + expert_bias;
+# Experts: fc1.weight{N}/fc2.weight{N}).  These regexes translate native names
+# into the HF DeepSeek/GLM names so save_hf / load_hf keep identical HF keys.
+_GROUPED_EXPERT_RE = re.compile(
+    r"^(model\.(?:layers|mtp\.layers)\.\d+(?:\.transformer_layer)?\.mlp\.experts)\.fc([12])\.weight(\d+)$"
+)
+_FUSED_GATE_UP_RE = re.compile(
+    r"^(model\.(?:layers|mtp\.layers)\.\d+(?:\.transformer_layer)?\.mlp"
+    r"(?:\.shared_experts)?)\.gate_up\.weight$"
+)
+# SwiGLUMLP down projection (dense MLP + shared experts) -> HF `down_proj`.
+_DOWN_RE = re.compile(
+    r"^(model\.(?:layers|mtp\.layers)\.\d+(?:\.transformer_layer)?\.mlp"
+    r"(?:\.shared_experts)?)\.down\.weight$"
+)
+
+
+def _native_suffix_to_hf(name: str) -> str:
+    """Translate a native param suffix to the HF-equivalent suffix.
+
+    Handles the renamed router and the SwiGLUMLP down projection that map 1:1
+    to HF.  Fused gate_up and grouped experts (which split/merge tensors) are
+    handled separately by the resolver / exporter.
+    """
+    # Router: shared SigmoidTopKRouter exposes `gate.gate.weight` + `expert_bias`.
+    name = name.replace(".mlp.gate.gate.weight", ".mlp.gate.weight")
+    name = name.replace(".mlp.gate.expert_bias", ".mlp.gate.e_score_correction_bias")
+    # SwiGLUMLP `down` -> HF `down_proj` (dense MLP and shared experts).
+    down = _DOWN_RE.match(name)
+    if down is not None:
+        return f"{down.group(1)}.down_proj.weight"
+    return name
+
 
 def _resolve_hf_tensor(
     reader: SafeTensorReader, name: str, target: nn.Parameter | torch.Tensor
@@ -147,9 +182,14 @@ def _local_layer_indices(model: nn.Module) -> list[int]:
     return []
 
 
-def _to_hf_state_name(
-    name: str, *, config: Glm5Config, model: nn.Module, ps: ParallelState
+def _globalize_layer_name(
+    name: str, *, config: Glm5Config, model: nn.Module
 ) -> str | None:
+    """Rewrite local layer / MTP indices to the global HF layer index.
+
+    The returned name still carries the *native* suffix (router/expert/fused
+    names); suffix translation is applied by the caller.
+    """
     if name == "model.mtp_embed.weight":
         return "model.embed_tokens.weight"
 
@@ -162,25 +202,48 @@ def _to_hf_state_name(
         global_layer = config.num_hidden_layers + mtp_idx
         if suffix.startswith(".transformer_layer."):
             suffix = suffix[len(".transformer_layer") :]
-        name = f"model.layers.{global_layer}{suffix}"
-    else:
-        layer_indices = _local_layer_indices(model)
-        match = _LAYER_RE.match(name)
-        if match is not None and layer_indices:
-            prefix, local_idx_text, suffix = match.groups()
-            local_idx = int(local_idx_text)
-            if local_idx >= len(layer_indices):
-                return None
-            name = f"{prefix}{layer_indices[local_idx]}{suffix}"
+        return f"model.layers.{global_layer}{suffix}"
 
-    match = _LOCAL_EXPERT_RE.match(name)
-    if match is None:
-        return name
+    layer_indices = _local_layer_indices(model)
+    match = _LAYER_RE.match(name)
+    if match is not None and layer_indices:
+        prefix, local_idx_text, suffix = match.groups()
+        local_idx = int(local_idx_text)
+        if local_idx >= len(layer_indices):
+            return None
+        return f"{prefix}{layer_indices[local_idx]}{suffix}"
+    return name
 
-    prefix, local_expert_text, suffix = match.groups()
+
+def _global_expert_id(local_expert: int, *, config: Glm5Config, ps: ParallelState) -> int:
     experts_per_rank = ensure_divisible(config.n_routed_experts, ps.ep_size)
-    global_expert = ps.ep_rank * experts_per_rank + int(local_expert_text)
-    return f"{prefix}{global_expert}{suffix}"
+    return ps.ep_rank * experts_per_rank + local_expert
+
+
+def _to_hf_state_name(
+    name: str, *, config: Glm5Config, model: nn.Module, ps: ParallelState
+) -> str | None:
+    """Map a native (post-globalized) name to its single HF name (1:1 cases).
+
+    Returns None for names that fan out to multiple HF tensors (fused gate_up,
+    grouped experts) — those are handled by the dedicated load/export paths.
+    """
+    name = _globalize_layer_name(name, config=config, model=model)
+    if name is None:
+        return None
+
+    if _FUSED_GATE_UP_RE.match(name) or _GROUPED_EXPERT_RE.match(name):
+        return None
+
+    name = _native_suffix_to_hf(name)
+
+    # Pre-existing per-expert (non-grouped) layout: remap local→global expert id.
+    match = _LOCAL_EXPERT_RE.match(name)
+    if match is not None:
+        prefix, local_expert_text, suffix = match.groups()
+        global_expert = _global_expert_id(int(local_expert_text), config=config, ps=ps)
+        return f"{prefix}{global_expert}{suffix}"
+    return name
 
 
 def _resolve_named_parameter_tensor(
@@ -224,6 +287,49 @@ def _resolve_named_parameter_tensor(
     return torch.stack(tensors, dim=0).contiguous()
 
 
+def _resolve_fused_or_grouped(
+    reader: SafeTensorReader,
+    global_name: str,
+    target: nn.Parameter | torch.Tensor,
+    *,
+    config: Glm5Config,
+    ps: ParallelState,
+) -> torch.Tensor | None:
+    """Resolve shared-primitive params that map to multiple HF tensors.
+
+    - SwiGLUMLP `mlp[.shared_experts].gate_up.weight` <- HF gate_proj + up_proj
+    - shared Experts `mlp.experts.fc1.weight{N}` <- HF expert N gate_proj+up_proj
+    - shared Experts `mlp.experts.fc2.weight{N}` <- HF expert N down_proj
+    """
+    fused = _FUSED_GATE_UP_RE.match(global_name)
+    if fused is not None:
+        mlp_prefix = fused.group(1)
+        split = target.shape[0] // 2
+        gate = _resolve_hf_tensor(
+            reader, f"{mlp_prefix}.gate_proj.weight", target[:split]
+        )
+        up = _resolve_hf_tensor(reader, f"{mlp_prefix}.up_proj.weight", target[split:])
+        if gate is None or up is None:
+            return None
+        return torch.cat([gate, up], dim=0).contiguous()
+
+    grouped = _GROUPED_EXPERT_RE.match(global_name)
+    if grouped is not None:
+        experts_prefix, fc, local_expert_text = grouped.groups()
+        global_expert = _global_expert_id(int(local_expert_text), config=config, ps=ps)
+        ep = f"{experts_prefix}.{global_expert}"
+        if fc == "1":
+            split = target.shape[0] // 2
+            gate = _resolve_hf_tensor(reader, f"{ep}.gate_proj.weight", target[:split])
+            up = _resolve_hf_tensor(reader, f"{ep}.up_proj.weight", target[split:])
+            if gate is None or up is None:
+                return None
+            return torch.cat([gate, up], dim=0).contiguous()
+        return _resolve_hf_tensor(reader, f"{ep}.down_proj.weight", target)
+
+    return None
+
+
 def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: ParallelState) -> None:
     if ps.tp_size != 1 or ps.etp_size != 1:
         raise NotImplementedError("GLM5 direct HF load currently supports TP=ETP=1.")
@@ -238,12 +344,22 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
         (name, target) for name, target in base_model.named_buffers() if name in state_names
     )
     for name, target in targets:
-        hf_name = _to_hf_state_name(name, config=config, model=base_model, ps=ps)
-        if hf_name is None:
+        global_name = _globalize_layer_name(name, config=config, model=base_model)
+        if global_name is None:
             continue
-        tensor = _resolve_named_parameter_tensor(reader, hf_name, target, config=config, ps=ps)
+        if _FUSED_GATE_UP_RE.match(global_name) or _GROUPED_EXPERT_RE.match(global_name):
+            tensor = _resolve_fused_or_grouped(
+                reader, global_name, target, config=config, ps=ps
+            )
+            ref_name = global_name
+        else:
+            hf_name = _to_hf_state_name(name, config=config, model=base_model, ps=ps)
+            if hf_name is None:
+                continue
+            tensor = _resolve_named_parameter_tensor(reader, hf_name, target, config=config, ps=ps)
+            ref_name = hf_name
         if tensor is None:
-            missing.append(hf_name)
+            missing.append(ref_name)
             continue
         _copy_param(target, tensor)
         loaded += 1
@@ -266,6 +382,51 @@ def _validate_export_scope(ps: ParallelState) -> None:
         raise NotImplementedError("GLM5 direct HF export currently supports EP=1.")
 
 
+def _native_to_hf_pairs(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    config: Glm5Config,
+    model: nn.Module,
+    ps: ParallelState,
+) -> list[tuple[str, torch.Tensor]]:
+    """Convert one native state-dict entry to its [(hf_name, hf_tensor)] list.
+
+    Splits fused gate_up (SwiGLUMLP / shared Experts fc1) back into HF
+    gate_proj/up_proj and renames the shared router / down projections.
+    """
+    global_name = _globalize_layer_name(name, config=config, model=model)
+    if global_name is None:
+        return []
+
+    fused = _FUSED_GATE_UP_RE.match(global_name)
+    if fused is not None:
+        mlp_prefix = fused.group(1)
+        gate, up = tensor.chunk(2, dim=0)
+        return [
+            (f"{mlp_prefix}.gate_proj.weight", gate.contiguous()),
+            (f"{mlp_prefix}.up_proj.weight", up.contiguous()),
+        ]
+
+    grouped = _GROUPED_EXPERT_RE.match(global_name)
+    if grouped is not None:
+        experts_prefix, fc, local_expert_text = grouped.groups()
+        global_expert = _global_expert_id(int(local_expert_text), config=config, ps=ps)
+        ep = f"{experts_prefix}.{global_expert}"
+        if fc == "1":
+            gate, up = tensor.chunk(2, dim=0)
+            return [
+                (f"{ep}.gate_proj.weight", gate.contiguous()),
+                (f"{ep}.up_proj.weight", up.contiguous()),
+            ]
+        return [(f"{ep}.down_proj.weight", tensor)]
+
+    hf_name = _to_hf_state_name(name, config=config, model=model, ps=ps)
+    if hf_name is None:
+        return []
+    return [(hf_name, tensor)]
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     config: Glm5Config,
@@ -278,18 +439,21 @@ def export_hf_weights(
     if rank0_only and _rank0() != 0:
         return
 
+    def _cast(t: torch.Tensor) -> torch.Tensor:
+        t = t.detach().cpu().contiguous()
+        if export_dtype is not None and t.is_floating_point():
+            t = t.to(dtype=export_dtype)
+        return t
+
     chunks = model if isinstance(model, list) else [model]
     for chunk in chunks:
         base_model = unwrap_model(chunk)
         state = base_model.state_dict()
         for name, tensor in state.items():
-            hf_name = _to_hf_state_name(name, config=config, model=base_model, ps=ps)
-            if hf_name is None:
-                continue
-            exported = tensor.detach().cpu().contiguous()
-            if export_dtype is not None and exported.is_floating_point():
-                exported = exported.to(dtype=export_dtype)
-            yield hf_name, exported
+            for hf_name, hf_tensor in _native_to_hf_pairs(
+                name, tensor, config=config, model=base_model, ps=ps
+            ):
+                yield hf_name, _cast(hf_tensor)
 
 
 def save_hf_weights(

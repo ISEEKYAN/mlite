@@ -1,12 +1,26 @@
-"""Native GLM-5 model assembled from Megatron Lite primitives."""
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Native GLM-5 (deepseek_v3_2) model.
+
+Structurally a Kimi-K2 / DeepSeek-V3 decoder that reuses the SAME shared MoE
+primitives (``Experts``, sigmoid-topk router with aux load-balancing loss,
+``TokenDispatcher``, ``MoEAuxLossAutoScaler``).  The only architectural
+difference from Kimi is the attention module: GLM-5 swaps MLA for the
+Dynamic Sparse Attention (DSA) primitive ``DynamicSparseAttention`` (+ indexer).
+
+DSA is a model-agnostic primitive operating on batch-first ``[B, S, H]`` tensors
+with explicit ``cos``/``sin``/``position_ids`` and plain (non-TP) linears, so the
+model keeps the DeepSeek-V4 family's batch-first layout rather than Kimi's
+sequence-parallel SBHD layout (see report for the SBHD/BSHD rationale).  Expert
+compute, routing and dispatch are nonetheless the shared Kimi primitives.
+"""
 
 from __future__ import annotations
 
-import math
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -16,243 +30,157 @@ from megatron.lite.primitive.modules.attention import (
     RMSNorm,
     build_rotary_embeddings,
 )
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.mlp import SwiGLUMLP
+from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
+from megatron.lite.primitive.modules.router import (
+    SigmoidTopKRouter,
+    _ordered_topk_from_routing_map,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils.moe import (
+    compute_routing_scores_for_aux_loss,
+    switch_load_balancing_loss_func,
+    topk_routing_with_score_function,
+)
 
 
-class Glm5MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+class Glm5SigmoidTopKRouter(SigmoidTopKRouter):
+    """GLM-5 sigmoid router.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    Structurally the shared ``SigmoidTopKRouter`` (sigmoid scoring + expert-bias
+    bias-correction + per-token norm + ``routed_scaling_factor`` + aux
+    load-balancing loss via ``MoEAuxLossAutoScaler`` + tp-gated all-reduce of
+    token counts).  Mirrors Kimi's ``KimiK2SigmoidTopKRouter`` but additionally
+    threads GLM-5's group-limited routing config (``n_group``/``topk_group``)
+    into the shared ``topk_routing_with_score_function``.
 
+    GLM-5's config drives ``num_experts_per_tok`` / ``routed_scaling_factor`` /
+    ``n_group`` / ``topk_group``.  GLM-5 has no ``scoring_func`` /
+    ``aux_loss_alpha`` HF fields, so sigmoid scoring and a zero aux coefficient
+    are used by default (aux loss therefore contributes 0, matching the old
+    no-aux behaviour, while keeping the kimi structure available).
+    """
 
-class Glm5RoutedExperts(nn.Module):
-    def __init__(
-        self,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        ps: ParallelState | None = None,
-    ):
-        super().__init__()
-        ps = ps or ParallelState()
-        self.num_global_experts = num_experts
-        self.num_experts = ensure_divisible(num_experts, ps.ep_size)
-        self.local_start = ps.ep_rank * self.num_experts
-        self.intermediate_size = intermediate_size
-        self.hidden_size = hidden_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * intermediate_size, hidden_size)
-        )
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, hidden_size, intermediate_size))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.gate_up_proj, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.down_proj, a=math.sqrt(5))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
-        permuted_probs: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if hidden_states.size(0) == 0:
-            output = hidden_states.reshape(0, self.hidden_size)
-            if permuted_probs is not None:
-                output = output + permuted_probs.sum().to(output.dtype) * 0.0
-            return output
-
-        output = hidden_states.new_empty(hidden_states.size(0), self.hidden_size)
-        offset = 0
-        for expert_idx, count in enumerate(tokens_per_expert.tolist()):
-            if count == 0:
-                continue
-            end = offset + count
-            expert_input = hidden_states[offset:end]
-            gate_up = F.linear(expert_input, self.gate_up_proj[expert_idx])
-            gate_proj, up_proj = gate_up.chunk(2, dim=-1)
-            expert_hidden = F.silu(gate_proj) * up_proj
-            expert_out = F.linear(expert_hidden, self.down_proj[expert_idx])
-            if permuted_probs is not None:
-                expert_out = expert_out * permuted_probs[offset:end].unsqueeze(-1)
-            output[offset:end] = expert_out.to(hidden_states.dtype)
-            offset = end
-        return output
-
-    def forward_topk(
-        self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor
-    ) -> torch.Tensor:
-        num_topk = topk_indices.size(-1)
-        num_tokens = hidden_states.size(0)
-        hidden_dim = hidden_states.size(-1)
-
-        token_idx = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            .unsqueeze(1)
-            .expand(-1, num_topk)
-            .reshape(-1)
-        )
-        sample_weights = topk_weights.reshape(-1)
-        expert_ids = topk_indices.reshape(-1)
-        invalid_mask = expert_ids >= self.num_experts
-        expert_ids = expert_ids.clamp(0, self.num_experts - 1)
-        selected_hidden = hidden_states[token_idx]
-
-        selected_gate_up = self.gate_up_proj[expert_ids]
-        gate_up = torch.bmm(selected_gate_up, selected_hidden.unsqueeze(-1)).squeeze(-1)
-        gate_proj, up_proj = gate_up.chunk(2, dim=-1)
-        expert_hidden = F.silu(gate_proj) * up_proj
-
-        selected_down = self.down_proj[expert_ids]
-        expert_out = torch.bmm(selected_down, expert_hidden.unsqueeze(-1)).squeeze(-1)
-        weighted = expert_out * sample_weights.unsqueeze(-1)
-        weighted.masked_fill_(invalid_mask.unsqueeze(-1), 0.0)
-        return weighted.view(num_tokens, num_topk, hidden_dim).sum(dim=1).to(hidden_states.dtype)
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        for expert_idx in range(self.num_experts):
-            gate_proj = self.gate_up_proj[expert_idx, : self.intermediate_size]
-            up_proj = self.gate_up_proj[expert_idx, self.intermediate_size :]
-            down_proj = self.down_proj[expert_idx]
-            if not keep_vars:
-                gate_proj = gate_proj.detach()
-                up_proj = up_proj.detach()
-                down_proj = down_proj.detach()
-            expert_prefix = f"{prefix}{expert_idx}."
-            destination[expert_prefix + "gate_proj.weight"] = gate_proj
-            destination[expert_prefix + "up_proj.weight"] = up_proj
-            destination[expert_prefix + "down_proj.weight"] = down_proj
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-    ) -> None:
-        del local_metadata
-
-        def _copy(key: str, target: torch.Tensor) -> bool:
-            tensor = state_dict.get(key)
-            if tensor is None:
-                if strict:
-                    missing_keys.append(key)
-                return False
-            if tensor.shape != target.shape:
-                error_msgs.append(
-                    f"size mismatch for {key}: copying a param with shape {tuple(tensor.shape)} "
-                    f"from checkpoint, the shape in current model is {tuple(target.shape)}."
-                )
-                return False
-            with torch.no_grad():
-                target.copy_(tensor)
-            return True
-
-        gate_up_key = prefix + "gate_up_proj"
-        if gate_up_key in state_dict:
-            _copy(gate_up_key, self.gate_up_proj)
-        else:
-            for expert_idx in range(self.num_experts):
-                expert_prefix = f"{prefix}{expert_idx}."
-                _copy(
-                    expert_prefix + "gate_proj.weight",
-                    self.gate_up_proj[expert_idx, : self.intermediate_size],
-                )
-                _copy(
-                    expert_prefix + "up_proj.weight",
-                    self.gate_up_proj[expert_idx, self.intermediate_size :],
-                )
-        down_key = prefix + "down_proj"
-        if down_key in state_dict:
-            _copy(down_key, self.down_proj)
-        else:
-            for expert_idx in range(self.num_experts):
-                _copy(f"{prefix}{expert_idx}.down_proj.weight", self.down_proj[expert_idx])
-
-
-class Glm5Router(nn.Module):
-    def __init__(self, config: Glm5Config):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
-        self.register_buffer(
-            "e_score_correction_bias", torch.zeros(config.n_routed_experts, dtype=torch.float32)
-        )
-        self.topk = config.num_experts_per_tok
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.route_scale = config.routed_scaling_factor
-        self.norm_topk_prob = config.norm_topk_prob
+    def __init__(self, config: Glm5Config, ps: ParallelState, *, compute_aux_loss: bool = True):
+        # The shared router reads num_experts_per_tok / n_routed_experts /
+        # routed_scaling_factor / scoring_func / aux_loss_alpha from the config.
+        super().__init__(config, ps, compute_aux_loss=compute_aux_loss)
+        # GLM-5 ships a persistent sigmoid bias-correction term
+        # (HF `mlp.gate.e_score_correction_bias`).  The shared router registers
+        # `expert_bias` as non-persistent; make it persistent so it round-trips
+        # through load_hf / save_hf.
+        self._non_persistent_buffers_set.discard("expert_bias")
+        n_group = getattr(config, "n_group", None)
+        topk_group = getattr(config, "topk_group", None)
+        # Group-limited routing only when groups are actually used (>1).
+        self.num_groups = n_group if (n_group and n_group > 1) else None
+        self.group_topk = topk_group if self.num_groups is not None else None
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = F.linear(x.float(), self.weight.float()).sigmoid()
-        original_scores = scores
-        scores_for_choice = scores + self.e_score_correction_bias.to(scores.dtype)
+        logits = self.gate(x)
+        logits = logits.view(-1, self.num_experts)
+        num_tokens = logits.size(0)
+        routing_kwargs: dict = {}
+        if self.num_groups is not None and self.group_topk is not None:
+            routing_kwargs = dict(num_groups=self.num_groups, group_topk=self.group_topk)
+        probs_dense, routing_map = topk_routing_with_score_function(
+            logits,
+            self.topk,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias.to(logits.dtype),
+            scaling_factor=(self.scaling_factor or None),
+            fused=self.moe_router_fusion,
+            **routing_kwargs,
+        )
+        topk_scores, topk_indices = _ordered_topk_from_routing_map(
+            probs_dense, routing_map, self.topk
+        )
+        topk_scores = topk_scores.to(logits.dtype)
 
-        if self.n_group > 1:
-            grouped = scores_for_choice.view(x.size(0), self.n_group, -1)
-            group_scores = grouped.topk(2, dim=-1, sorted=False).values.sum(dim=-1)
-            group_idx = group_scores.topk(self.topk_group, dim=-1, sorted=False).indices
-            group_mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
-                1, group_idx, True
+        if self.compute_aux_loss and self.training and torch.is_grad_enabled():
+            _, aux_scores = compute_routing_scores_for_aux_loss(
+                logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
             )
-            scores_for_choice = scores_for_choice.masked_fill(
-                ~group_mask.unsqueeze(-1).expand_as(grouped).flatten(1), 0.0
+            tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
+            total_num_tokens = num_tokens
+            if self._aux_loss_group is not None:
+                dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+            aux_loss = switch_load_balancing_loss_func(
+                aux_scores,
+                tokens_per_expert,
+                total_num_tokens,
+                self.topk,
+                self.num_experts,
+                self.aux_loss_coeff,
+                fused=False,
             )
+            topk_scores = MoEAuxLossAutoScaler.apply(topk_scores, aux_loss)
 
-        indices = scores_for_choice.topk(self.topk, dim=-1, sorted=False).indices
-        weights = original_scores.gather(1, indices)
-        if self.norm_topk_prob and self.topk > 1:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        return weights * self.route_scale, indices
+        return topk_scores, topk_indices
 
 
 class Glm5MoE(nn.Module):
+    """MoE assembly mirroring Kimi's MoELayer: router -> dispatcher -> shared
+    Experts -> combine, plus a shared expert.
+
+    Reuses the shared ``Experts`` / ``TokenDispatcher`` / ``SigmoidTopKRouter``
+    primitives (no hand-rolled per-expert Python loop, no reinvented router).
+    """
+
     def __init__(
-        self, config: Glm5Config, ps: ParallelState | None = None, *, use_deepep: bool = False
+        self, config: Glm5Config, ps: ParallelState, *, use_deepep: bool = False
     ):
         super().__init__()
-        ps = ps or ParallelState()
         self.hidden_size = config.hidden_size
-        self.gate = Glm5Router(config)
-        self.dispatcher = None
-        if ps.ep_size > 1:
-            from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-
-            self.dispatcher = TokenDispatcher(
-                config.n_routed_experts,
-                config.hidden_size,
-                ps,
-                use_deepep=use_deepep,
-            )
-        self.experts = Glm5RoutedExperts(
-            config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, ps
+        self.gate = Glm5SigmoidTopKRouter(config, ps, compute_aux_loss=True)
+        self.experts = Experts(config, ps)
+        self.dispatcher = TokenDispatcher(
+            config.n_routed_experts,
+            config.hidden_size,
+            ps,
+            use_deepep=use_deepep,
         )
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
-            Glm5MLP(config.hidden_size, shared_intermediate)
+            SwiGLUMLP(config.hidden_size, shared_intermediate)
             if config.n_shared_experts > 0
             else None
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
-        residual = x
         x_flat = x.reshape(-1, self.hidden_size)
-        weights, indices = self.gate(x_flat)
-        if self.dispatcher is None:
-            y = self.experts.forward_topk(x_flat, indices, weights).view(shape)
-        else:
-            dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_flat, weights, indices)
-            self.dispatcher.wait_dispatch_event()
-            expert_out = self.experts(dispatched, tpe, permuted_probs)
-            y = self.dispatcher.combine(expert_out).view(shape)
+        scores, indices = self.gate(x_flat)
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_flat, scores, indices)
+        del scores, indices
+        self.dispatcher.wait_dispatch_event()
+        expert_out = self.experts(
+            dispatched,
+            tpe,
+            permuted_probs,
+            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+        )
+        out = self.dispatcher.combine(expert_out)
         if self.shared_experts is not None:
-            y = y + self.shared_experts(residual)
-        return y
+            out = out + self.shared_experts(x_flat)
+        return out.view(shape).to(x.dtype)
+
+
+class Glm5MLP(SwiGLUMLP):
+    """Dense MLP, reusing the shared SwiGLU primitive.
+
+    ``gate_up`` is the fused gate+up projection (HF ``gate_proj``/``up_proj`` are
+    concatenated by the checkpoint loader / split on export); ``down`` is the
+    output projection.
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__(hidden_size, intermediate_size)
 
 
 class Glm5Layer(nn.Module):
@@ -266,6 +194,7 @@ class Glm5Layer(nn.Module):
     ):
         super().__init__()
         ps = ps or ParallelState()
+        self.layer_idx = layer_idx
         self.self_attn = DynamicSparseAttention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -291,11 +220,10 @@ class Glm5Layer(nn.Module):
             cp_rank=ps.cp_rank,
             cp_group=ps.cp_group,
         )
-        self.mlp = (
-            Glm5MoE(config, ps, use_deepep=use_deepep)
-            if config.is_moe_layer(layer_idx)
-            else Glm5MLP(config.hidden_size, config.intermediate_size)
-        )
+        if config.is_moe_layer(layer_idx):
+            self.mlp: nn.Module = Glm5MoE(config, ps, use_deepep=use_deepep)
+        else:
+            self.mlp = Glm5MLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -748,23 +676,23 @@ class Glm5ForCausalLM(nn.Module):
 
     @torch.no_grad()
     def initialize_weights(self) -> None:
+        std = self.config.initializer_range
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+                nn.init.normal_(module.weight, mean=0.0, std=std)
             elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            elif isinstance(module, RMSNorm | nn.LayerNorm):
-                (
-                    module.reset_parameters()
-                    if hasattr(module, "reset_parameters")
-                    else module.weight.fill_(1.0)
-                )
-            elif isinstance(module, Glm5Router):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-                module.e_score_correction_bias.zero_()
-            elif isinstance(module, Glm5RoutedExperts):
-                nn.init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
-                nn.init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+            elif isinstance(module, nn.LayerNorm):
+                module.reset_parameters()
+            elif isinstance(module, Experts):
+                for param in module.parameters():
+                    nn.init.normal_(param, mean=0.0, std=std)
+            elif isinstance(module, Glm5SigmoidTopKRouter):
+                nn.init.normal_(module.gate.weight, mean=0.0, std=std)
+                if module.expert_bias is not None:
+                    module.expert_bias.zero_()
+            elif hasattr(module, "reset_parameters") and isinstance(module, RMSNorm):
+                module.reset_parameters()
 
 
 __all__ = [
@@ -775,6 +703,5 @@ __all__ = [
     "Glm5MTPLayer",
     "Glm5MoE",
     "Glm5Model",
-    "Glm5Router",
-    "Glm5RoutedExperts",
+    "Glm5SigmoidTopKRouter",
 ]

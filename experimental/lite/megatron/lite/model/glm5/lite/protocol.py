@@ -30,15 +30,22 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec, wrap_checkpoint
+from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
+
+def _is_moe(layer) -> bool:
+    return hasattr(getattr(layer, "mlp", None), "dispatcher")
+
+
 MODULE_MAP = {
     "self_attn": lambda layer: layer.self_attn,
-    "mlp": lambda layer: layer.mlp,
-    "moe": lambda layer: layer.mlp if hasattr(layer.mlp, "dispatcher") else None,
+    "core_attn": lambda layer: layer.self_attn,
+    "moe": lambda layer: layer.mlp if _is_moe(layer) else None,
+    "mlp": lambda layer: None if _is_moe(layer) else getattr(layer, "mlp", None),
     "experts": lambda layer: getattr(getattr(layer, "mlp", None), "experts", None),
+    "router": lambda layer: getattr(getattr(layer, "mlp", None), "gate", None),
     "shared_experts": lambda layer: getattr(getattr(layer, "mlp", None), "shared_experts", None),
 }
 
@@ -86,34 +93,23 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
 
-def _apply_glm5_recompute(
-    layers: nn.ModuleList, recompute_spec: list[str], ps: ParallelState
-) -> None:
-    if not recompute_spec:
-        return
-    if "full" not in recompute_spec or ps.ep_size <= 1:
-        apply_recompute(layers, recompute_spec, MODULE_MAP)
-        return
+def _make_aux_loss_hook():
+    from megatron.lite.primitive.modules.attention.dsa import DSAIndexerLossAutoScaler
+    from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
-    for layer in layers:
-        wrap_checkpoint(layer, preserve_rng_state=True)
+    def hook(scale: torch.Tensor) -> None:
+        MoEAuxLossAutoScaler.set_loss_scale(scale)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale)
 
-    remaining = [name for name in recompute_spec if name != "full"]
-    if remaining:
-        apply_recompute(layers, remaining, MODULE_MAP)
+    return hook
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
     etp = 1 if p.etp is None else p.etp
-    if (p.tp, etp) != (1, 1):
-        raise NotImplementedError(
-            "GLM5 native lite currently supports TP=ETP=1. "
-            "EP/PP/CP/VPP are wired through existing Megatron Lite primitives."
-        )
-    if p.ep < 1 or p.pp < 1 or p.cp < 1 or p.vpp < 1:
+    if p.ep < 1 or p.pp < 1 or p.cp < 1 or p.vpp < 1 or p.tp < 1 or etp < 1:
         raise ValueError(
-            "ParallelConfig ep/pp/cp/vpp must be >= 1, "
-            f"got ep={p.ep}, pp={p.pp}, cp={p.cp}, vpp={p.vpp}."
+            "ParallelConfig tp/etp/ep/pp/cp/vpp must be >= 1, "
+            f"got tp={p.tp}, etp={etp}, ep={p.ep}, pp={p.pp}, cp={p.cp}, vpp={p.vpp}."
         )
 
 
@@ -155,8 +151,9 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             for i in range(vpp)
         ]
 
-    for chunk in chunks:
-        _apply_glm5_recompute(chunk.model.layers, recompute_spec, ps)
+    if recompute_spec:
+        for chunk in chunks:
+            apply_recompute(chunk.model.layers, recompute_spec, MODULE_MAP)
 
     if impl_cfg.offload:
         from megatron.lite.primitive.recompute import apply_offload
@@ -208,6 +205,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             "model_cfg": model_cfg,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
+            "pre_forward_hook": _make_aux_loss_hook(),
         },
     )
 
