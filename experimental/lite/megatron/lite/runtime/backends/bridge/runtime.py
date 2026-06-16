@@ -593,10 +593,24 @@ def _packed_batch_to_dense_inputs(batch: PackedBatch) -> dict[str, Any]:
     on the same tokens, so the mlite-vs-mbridge comparison stays fair. CP=1 only.
     """
     seq_lens = batch.seq_lens.to(torch.int32)
+    if seq_lens.numel() != 1:
+        raise NotImplementedError(
+            "Dense bridge forward supports a single packed sequence; "
+            f"got {seq_lens.numel()} sequences."
+        )
     device = seq_lens.device
     total = int(seq_lens.sum().item())
     input_ids = batch.input_ids.reshape(1, total).contiguous()
-    labels = batch.labels.reshape(1, total).contiguous() if batch.labels is not None else None
+    labels = None
+    if batch.labels is not None:
+        # Match the native THD path (thd.pack_nested_thd roll_labels): shift
+        # labels one position left for next-token loss, last label = 0. Without
+        # this the dense reference scores different targets than the THD backend
+        # and the cross-backend loss comparison is unfair.
+        labels = batch.labels.reshape(1, total).contiguous()
+        if total > 0:
+            labels = torch.roll(labels, shifts=-1, dims=1)
+            labels[:, total - 1] = 0
     attention_mask = torch.ones((1, total), dtype=torch.long, device=device)
     position_ids = (
         torch.arange(total, device=device).view(1, 1, -1).expand(3, 1, total).contiguous()
@@ -608,7 +622,11 @@ def _packed_batch_to_dense_inputs(batch: PackedBatch) -> dict[str, Any]:
         "position_ids": position_ids,
     }
     if batch.loss_mask is not None:
-        sample["loss_mask"] = batch.loss_mask.reshape(1, total).contiguous()
+        loss_mask = batch.loss_mask.reshape(1, total).contiguous()
+        if total > 0:
+            loss_mask = torch.roll(loss_mask, shifts=-1, dims=1)
+            loss_mask[:, total - 1] = 0
+        sample["loss_mask"] = loss_mask
     return sample
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
 
