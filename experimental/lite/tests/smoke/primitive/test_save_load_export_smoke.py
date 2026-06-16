@@ -564,14 +564,10 @@ def _offload_topology(model_name: str) -> ParallelConfig:
     if forced:
         tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
         return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
-    if model_name == "deepseek_v4":
-        # DS4's mHC pipeline does not yet support CP>1: the hc_mult-folded hidden
-        # is sent full-seq while the CP-divided recv buffer expects seq/cp, so the
-        # pipeline P2P size-mismatches (independent of offload; tracked separately).
-        # offload's CPU<->GPU param/optstate roundtrip is CP-orthogonal, so DS4 is
-        # validated at cp1 — its proven pipeline topology.
-        return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=1)
-    if model_name in _TP1_ONLY:
+    # proxy2 = 8-GPU pp2/ep2/cp2.  CSA/DSA (glm5, ds4) are TP=1 only, so they
+    # fill 8 ranks with dp2 (tp1·cp2·pp2·dp2=8); TP-capable MoE models use tp2
+    # (tp2·cp2·pp2·dp1=8).
+    if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
 
