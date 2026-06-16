@@ -509,13 +509,15 @@ def _run_pipeline_chunk_forward(
     num_microbatches: int,
     pre_forward_hook=None,
     loss_fn=None,
+    loss_context=None,
 ) -> dict:
     _set_aux_loss_scale(pre_forward_hook, num_microbatches)
     if not is_first_stage:
         model.set_input_tensor(input_tensor)
-    out = forward_step_fn(model, batch)
-    if is_last_stage:
-        _apply_external_loss(out, batch, loss_fn)
+    with use_loss_context(loss_context):
+        out = forward_step_fn(model, batch)
+        if is_last_stage:
+            _apply_external_loss(out, batch, loss_fn, loss_context)
     return out
 
 
@@ -536,7 +538,10 @@ def _forward_only_pipeline_schedule(
     outputs: list[dict] = []
 
     for _mb in range(num_microbatches):
-        batch = next(data_iter)
+        # Split (PackedBatch, LossContext) like 1F1B/run_microbatch_loop so the
+        # forward sees the unwrapped batch and log-prob inference applies the
+        # loss context (temperature / return_log_probs / loss scale).
+        batch, loss_context = split_loss_context(next(data_iter))
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         pending_activation: torch.Tensor | None = None
         last_output: dict | None = None
@@ -562,6 +567,7 @@ def _forward_only_pipeline_schedule(
                     num_microbatches=num_microbatches,
                     pre_forward_hook=None,
                     loss_fn=loss_fn,
+                    loss_context=loss_context,
                 )
                 if is_last_stage:
                     last_output = out
