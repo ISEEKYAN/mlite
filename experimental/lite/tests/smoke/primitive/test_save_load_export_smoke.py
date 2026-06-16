@@ -524,7 +524,7 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
     path: a dist_opt model whose TP/EP/PP shards are gathered to full HF
     tensors. NOTE: exporting directly from a live fsdp2 (DTensor-sharded) model
     is NOT covered here — save_hf_weights' gather is not DTensor-aware and
-    deadlocks; tracked as a known gap (see TASK-2.16.9 log / K-note).
+    deadlocks; tracked as a known gap.
     """
     if dist.get_world_size() != 8:
         pytest.skip("export proxy smoke requires exactly 8 GPUs.")
