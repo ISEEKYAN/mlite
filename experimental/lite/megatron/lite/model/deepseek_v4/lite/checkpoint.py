@@ -27,13 +27,17 @@ _BLOCK_KEY_RE = re.compile(r"^model\.(layers|mtp)\.(\d+)\.(.+)$")
 _GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.fc([12])\.weight(\d+)$")
 _PROJ_TO_HF = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
+# Native top-level param names changed when the model was re-skeletoned on the
+# Kimi clone: the embedding is now a VocabParallelEmbedding
+# (``embed_tokens.embedding.weight``) and the head a VocabParallelOutput
+# (``lm_head.col.linear.weight``).  The HF target names are unchanged.
 _TOP_LEVEL = {
-    "model.embed_tokens.weight": "embed.weight",
+    "model.embed_tokens.embedding.weight": "embed.weight",
     "model.norm.weight": "norm.weight",
     "model.hc_head.hc_fn": "hc_head_fn",
     "model.hc_head.hc_base": "hc_head_base",
     "model.hc_head.hc_scale": "hc_head_scale",
-    "lm_head.weight": "head.weight",
+    "lm_head.col.linear.weight": "head.weight",
 }
 
 
@@ -197,6 +201,11 @@ def _hf_names_for_state_key(name: str, config: DeepseekV4Config, ps: ParallelSta
         return []
     block, index, attr = match.groups()
     prefix = f"layers.{index}" if block == "layers" else f"mtp.{index}"
+    # The Kimi-derived model wraps CSA in a ``DeepseekV4CSAAttention`` shim, so
+    # the native CSA params now live under ``self_attn.self_attn.*`` (one extra
+    # ``self_attn`` level).  Collapse it so the HF attention names are unchanged.
+    if attr.startswith("self_attn.self_attn."):
+        attr = "self_attn." + attr.removeprefix("self_attn.self_attn.")
     if attr.startswith("self_attn.compressor."):
         return [f"{prefix}.attn.compressor.{attr.removeprefix('self_attn.compressor.')}"]
     if attr.startswith("self_attn.indexer."):

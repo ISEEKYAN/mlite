@@ -62,10 +62,12 @@ MODULE_MAP = {
     "ffn_norm": lambda layer: layer.post_attention_layernorm,
 }
 
+# The Kimi-derived model has no ``attention_mask`` arg (CSA derives its causal /
+# sliding-window masking from ``position_ids``, as the previous DS4 did with
+# attention_mask=None); keep it out of the forward whitelist.
 _MODEL_FORWARD_KEYS = (
     "input_ids",
     "position_ids",
-    "attention_mask",
     "labels",
     "loss_mask",
     "temperature",
@@ -299,13 +301,34 @@ def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
     return [*layers, *mtp_layers]
 
 
+def _validate_parallel_scope(p: ParallelConfig) -> None:
+    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
+
+    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
+    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
+    """
+    etp = 1 if p.etp is None else p.etp
+    if p.tp > 1:
+        raise NotImplementedError(
+            "DeepSeek V4 native CSA attention does not support tensor parallelism; "
+            f"got tp={p.tp}. Use tp=1 (PP/VPP/EP/CP are supported)."
+        )
+    if etp > 1:
+        raise NotImplementedError(
+            "DeepSeek V4 native CSA attention does not support expert tensor parallelism; "
+            f"got etp={etp}. Use etp=1 (EP is supported)."
+        )
+
+
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4ForCausalLM
 
-    _ = impl_cfg.use_thd
-    _apply_mtp_config(model_cfg, impl_cfg)
-    ps = init_parallel(impl_cfg.parallel)
     p = impl_cfg.parallel
+    _validate_parallel_scope(p)
+    _apply_mtp_config(model_cfg, impl_cfg)
+    mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
+    mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
+    ps = init_parallel(impl_cfg.parallel)
     vpp = None if p.vpp == 1 else p.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
@@ -327,6 +350,12 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 vpp=vpp,
                 vpp_chunk_id=i,
                 use_deepep=impl_cfg.use_deepep,
+                use_thd=impl_cfg.use_thd,
+                hf_path=impl_cfg.hf_path,
+                attention_backend_override=impl_cfg.attention_backend_override,
+                mtp_enable=mtp_enable,
+                mtp_enable_train=mtp_enable_train,
+                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
             )
             .to(torch.bfloat16)
             .cuda()
