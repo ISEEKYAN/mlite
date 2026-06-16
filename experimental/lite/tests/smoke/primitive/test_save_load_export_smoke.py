@@ -242,12 +242,23 @@ def _single_node_cuda_dist():
     os.environ.setdefault("MASTER_PORT", "29555")
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+    # Diagnostic: dump all thread stacks and force-exit after N seconds so a
+    # hang self-reports fast (keeps each run well under the time budget) instead
+    # of stalling on NCCL's slow watchdog/abort. Opt-in via MLITE_HANG_DUMP_S.
+    hang_dump_s = os.environ.get("MLITE_HANG_DUMP_S")
+    if hang_dump_s:
+        import faulthandler
+
+        faulthandler.dump_traceback_later(int(hang_dump_s), exit=True)
+
     created_pg = False
     if not dist.is_initialized():
         # Short timeout so a desynced collective fails fast instead of stalling
         # the whole job on the multi-minute NCCL watchdog default.
+        timeout_s = int(os.environ.get("MLITE_DIST_TIMEOUT_S", "180"))
         dist.init_process_group(
-            backend="nccl", init_method="env://", timeout=timedelta(seconds=180)
+            backend="nccl", init_method="env://", timeout=timedelta(seconds=timeout_s)
         )
         created_pg = True
     yield
