@@ -252,10 +252,10 @@ class DSAIndexer(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project GLM5 indexer inputs for Megatron's fused DSA kernels."""
+        """Project DeepSeek-V3.2 indexer inputs for Megatron's fused DSA kernels."""
         if attention_mask is not None:
             raise NotImplementedError(
-                "GLM5 fused DSA indexer only supports causal masking; custom "
+                "DeepSeek-V3.2 fused DSA indexer only supports causal masking; custom "
                 "attention_mask is not supported."
             )
         batch, seq_len, _ = x.shape
@@ -418,7 +418,7 @@ class DynamicSparseAttention(nn.Module):
     ) -> torch.Tensor:
         if attention_mask is not None:
             raise NotImplementedError(
-                "GLM5 fused DSA only supports causal masking; custom attention_mask "
+                "DeepSeek-V3.2 fused DSA only supports causal masking; custom attention_mask "
                 "is not supported."
             )
         if packed_seq_params is not None:
@@ -460,7 +460,7 @@ class DynamicSparseAttention(nn.Module):
             position_ids = position_ids.unsqueeze(0)
         if position_ids.shape[-1] != x.shape[1]:
             raise ValueError(
-                "GLM5 packed DynamicSparseAttention position_ids must cover the reconstructed packed tokens, "
+                "DeepSeek-V3.2 packed DynamicSparseAttention position_ids must cover the reconstructed packed tokens, "
                 f"got {tuple(position_ids.shape)} for packed length {x.shape[1]}."
             )
         pieces = []
@@ -586,7 +586,7 @@ class DynamicSparseAttention(nn.Module):
             expected = (full_seq, full_seq)
             if tuple(attention_mask.shape[-2:]) != expected:
                 raise NotImplementedError(
-                    "GLM5 DynamicSparseAttention CP attention_mask must already cover the reconstructed "
+                    "DeepSeek-V3.2 DynamicSparseAttention CP attention_mask must already cover the reconstructed "
                     f"full sequence {expected}, got {tuple(attention_mask.shape)}."
                 )
         return full_x, full_position_ids, attention_mask
@@ -608,7 +608,7 @@ class DynamicSparseAttention(nn.Module):
             return position_ids.to(device=device, dtype=torch.long)
         if position_ids.shape[-1] != local_seq:
             raise ValueError(
-                "GLM5 DynamicSparseAttention CP position_ids must be either local or full sequence length, "
+                "DeepSeek-V3.2 DynamicSparseAttention CP position_ids must be either local or full sequence length, "
                 f"got {tuple(position_ids.shape)} for local_seq={local_seq}, full_seq={full_seq}."
             )
 
@@ -637,7 +637,7 @@ class DynamicSparseAttention(nn.Module):
             return full_x, position_ids
         if position_ids.shape[-1] != local_seq:
             raise ValueError(
-                "GLM5 packed DynamicSparseAttention CP position_ids must be either local or full packed length, "
+                "DeepSeek-V3.2 packed DynamicSparseAttention CP position_ids must be either local or full packed length, "
                 f"got {tuple(position_ids.shape)} for local_seq={local_seq}, full_seq={full_seq}."
             )
         pos_parts = _all_gather_cp(position_ids, cp_size=self.cp_size, cp_group=self.cp_group)
@@ -671,7 +671,9 @@ class DynamicSparseAttention(nn.Module):
         if cu_seqlens is None:
             cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
         if cu_seqlens is None:
-            raise ValueError("GLM5 packed DynamicSparseAttention requires packed cu_seqlens.")
+            raise ValueError(
+                "DeepSeek-V3.2 packed DynamicSparseAttention requires packed cu_seqlens."
+            )
         return cu_seqlens.to(device=device, dtype=torch.int32)
 
     @staticmethod

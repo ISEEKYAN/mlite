@@ -1,5 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Kimi K2 lite impl - native model protocol for Megatron Lite runtime."""
+"""DeepSeek-V3.2 (deepseek_v3_2) lite native model protocol for Megatron Lite runtime.
+
+Cloned from ``megatron/lite/model/deepseek_v3/lite/protocol.py`` (deepseek_v3) and
+renamed DeepseekV3 -> DeepseekV32.  The build / optimizer / checkpoint plumbing is
+identical to DeepSeek-V3; the only adaptations are:
+  * the config type (``DeepseekV32Config``),
+  * the DSA indexer-loss pre-forward hook (``DSAIndexerLossAutoScaler`` in
+    addition to the MoE aux-loss scaler),
+  * the attention ``MODULE_MAP`` entries point at the DSA ``self_attention``
+    instead of MLA, and
+  * a ``_validate_parallel_scope`` gate: DeepSeek-V3.2's DSA attention is NOT
+    tensor-parallel-capable, so TP>1 / ETP>1 raise ``NotImplementedError``.
+    PP / VPP / EP / CP all work (inherited from DeepSeek-V3).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +23,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
@@ -30,7 +43,7 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    from megatron.lite.model.kimi_k2.lite.checkpoint import PLACEMENT_FN as placement_fn
+    from megatron.lite.model.deepseek_v3_2.lite.checkpoint import PLACEMENT_FN as placement_fn
 
     return placement_fn(param_name)
 
@@ -55,15 +68,18 @@ def _moe_module(name: str):
     return getter
 
 
+# DeepSeek-V3.2 ONLY: attention entries point at the DSA wrapper / module instead of
+# DeepSeek-V3's MLA.  Everything else mirrors DeepSeek-V3's MODULE_MAP.
 MODULE_MAP = {
-    "core_attn": lambda layer: layer.self_attention.core_attn,
+    "core_attn": lambda layer: layer.self_attention.self_attention,
     "experts": _moe_module("experts"),
     "moe": _maybe("moe"),
     "router": _moe_module("router"),
     "mlp": _maybe("mlp"),
     "mlp_norm": lambda layer: layer.mlp_norm,
-    "attn_proj": lambda layer: layer.self_attention.linear_proj,
-    "mla": lambda layer: layer.self_attention,
+    "attn_proj": lambda layer: layer.self_attention.self_attention.o_proj,
+    "self_attn": lambda layer: layer.self_attention,
+    "dsa": lambda layer: layer.self_attention.self_attention,
 }
 
 
@@ -89,11 +105,11 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
 
 
-def build_model_config(source: str | Path | dict, **overrides) -> KimiK2Config:
+def build_model_config(source: str | Path | dict, **overrides) -> DeepseekV32Config:
     if isinstance(source, dict):
-        cfg = KimiK2Config._from_hf_dict(source)
+        cfg = DeepseekV32Config._from_hf_dict(source)
     else:
-        cfg = KimiK2Config.from_hf(str(source))
+        cfg = DeepseekV32Config.from_hf(str(source))
     for key, value in overrides.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
@@ -112,18 +128,40 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
 
 
 def _make_aux_loss_hook():
+    # DeepSeek-V3.2 ONLY: also scale the DSA indexer auxiliary loss (DeepSeek-V3 has no indexer).
+    from megatron.lite.primitive.modules.attention.dsa import DSAIndexerLossAutoScaler
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
         MoEAuxLossAutoScaler.set_loss_scale(scale)
         MTPLossAutoScaler.set_loss_scale(scale)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale)
 
     return hook
 
 
+def _validate_parallel_scope(p: ParallelConfig) -> None:
+    """DeepSeek-V3.2 DSA attention is not tensor-parallel-capable (documented TP=1 case).
+
+    PP / VPP / EP / CP are inherited from the DeepSeek-V3 skeleton and work; only
+    TP>1 / ETP>1 are unsupported.
+    """
+    etp = 1 if p.etp is None else p.etp
+    if p.tp > 1:
+        raise NotImplementedError(
+            "DeepSeek-V3.2 native DSA attention does not support tensor parallelism; "
+            f"got tp={p.tp}. Use tp=1 (PP/VPP/EP/CP are supported)."
+        )
+    if etp > 1:
+        raise NotImplementedError(
+            "DeepSeek-V3.2 native DSA attention does not support expert tensor parallelism; "
+            f"got etp={etp}. Use etp=1 (EP is supported)."
+        )
+
+
 def _build_dist_opt_optimizer(
-    chunks, model_cfg: KimiK2Config, impl_cfg: ImplConfig, ps: ParallelState
+    chunks, model_cfg: DeepseekV32Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
     from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
 
@@ -132,17 +170,19 @@ def _build_dist_opt_optimizer(
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
         ps=ps,
-        model_name="kimi_k2",
+        model_name="deepseek_v3_2",
         is_expert=is_expert_param,
         deterministic=impl_cfg.deterministic,
     )
 
 
-def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+def build_model(model_cfg: DeepseekV32Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
+    _validate_parallel_scope(p)
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
     if impl_cfg.router_aux_loss_coef is not None:
+        # DeepSeek-V3.2 has no aux_loss_alpha HF field; honour an explicit override only.
         model_cfg.aux_loss_alpha = impl_cfg.router_aux_loss_coef
     mtp_enable = bool(impl_cfg.mtp_enable)
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
@@ -155,7 +195,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     elif hasattr(model_cfg, "num_nextn_predict_layers"):
         model_cfg.num_nextn_predict_layers = 0
 
-    from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
+    from megatron.lite.model.deepseek_v3_2.lite.model import DeepseekV32Model
 
     ps = init_parallel(p)
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
@@ -183,10 +223,12 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     )
 
     if vpp is None:
-        chunks = [KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            DeepseekV32Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()
+        ]
     else:
         chunks = [
-            KimiK2Model(
+            DeepseekV32Model(
                 model_cfg,
                 train_cfg,
                 ps,
@@ -227,7 +269,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
         optimizer_backend = "fsdp2"
 
         def _post_model_load_hook():
-            from megatron.lite.model.kimi_k2.lite.model import KimiK2Layer
+            from megatron.lite.model.deepseek_v3_2.lite.model import DeepseekV32Layer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
@@ -235,7 +277,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
                     chunks,
                     impl_cfg.optimizer_config,
                     ps,
-                    unit_modules=(KimiK2Layer,),
+                    unit_modules=(DeepseekV32Layer,),
                     expert_classifier=is_expert_param,
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
@@ -245,7 +287,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer is not None:
-        raise ValueError(f"Unknown kimi_k2 lite optimizer: {impl_cfg.optimizer!r}.")
+        raise ValueError(f"Unknown deepseek_v3_2 lite optimizer: {impl_cfg.optimizer!r}.")
 
     return ModelBundle(
         chunks=chunks,
@@ -263,19 +305,25 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
 
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: KimiK2Config, ps: ParallelState
+    chunk: nn.Module, hf_path: str, model_cfg: DeepseekV32Config, ps: ParallelState
 ) -> None:
     if not hf_path:
         return
-    from megatron.lite.model.kimi_k2.lite.checkpoint import load_hf_weights as load_impl
+    from megatron.lite.model.deepseek_v3_2.lite.checkpoint import load_hf_weights as load_impl
 
     load_impl(chunk, hf_path, model_cfg, ps)
 
 
-def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwargs):
-    from megatron.lite.model.kimi_k2.lite.checkpoint import export_hf_weights as export_impl
+def export_hf_weights(chunks, model_cfg: DeepseekV32Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.deepseek_v3_2.lite.checkpoint import export_hf_weights as export_impl
 
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_hf_weights(chunks, path: str, model_cfg: DeepseekV32Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.deepseek_v3_2.lite.checkpoint import save_hf_weights as save_impl
+
+    save_impl(chunks, path, model_cfg, ps, **kwargs)
 
 
 def vocab_size(model_cfg) -> int | None:
@@ -292,5 +340,6 @@ __all__ = [
     "export_hf_weights",
     "is_expert_param",
     "load_hf_weights",
+    "save_hf_weights",
     "vocab_size",
 ]

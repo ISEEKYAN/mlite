@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Kimi K2 lite native model."""
+"""DeepSeek-V3 lite native model."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
-from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.model.deepseek_v3.config import DeepseekV3Config
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -112,12 +112,12 @@ def _topk_routing_supports_groups() -> bool:
     return "num_groups" in params and "group_topk" in params
 
 
-class KimiK2SigmoidTopKRouter(nn.Module):
-    """Kimi K2 sigmoid router with group-limited routing and persistent expert bias."""
+class DeepseekV3SigmoidTopKRouter(nn.Module):
+    """DeepSeek-V3 sigmoid router with group-limited routing and persistent expert bias."""
 
     def __init__(
         self,
-        config: KimiK2Config,
+        config: DeepseekV3Config,
         ps: ParallelState,
         *,
         router_bias_rate: float = 0.0,
@@ -128,7 +128,7 @@ class KimiK2SigmoidTopKRouter(nn.Module):
         super().__init__()
         if router_bias_rate > 0:
             raise NotImplementedError(
-                "Kimi K2 expert-bias EMA update is not implemented in lite yet."
+                "DeepSeek-V3 expert-bias EMA update is not implemented in lite yet."
             )
         self.topk = config.num_experts_per_tok
         self.num_experts = config.n_routed_experts
@@ -213,7 +213,7 @@ class KimiK2SigmoidTopKRouter(nn.Module):
 
 
 class DenseMLP(nn.Module):
-    def __init__(self, config: KimiK2Config, ps: ParallelState):
+    def __init__(self, config: DeepseekV3Config, ps: ParallelState):
         super().__init__()
         self.gate_up = ColumnParallelLinear(
             config.hidden_size,
@@ -230,7 +230,7 @@ class DenseMLP(nn.Module):
 
 
 class SharedExpert(nn.Module):
-    def __init__(self, config: KimiK2Config, ps: ParallelState):
+    def __init__(self, config: DeepseekV3Config, ps: ParallelState):
         super().__init__()
         self.ps = ps
         ffn = config.shared_expert_intermediate_size
@@ -266,7 +266,7 @@ class _LocalLinear(nn.Module):
 class MoELayer(nn.Module):
     def __init__(
         self,
-        config: KimiK2Config,
+        config: DeepseekV3Config,
         ps: ParallelState,
         *,
         use_deepep: bool,
@@ -276,8 +276,8 @@ class MoELayer(nn.Module):
     ):
         super().__init__()
         if fp8:
-            raise NotImplementedError("Kimi K2 lite MoE fp8 training is not implemented yet.")
-        self.router = KimiK2SigmoidTopKRouter(
+            raise NotImplementedError("DeepSeek-V3 lite MoE fp8 training is not implemented yet.")
+        self.router = DeepseekV3SigmoidTopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
@@ -319,10 +319,10 @@ class MoELayer(nn.Module):
         return output.to(x.dtype)
 
 
-class KimiK2Layer(nn.Module):
+class DeepseekV3Layer(nn.Module):
     def __init__(
         self,
-        config: KimiK2Config,
+        config: DeepseekV3Config,
         ps: ParallelState,
         layer_idx: int,
         *,
@@ -391,10 +391,10 @@ def _roll_mtp_left(
     return rolled, rolled.sum()
 
 
-class KimiK2MTPLayer(nn.Module):
+class DeepseekV3MTPLayer(nn.Module):
     def __init__(
         self,
-        config: KimiK2Config,
+        config: DeepseekV3Config,
         ps: ParallelState,
         layer_idx: int,
         *,
@@ -419,7 +419,7 @@ class KimiK2MTPLayer(nn.Module):
             sp=ps.tp_size > 1,
             gather_output=True,
         )
-        self.transformer_layer = KimiK2Layer(
+        self.transformer_layer = DeepseekV3Layer(
             config,
             ps,
             config.num_hidden_layers + layer_idx,
@@ -463,10 +463,10 @@ class KimiK2MTPLayer(nn.Module):
         return hidden_states, input_ids, position_ids
 
 
-class KimiK2MTPBlock(nn.Module):
+class DeepseekV3MTPBlock(nn.Module):
     def __init__(
         self,
-        config: KimiK2Config,
+        config: DeepseekV3Config,
         ps: ParallelState,
         *,
         embedding: VocabParallelEmbedding,
@@ -484,7 +484,7 @@ class KimiK2MTPBlock(nn.Module):
         layers_to_build = 1 if repeated_layer else self.num_layers
         self.layers = nn.ModuleList(
             [
-                KimiK2MTPLayer(
+                DeepseekV3MTPLayer(
                     config,
                     ps,
                     idx,
@@ -526,7 +526,7 @@ class KimiK2MTPBlock(nn.Module):
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
     if isinstance(temperature, torch.Tensor):
         if temperature.numel() != 1:
-            raise ValueError("KimiK2Model supports scalar temperature only.")
+            raise ValueError("DeepseekV3Model supports scalar temperature only.")
         return float(temperature.detach().float().item())
     return float(temperature)
 
@@ -553,10 +553,10 @@ def _apply_attention_backend_override(backend: str | None) -> None:
     ) = env
 
 
-class KimiK2Model(nn.Module):
+class DeepseekV3Model(nn.Module):
     def __init__(
         self,
-        config: KimiK2Config,
+        config: DeepseekV3Config,
         train_config,
         ps: ParallelState,
         *,
@@ -596,7 +596,7 @@ class KimiK2Model(nn.Module):
         moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
-                KimiK2Layer(
+                DeepseekV3Layer(
                     config,
                     ps,
                     idx,
@@ -617,13 +617,13 @@ class KimiK2Model(nn.Module):
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
         self.mtp_embed: VocabParallelEmbedding | None = None
-        self.mtp: KimiK2MTPBlock | None = None
+        self.mtp: DeepseekV3MTPBlock | None = None
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
                 mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
                 self.mtp_embed = mtp_embedding
-            self.mtp = KimiK2MTPBlock(
+            self.mtp = DeepseekV3MTPBlock(
                 config,
                 ps,
                 embedding=mtp_embedding,
@@ -643,7 +643,7 @@ class KimiK2Model(nn.Module):
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
             if len(input_tensor) > 1:
-                raise ValueError("KimiK2Model expects a single pipeline input tensor.")
+                raise ValueError("DeepseekV3Model expects a single pipeline input tensor.")
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
@@ -839,10 +839,10 @@ class KimiK2Model(nn.Module):
 
 __all__ = [
     "DenseMLP",
-    "KimiK2MTPBlock",
-    "KimiK2MTPLayer",
-    "KimiK2Layer",
-    "KimiK2Model",
+    "DeepseekV3MTPBlock",
+    "DeepseekV3MTPLayer",
+    "DeepseekV3Layer",
+    "DeepseekV3Model",
     "MoELayer",
     "MTPLossAutoScaler",
     "MultiLatentAttention",

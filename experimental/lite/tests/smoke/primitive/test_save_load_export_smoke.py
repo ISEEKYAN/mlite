@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Save / load / export coverage smoke across the supported models and backends.
 
-Matrix: {qwen3_5, qwen3_moe, kimi_k2, glm5, deepseek_v4} x {dist_opt, fsdp2}.
+Matrix: {qwen3_5, qwen3_moe, deepseek_v3, deepseek_v3_2, deepseek_v4} x {dist_opt, fsdp2}.
 
 Each (model, backend) case does a faithful round-trip:
   build -> train one real step -> save checkpoint -> build fresh -> load ->
@@ -101,12 +101,12 @@ def _qwen3_moe():
     return cfg, protocol
 
 
-def _kimi_k2():
+def _deepseek_v3():
     _require_te()
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
-    from megatron.lite.model.kimi_k2.lite import protocol
+    from megatron.lite.model.deepseek_v3.config import DeepseekV3Config
+    from megatron.lite.model.deepseek_v3.lite import protocol
 
-    cfg = KimiK2Config(
+    cfg = DeepseekV3Config(
         num_hidden_layers=2,
         hidden_size=64,
         num_attention_heads=4,
@@ -140,13 +140,13 @@ def _kimi_k2():
     return cfg, protocol
 
 
-def _glm5():
-    pytest.importorskip("cudnn", reason="glm5 fused DSA needs the cudnn DSA stack.")
+def _deepseek_v3_2():
+    pytest.importorskip("cudnn", reason="deepseek_v3_2 fused DSA needs the cudnn DSA stack.")
     _require_te()
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite import protocol
+    from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
+    from megatron.lite.model.deepseek_v3_2.lite import protocol
 
-    cfg = Glm5Config(
+    cfg = DeepseekV32Config(
         num_hidden_layers=2,
         hidden_size=128,
         num_attention_heads=64,
@@ -215,8 +215,8 @@ def _deepseek_v4():
 MODELS = {
     "qwen3_5": _qwen3_5,
     "qwen3_moe": _qwen3_moe,
-    "kimi_k2": _kimi_k2,
-    "glm5": _glm5,
+    "deepseek_v3": _deepseek_v3,
+    "deepseek_v3_2": _deepseek_v3_2,
     "deepseek_v4": _deepseek_v4,
 }
 
@@ -287,9 +287,9 @@ def _reset_parallel_state_between_tests():
         mpu.destroy_model_parallel()
 
 
-# GLM5 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
+# DeepSeek-V3.2 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
 # through primitives), so their dist_opt topology shards via ep/pp/cp instead.
-_TP1_ONLY = {"glm5", "deepseek_v4"}
+_TP1_ONLY = {"deepseek_v3_2", "deepseek_v4"}
 
 
 def _topology(model_name: str, backend: str) -> ParallelConfig:
@@ -473,17 +473,19 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
                 if tensor.dtype.is_floating_point:
-                    assert tensor.dtype == torch.bfloat16, (
-                        f"{key} exported as {tensor.dtype}, want bf16"
-                    )
+                    assert (
+                        tensor.dtype == torch.bfloat16
+                    ), f"{key} exported as {tensor.dtype}, want bf16"
                 else:
-                    assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
-                        f"{key} exported as unexpected non-float dtype {tensor.dtype}"
-                    )
+                    assert tensor.dtype in (
+                        torch.int64,
+                        torch.int32,
+                        torch.bool,
+                    ), f"{key} exported as unexpected non-float dtype {tensor.dtype}"
                 assert torch.isfinite(tensor.float()).all(), f"{key} has non-finite values"
-                assert key.startswith("model.") or key in ("lm_head.weight",), (
-                    f"unexpected non-HF export key: {key}"
-                )
+                assert key.startswith("model.") or key in (
+                    "lm_head.weight",
+                ), f"unexpected non-HF export key: {key}"
                 keys.add(key)
     assert keys, "exported zero tensors"
     # PP-gather completeness: the rank-0 export must carry EVERY decoder layer's
@@ -555,18 +557,18 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
 
 # qwen3_5 offload is validated separately (its GatedDeltaNet linear-attention
 # path and run env differ); the others run here.
-DELIVERY_MODELS = ("deepseek_v4", "glm5", "kimi_k2")
+DELIVERY_MODELS = ("deepseek_v4", "deepseek_v3_2", "deepseek_v3")
 
 
 def _offload_topology(model_name: str) -> ParallelConfig:
-    # proxy2 = 8-GPU pp2/ep2/cp2.  CSA/DSA (glm5, ds4) are TP=1 only, so they
+    # proxy2 = 8-GPU pp2/ep2/cp2.  CSA/DSA (deepseek_v3_2, ds4) are TP=1 only, so they
     # fill 8 ranks with dp2 (tp1·cp2·pp2·dp2=8); TP-capable MoE models use tp2
     # (tp2·cp2·pp2·dp1=8).
     forced = os.environ.get("MLITE_FORCE_TOPO")
     if forced:
         tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
         return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
-    if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
+    if model_name in _TP1_ONLY:  # deepseek_v3_2, deepseek_v4: CSA/DSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
 
@@ -671,7 +673,7 @@ def test_offload_onload_roundtrip(model_name, backend, tmp_path):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("model_name", ["kimi_k2"])
+@pytest.mark.parametrize("model_name", ["deepseek_v3"])
 def test_offload_fraction_keeps_optimizer_state_on_cpu(model_name, backend, tmp_path):
     """offload_fraction>0 keeps the optimizer update state on CPU and still
     trains.  One delivery model is enough to guard the real-model wiring
@@ -688,7 +690,7 @@ def test_offload_fraction_keeps_optimizer_state_on_cpu(model_name, backend, tmp_
         offload_fraction=1.0,
     )
     _train_step(handle, backend, cfg)
-    assert "cpu" in _opt_state_devices(handle, backend), (
-        "offload_fraction=1.0 should keep optimizer update state on CPU."
-    )
+    assert "cpu" in _opt_state_devices(
+        handle, backend
+    ), "offload_fraction=1.0 should keep optimizer update state on CPU."
     _train_step(handle, backend, cfg)  # trains with the offloaded update state

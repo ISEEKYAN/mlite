@@ -1,4 +1,4 @@
-"""GLM-5 architecture config."""
+"""DeepSeek-V3.2 architecture config."""
 
 from __future__ import annotations
 
@@ -58,8 +58,8 @@ _HF_FIELDS = frozenset(
 
 
 @dataclass
-class Glm5Config:
-    """Pure GLM-5 MoE + MLA + DSA architecture parameters."""
+class DeepseekV32Config:
+    """Pure DeepSeek-V3.2 MoE + MLA + DSA architecture parameters."""
 
     num_hidden_layers: int = 78
     hidden_size: int = 6144
@@ -142,7 +142,7 @@ class Glm5Config:
         check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
         check(
             self.num_key_value_heads == self.num_attention_heads,
-            "initial GLM5 native path expects MLA heads to be ungrouped",
+            "initial DeepSeek-V3.2 native path expects MLA heads to be ungrouped",
         )
         check(self.vocab_size > 0, "vocab_size must be > 0")
         check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
@@ -170,7 +170,7 @@ class Glm5Config:
 
         if errors:
             raise ValueError(
-                f"Invalid Glm5Config ({len(errors)} error"
+                f"Invalid DeepseekV32Config ({len(errors)} error"
                 f"{'s' if len(errors) != 1 else ''}):\n  " + "\n  ".join(errors)
             )
 
@@ -178,16 +178,16 @@ class Glm5Config:
         return {f.name: getattr(self, f.name) for f in dc_fields(self)}
 
     @classmethod
-    def from_hf(cls, path_or_name: str, **overrides) -> Glm5Config:
+    def from_hf(cls, path_or_name: str, **overrides) -> DeepseekV32Config:
         return cls._from_hf_dict(load_hf_config_dict(path_or_name), **overrides)
 
     @classmethod
-    def from_hf_config(cls, hf_config, **overrides) -> Glm5Config:
+    def from_hf_config(cls, hf_config, **overrides) -> DeepseekV32Config:
         hf = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
         return cls._from_hf_dict(hf, **overrides)
 
     @classmethod
-    def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> Glm5Config:
+    def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> DeepseekV32Config:
         kwargs = {
             key: value for key, value in hf.items() if key in _HF_FIELDS and value is not None
         }

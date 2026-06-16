@@ -1,15 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek V4 (ds4flash) lite native model.
 
-A clone of the Kimi-K2 (deepseek_v3) lite model -- same approach as GLM-5 --
-inheriting Kimi's Megatron plumbing (SBHD ``[S, B, H]`` layout, VocabParallel
+A clone of the DeepSeek-V3 (deepseek_v3) lite model -- same approach as DeepSeek-V3.2 --
+inheriting DeepSeek-V3's Megatron plumbing (SBHD ``[S, B, H]`` layout, VocabParallel
 embed/head, ``set_input_tensor``, ``build_pipeline_chunk_layout`` boundaries,
 MTP via ``layout.has_head``, dist-opt/distckpt via the protocol).  Three
 model-wide DS4 deviations (documented inline at each site):
 
 1. Attention = CSA, not MLA.  The CSA primitive is batch-first ``[B, S, H]`` and
    needs explicit ``position_ids``; ``DeepseekV4CSAAttention`` wraps it with an
-   SBHD<->BSHD shim (like GLM-5's DSA shim).  Per-layer behaviour is driven by
+   SBHD<->BSHD shim (like DeepSeek-V3.2's DSA shim).  Per-layer behaviour is driven by
    ``config.compress_ratios[layer_idx]`` inside CSA.
 
 2. mHC (multi-head hyper-connection): the hidden carries ``hc_mult`` parallel
@@ -25,7 +25,7 @@ model-wide DS4 deviations (documented inline at each site):
    shared Experts/Router/Dispatcher).
 
 CSA is not TP-capable, so DS4 is a documented TP=1 case (protocol gate raises
-for TP>1/ETP>1); VPP/PP/EP/CP work, inherited from the Kimi skeleton.
+for TP>1/ETP>1); VPP/PP/EP/CP work, inherited from the DeepSeek-V3 skeleton.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ def _roll_mtp_left(
     """Shift labels/ids one position left (next-token target for MTP depth d).
 
     DS4 inputs are dense ``[B, S]`` (TP=1, MTP runs only at CP==1), so -- unlike
-    Kimi -- there is no packed-THD branch here; a plain ``torch.roll`` on the
+    DeepSeek-V3 -- there is no packed-THD branch here; a plain ``torch.roll`` on the
     sequence dim suffices.
     """
     dim = dims if dims >= 0 else tensor.dim() + dims
@@ -82,7 +82,7 @@ def _roll_mtp_left(
 
 # -- DS4 ONLY: CSA attention wrapper.  Holds ``CompressedSparseAttention`` and
 # adapts it to the skeleton's SBHD-in / SBHD-out attention contract, mirroring
-# GLM-5's ``Glm5DSAAttention`` DSA shim.  Per-layer behaviour (window / compress
+# DeepSeek-V3.2's ``DeepseekV32DSAAttention`` DSA shim.  Per-layer behaviour (window / compress
 # / indexer) is selected inside CSA via ``config.compress_ratios[layer_idx]``.
 class DeepseekV4CSAAttention(nn.Module):
     """SBHD ``[S, B, H]`` shim around the batch-first CSA primitive.
@@ -111,7 +111,7 @@ class DeepseekV4CSAAttention(nn.Module):
 class DeepseekV4Layer(nn.Module):
     """One decoder layer.
 
-    Structurally the Kimi layer, but the plain ``x = x + sublayer(norm(x))``
+    Structurally the DeepSeek-V3 layer, but the plain ``x = x + sublayer(norm(x))``
     residual is replaced by DS4's per-layer ``HyperConnection`` (mHC), and
     attention is CSA via the SBHD shim above.  The hidden is the 4-D SBHD mHC
     tensor ``[S, B, hc_mult, H]`` end-to-end.  Attribute names (``self_attn`` /
@@ -133,7 +133,7 @@ class DeepseekV4Layer(nn.Module):
         self.ps = ps
         self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
+        # DS4 ONLY: CSA attention behind the SBHD shim (DeepSeek-V3 builds MLA here).
         self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
         self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep)
@@ -172,9 +172,9 @@ class DeepseekV4Layer(nn.Module):
 
 
 class DeepseekV4MTPLayer(DeepseekV4Layer):
-    """MTP depth layer: Kimi's MTP combiner, adapted to DS4's mHC hidden.
+    """MTP depth layer: DeepSeek-V3's MTP combiner, adapted to DS4's mHC hidden.
 
-    Like Kimi's ``KimiK2MTPLayer`` it owns ``enorm`` / ``hnorm`` and a projection
+    Like DeepSeek-V3's ``DeepseekV3MTPLayer`` it owns ``enorm`` / ``hnorm`` and a projection
     to fuse the rolled-token embedding with the running hidden, then runs one
     transformer layer.  DS4 differences: the projection uses DS4's
     ``e_proj`` / ``h_proj`` names (preserved for HF export), the embedding /
@@ -201,7 +201,9 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hc_head = MultiHeadHyperConnectionHead(config.hidden_size, config.hc_mult, config.hc_eps)
+        self.hc_head = MultiHeadHyperConnectionHead(
+            config.hidden_size, config.hc_mult, config.hc_eps
+        )
 
     def forward(
         self,
@@ -258,7 +260,7 @@ def _apply_attention_backend_override(backend: str | None) -> None:
 
 
 class DeepseekV4Model(nn.Module):
-    """DS4 model.  Mirrors ``KimiK2Model``: ``build_pipeline_chunk_layout`` for
+    """DS4 model.  Mirrors ``DeepseekV3Model``: ``build_pipeline_chunk_layout`` for
     embed/head/layer placement, ``set_input_tensor`` for the PP recv buffer, a
     shared embed/head, MTP gated on ``layout.has_head``, SBHD scatter at embed,
     and a single forward producing the loss / logits / MTP outputs.
@@ -410,9 +412,7 @@ class DeepseekV4Model(nn.Module):
         # that crosses into the batch-first CSA interior.
         if position_ids is None:
             seq_len, batch = h.size(0), h.size(1)
-            position_ids = (
-                torch.arange(seq_len, device=h.device).unsqueeze(0).expand(batch, -1)
-            )
+            position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0).expand(batch, -1)
 
         fp8_ctx = (
             te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
@@ -431,19 +431,16 @@ class DeepseekV4Model(nn.Module):
             return output
 
         # Last stage: contract the mHC streams, then run head / MTP / loss
-        # exactly as the Kimi skeleton does.
+        # exactly as the DeepSeek-V3 skeleton does.
         mtp_source = h
         hidden_for_head = contract_mhc_hidden_for_pipeline(h, norm=self.norm, head=self.hc_head)
 
         # MTP runs on the head stage (where self.mtp is built with a valid bound
         # embedding -- self.embed_tokens when present, else the self.mtp_embed
-        # fallback, mirroring Kimi).  Disabled at CP>1 (the rolled MTP targets are
+        # fallback, mirroring DeepSeek-V3).  Disabled at CP>1 (the rolled MTP targets are
         # not CP-sliced) and when no input_ids are available.
         run_mtp = (
-            enable_mtp
-            and input_ids is not None
-            and len(self.mtp) > 0
-            and self.ps.cp_size == 1
+            enable_mtp and input_ids is not None and len(self.mtp) > 0 and self.ps.cp_size == 1
         )
         mtp_hidden_states = self._apply_mtp(
             mtp_source, input_ids=input_ids, position_ids=position_ids, run_mtp=run_mtp
@@ -511,7 +508,7 @@ class DeepseekV4Model(nn.Module):
         assert input_ids is not None
         # DS4 MTP rolls input_ids per depth and runs each MTP layer on the
         # running per-stream source, contracting each depth's output to [S, B, H]
-        # for the head.  Mirrors Kimi's KimiK2MTPBlock loop.
+        # for the head.  Mirrors DeepSeek-V3's DeepseekV3MTPBlock loop.
         mtp_input_ids = input_ids
         source = mtp_source
         outputs: list[torch.Tensor] = []

@@ -1,24 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""GLM-5 (deepseek_v3_2) lite native checkpoint mapping.
+"""DeepSeek-V3.2 (deepseek_v3_2) lite native checkpoint mapping.
 
-Cloned from ``megatron/lite/model/kimi_k2/lite/checkpoint.py`` (deepseek_v3)
-and renamed KimiK2 -> Glm5.  The MoE / dense-MLP / embed / head / MTP weight
-mapping is structurally identical to Kimi.  The ONLY adaptations are in the
+Cloned from ``megatron/lite/model/deepseek_v3/lite/checkpoint.py`` (deepseek_v3)
+and renamed DeepseekV3 -> DeepseekV32.  The MoE / dense-MLP / embed / head / MTP weight
+mapping is structurally identical to DeepSeek-V3.  The ONLY adaptations are in the
 attention block:
 
-  * GLM-5's attention is the DSA primitive ``DynamicSparseAttention`` (wrapped
-    by ``Glm5DSAAttention``), whose native parameters live under
+  * DeepSeek-V3.2's attention is the DSA primitive ``DynamicSparseAttention`` (wrapped
+    by ``DeepseekV32DSAAttention``), whose native parameters live under
     ``self_attention.self_attention.*`` -- i.e. ``q_a_proj`` / ``q_a_layernorm``
     / ``q_b_proj`` / ``kv_a_proj_with_mqa`` / ``kv_a_layernorm`` / ``kv_b_proj``
     / ``o_proj`` plus the indexer (``indexer.wq_b`` / ``indexer.wk`` /
-    ``indexer.k_norm`` / ``indexer.weights_proj``).  Kimi's MLA names
+    ``indexer.k_norm`` / ``indexer.weights_proj``).  DeepSeek-V3's MLA names
     (``linear_q_down_proj`` etc.) are replaced accordingly.
-  * The HF weight NAMES match GLM-5's HF model: the DSA submodule names map 1:1
+  * The HF weight NAMES match DeepSeek-V3.2's HF model: the DSA submodule names map 1:1
     to ``model.layers.{i}.self_attn.*`` (and ``...self_attn.indexer.*``),
-    preserving the names the previous GLM-5 checkpoint used.
+    preserving the names the previous DeepSeek-V3.2 checkpoint used.
 
-GLM-5 is TP=1 (DSA is not tensor-parallel-capable), so the ``_tp`` helpers are
-no-ops here; they are kept for structural parity with Kimi.
+DeepSeek-V3.2 is TP=1 (DSA is not tensor-parallel-capable), so the ``_tp`` helpers are
+no-ops here; they are kept for structural parity with DeepSeek-V3.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
-from megatron.lite.model.glm5.config import Glm5Config
+from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _cast_export_tensor,
@@ -54,7 +54,7 @@ def PLACEMENT_FN(param_name: str) -> list:
         return [Replicate(), Replicate(), Replicate(), Replicate()]
     if "eh_proj.linear.weight" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
-    # GLM-5 DSA is TP=1 (no head sharding of attention projections).
+    # DeepSeek-V3.2 DSA is TP=1 (no head sharding of attention projections).
     if "gate_up" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "down" in param_name:
@@ -150,7 +150,7 @@ def _text_prefix(reader: SafeTensorReader) -> str:
     for prefix in ("model", "language_model.model", "model.language_model"):
         if _has(reader, f"{prefix}.embed_tokens.weight"):
             return prefix
-    raise KeyError("Could not find GLM-5 text model prefix in HF checkpoint.")
+    raise KeyError("Could not find DeepSeek-V3.2 text model prefix in HF checkpoint.")
 
 
 def _lm_head_name(reader: SafeTensorReader, text_prefix: str) -> str:
@@ -162,11 +162,11 @@ def _lm_head_name(reader: SafeTensorReader, text_prefix: str) -> str:
     for name in candidates:
         if _has(reader, name):
             return name
-    raise KeyError("Could not find GLM-5 lm_head.weight in HF checkpoint.")
+    raise KeyError("Could not find DeepSeek-V3.2 lm_head.weight in HF checkpoint.")
 
 
 def _load_vocab(
-    reader: SafeTensorReader, name: str, cfg: Glm5Config, ps: ParallelState
+    reader: SafeTensorReader, name: str, cfg: DeepseekV32Config, ps: ParallelState
 ) -> torch.Tensor:
     from megatron.lite.primitive.parallel import pad_vocab_for_tp
 
@@ -186,17 +186,15 @@ def _load_attention(
     reader: SafeTensorReader,
     ps: ParallelState,
 ) -> None:
-    # GLM-5 ONLY: DSA attention.  Native params live under
+    # DeepSeek-V3.2 ONLY: DSA attention.  Native params live under
     # `<local_prefix>.self_attention.self_attention.*` (the wrapper adds one
-    # `self_attention` level around the DSA module).  HF names are GLM-5's
+    # `self_attention` level around the DSA module).  HF names are DeepSeek-V3.2's
     # `<hf_prefix>.{...}` (DSA submodule names map 1:1 to the HF model).
     ap = f"{local_prefix}.self_attention.self_attention"
     out[f"{ap}.q_a_proj.weight"] = _get(reader, f"{hf_prefix}.q_a_proj.weight")
     out[f"{ap}.q_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.q_a_layernorm.weight")
     out[f"{ap}.q_b_proj.weight"] = _get(reader, f"{hf_prefix}.q_b_proj.weight")
-    out[f"{ap}.kv_a_proj_with_mqa.weight"] = _get(
-        reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight"
-    )
+    out[f"{ap}.kv_a_proj_with_mqa.weight"] = _get(reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight")
     out[f"{ap}.kv_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.kv_a_layernorm.weight")
     out[f"{ap}.kv_b_proj.weight"] = _get(reader, f"{hf_prefix}.kv_b_proj.weight")
     out[f"{ap}.o_proj.weight"] = _get(reader, f"{hf_prefix}.o_proj.weight")
@@ -279,7 +277,7 @@ def _load_experts(
     *,
     local_prefix: str,
     hf_mlp_prefix: str,
-    cfg: Glm5Config,
+    cfg: DeepseekV32Config,
     ps: ParallelState,
     reader: SafeTensorReader,
 ) -> None:
@@ -316,7 +314,7 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
         if actual is not None:
             resolved[actual] = tensor
         else:
-            log_rank0(f"WARNING: glm5 checkpoint tensor has no target param: {name}")
+            log_rank0(f"WARNING: deepseek_v3_2 checkpoint tensor has no target param: {name}")
 
     for name, target in model.named_parameters():
         if name not in resolved:
@@ -332,10 +330,10 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
         target.data.copy_(tensor.to(dtype=target.dtype) if target.is_floating_point() else tensor)
 
 
-class Glm5WeightSpec:
-    """Export GLM-5 lite weights to HF GLM-5 (deepseek_v3_2) names."""
+class DeepseekV32WeightSpec:
+    """Export DeepSeek-V3.2 lite weights to HF DeepSeek-V3.2 (deepseek_v3_2) names."""
 
-    def __init__(self, config: Glm5Config):
+    def __init__(self, config: DeepseekV32Config):
         self.config = config
 
     @property
@@ -349,7 +347,7 @@ class Glm5WeightSpec:
         del native_name
         return hf_tensors[0]
 
-    # GLM-5 ONLY: DSA attention native suffix -> HF suffix.  The wrapper places
+    # DeepSeek-V3.2 ONLY: DSA attention native suffix -> HF suffix.  The wrapper places
     # the DSA module under `self_attention.self_attention.*`; the HF model uses
     # `self_attn.*` with identical submodule names.
     _ATTN_SUFFIX_MAP: dict[str, str] = {
@@ -409,7 +407,7 @@ class Glm5WeightSpec:
         if suffix == "input_layernorm.weight":
             return [(f"{hp}.input_layernorm.weight", tensor)]
 
-        # GLM-5 ONLY: DSA attention (incl. indexer) maps 1:1 onto self_attn.*.
+        # DeepSeek-V3.2 ONLY: DSA attention (incl. indexer) maps 1:1 onto self_attn.*.
         attn_hf = self._ATTN_SUFFIX_MAP.get(suffix)
         if attn_hf is not None:
             return [(f"{ap}.{attn_hf}", tensor)]
@@ -458,7 +456,7 @@ class Glm5WeightSpec:
         return None
 
     def tp_spec(self, native_name: str) -> tuple[int, int] | None:
-        # GLM-5 is TP=1 (DSA not TP-capable); only EP / ETP shard tensors.
+        # DeepSeek-V3.2 is TP=1 (DSA not TP-capable); only EP / ETP shard tensors.
         if native_name.startswith("mtp.layers.") and ".transformer_layer." in native_name:
             proxy = native_name.replace(".transformer_layer.", ".")
             return self.tp_spec(proxy)
@@ -495,7 +493,9 @@ class Glm5WeightSpec:
         return f"{prefix}.weight{local_idx}"
 
 
-def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: ParallelState) -> None:
+def load_hf_weights(
+    model: nn.Module, path: str, config: DeepseekV32Config, ps: ParallelState
+) -> None:
     base_model = unwrap_model(model)
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
@@ -623,10 +623,10 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
     _copy_loaded_state(base_model, out)
 
 
-def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
+def export_hf_weights(model, config: DeepseekV32Config, ps: ParallelState, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
-    spec = Glm5WeightSpec(config)
+    spec = DeepseekV32WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
@@ -649,7 +649,9 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
                 yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
-def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:
+def save_hf_weights(
+    model, path: str, config: DeepseekV32Config, ps: ParallelState, **kwargs
+) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
 
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -662,7 +664,7 @@ def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **k
 
 __all__ = [
     "EXPERT_CLASSIFIER",
-    "Glm5WeightSpec",
+    "DeepseekV32WeightSpec",
     "PLACEMENT_FN",
     "_dequant_int4_weight",
     "_dequant_fp8_weight",

@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek V4 (ds4flash) lite native <-> HF checkpoint mapping.
 
-Like kimi_k2 / glm5: ``DeepseekV4WeightSpec`` encodes the per-param native -> HF
+Like deepseek_v3 / deepseek_v3_2: ``DeepseekV4WeightSpec`` encodes the per-param native -> HF
 name (+ TP/EP shard spec); export/save route through the shared
 ``primitive/ckpt/hf_weights.py`` exporter (its PP ``all_gather_object`` is
 reached by all ranks before any ``rank0_only`` filter, so PP>1 export doesn't
 desync).  Native names are bare ``DeepseekV4Model`` keys; ``self.layers`` is a
-ModuleDict keyed by GLOBAL layer index (kimi uses a local ModuleList), so the
+ModuleDict keyed by GLOBAL layer index (deepseek_v3 uses a local ModuleList), so the
 exporter's local->global remap is an identity here.
 
 HF targets are canonical HF DeepSeek (``model.embed_tokens.weight`` /
@@ -19,7 +19,7 @@ HF targets are canonical HF DeepSeek (``model.embed_tokens.weight`` /
     model.-rooted; fidelity vs Megatron's latest mHC is a TODO).
   * MTP: folded into the decoder namespace at ``model.layers.<num_hidden+i>``.
 
-CSA is not TP-capable: DS4 runs TP=ETP=1 (only EP shards experts), like GLM-5.
+CSA is not TP-capable: DS4 runs TP=ETP=1 (only EP shards experts), like DeepSeek-V3.2.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    # distckpt sharded placement (TP=ETP=1 for ds4; shares kimi/glm5's
+    # distckpt sharded placement (TP=ETP=1 for ds4; shares deepseek_v3/deepseek_v3_2's
     # Experts/SwiGLUMLP/VocabParallel structure). EP-sharded experts must carry
     # an explicit placement or the dist-opt checkpoint won't restore them
     # bit-exactly. The CSA/mHC/MTP-norm params fall through to all-Replicate.
@@ -116,7 +116,11 @@ def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
         return f"mlp.shared_experts.{_PROJ_TO_HF.get(proj, proj)}.weight"
     # mHC params have no upstream HF analogue; keep them under self_attn / mlp /
     # hc_head sub-namespaces so every key stays ``model.layers.{i}.*``-rooted.
-    for prefix, target in (("attn_hc", "self_attn.hc"), ("ffn_hc", "mlp.hc"), ("hc_head", "hc_head")):
+    for prefix, target in (
+        ("attn_hc", "self_attn.hc"),
+        ("ffn_hc", "mlp.hc"),
+        ("hc_head", "hc_head"),
+    ):
         if attr.startswith(f"{prefix}."):
             return f"{target}_{attr.rsplit('.', 1)[-1].removeprefix('hc_')}"
     if block == "mtp" and attr in {
@@ -130,7 +134,9 @@ def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
     return None
 
 
-def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: ParallelState) -> int:
+def _global_expert_idx_from_local(
+    local_idx: int, config: DeepseekV4Config, ps: ParallelState
+) -> int:
     num_local = ensure_divisible(config.n_routed_experts, ps.ep_size)
     return ps.ep_rank * num_local + local_idx
 
@@ -374,7 +380,7 @@ def _to_global_expert_name(name: str, config: DeepseekV4Config, ps: ParallelStat
 class DeepseekV4WeightSpec:
     """Export DS4 lite weights to HF DeepSeek-V4 names (CSA / mHC / MTP / MoE).
 
-    Mirrors ``KimiK2WeightSpec`` / ``Glm5WeightSpec`` on DS4's bare native names
+    Mirrors ``DeepseekV3WeightSpec`` / ``DeepseekV32WeightSpec`` on DS4's bare native names
     with global layer indices.  The shared exporter rewrites EP-local expert
     ``weight<local>`` ids to global before calling ``native_to_hf``.
     """
@@ -453,7 +459,7 @@ class DeepseekV4WeightSpec:
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
     """Export DS4 weights as HF (name, tensor) pairs via the SHARED exporter.
 
-    Identical structure to kimi/glm5: delegate to the shared ``_export`` (which
+    Identical structure to deepseek_v3/deepseek_v3_2: delegate to the shared ``_export`` (which
     does the TP/ETP/EP/PP gather, including the PP ``all_gather_object`` reached
     by ALL ranks before any ``rank0_only`` filter), then append the persistent
     router buffers (``tid2eid`` for hash layers, ``expert_bias`` for non-hash
@@ -487,7 +493,9 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
                 yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
-def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:
+def save_hf_weights(
+    model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs
+) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
 
     rank = dist.get_rank() if dist.is_initialized() else 0

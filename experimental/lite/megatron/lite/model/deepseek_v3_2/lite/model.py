@@ -1,25 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""GLM-5 (deepseek_v3_2) lite native model.
+"""DeepSeek-V3.2 (deepseek_v3_2) lite native model.
 
-This model is a near-verbatim clone of the Kimi-K2 (deepseek_v3) lite model
-(``megatron/lite/model/kimi_k2/lite/model.py``).  It inherits ALL of Kimi's
+This model is a near-verbatim clone of the DeepSeek-V3 (deepseek_v3) lite model
+(``megatron/lite/model/deepseek_v3/lite/model.py``).  It inherits ALL of DeepSeek-V3's
 Megatron plumbing unchanged: SBHD ``[S, B, H]`` layout, sequence-parallel
 scatter/gather, ``VocabParallelEmbedding`` / ``VocabParallelOutput``,
 ``share_embeddings_and_output_weights``, ``set_input_tensor``,
 ``build_pipeline_chunk_layout``-based pipeline boundaries, MTP, and the
 dist-opt / distckpt integration.
 
-The ONLY functional difference from Kimi is the attention module: where Kimi
-uses ``MultiLatentAttention`` (MLA), GLM-5 uses Dynamic Sparse Attention (DSA).
+The ONLY functional difference from DeepSeek-V3 is the attention module: where DeepSeek-V3
+uses ``MultiLatentAttention`` (MLA), DeepSeek-V3.2 uses Dynamic Sparse Attention (DSA).
 The DSA primitive is hard-wired batch-first ``[B, S, H]`` and expects explicit
 ``cos`` / ``sin`` / ``position_ids`` + ``packed_seq_params``, so it is wrapped
-by ``Glm5DSAAttention`` which transposes ``[S, B, H] -> [B, S, H]`` before DSA
+by ``DeepseekV32DSAAttention`` which transposes ``[S, B, H] -> [B, S, H]`` before DSA
 and back after, and builds the rotary embeddings / position ids locally.  The
-surrounding Kimi skeleton therefore stays byte-for-byte SBHD and untouched.
+surrounding DeepSeek-V3 skeleton therefore stays byte-for-byte SBHD and untouched.
 
-NOTE: DSA is NOT tensor-parallel-capable, so GLM-5 is a documented TP=1 special
+NOTE: DSA is NOT tensor-parallel-capable, so DeepSeek-V3.2 is a documented TP=1 special
 case (the protocol gate raises for TP>1 / ETP>1).  VPP / PP / EP / CP work,
-inherited from Kimi.
+inherited from DeepSeek-V3.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
-from megatron.lite.model.glm5.config import Glm5Config
+from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
 from megatron.lite.primitive.modules.attention import (
     DynamicSparseAttention,
     build_rotary_embeddings,
@@ -68,12 +68,12 @@ from megatron.lite.primitive.utils.moe import (
     topk_routing_with_score_function,
 )
 
-# -- GLM-5 ONLY: SP-grad parameter suffixes for the DSA attention (Kimi's MLA
+# -- DeepSeek-V3.2 ONLY: SP-grad parameter suffixes for the DSA attention (DeepSeek-V3's MLA
 # suffixes -- linear_q_down_proj / linear_kv_down_proj / *_up_proj.linear.* --
 # are replaced by the DSA module's parameter names).  These tag the
 # layernorm-fronted columns whose grads must be all-reduced across SP ranks.
-# (At GLM-5's enforced TP=1 this list is unused, but is kept structurally so
-# the model stays a faithful Kimi clone.)
+# (At DeepSeek-V3.2's enforced TP=1 this list is unused, but is kept structurally so
+# the model stays a faithful DeepSeek-V3 clone.)
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".input_layernorm.weight",
     ".self_attention.q_a_proj.weight",
@@ -142,24 +142,24 @@ def _topk_routing_supports_groups() -> bool:
     return "num_groups" in params and "group_topk" in params
 
 
-# -- GLM-5 ONLY: DSA attention wrapper.  Holds ``DynamicSparseAttention`` and
-# adapts it to Kimi's SBHD-in / SBHD-out attention contract.  Everything outside
+# -- DeepSeek-V3.2 ONLY: DSA attention wrapper.  Holds ``DynamicSparseAttention`` and
+# adapts it to DeepSeek-V3's SBHD-in / SBHD-out attention contract.  Everything outside
 # this class (norms, residual, MoE, MTP, embed, head, SP scatter/gather) is
-# identical to Kimi.
-class Glm5DSAAttention(nn.Module):
+# identical to DeepSeek-V3.
+class DeepseekV32DSAAttention(nn.Module):
     """SBHD ``[S, B, H]`` shim around the batch-first DSA primitive.
 
-    Kimi's decoder layer calls ``self.self_attention(x_sbhd, packed_seq_params=)``
+    DeepSeek-V3's decoder layer calls ``self.self_attention(x_sbhd, packed_seq_params=)``
     where ``x_sbhd`` is ``[S, B, H]``.  DSA is hard-wired ``[B, S, H]`` and needs
     explicit ``cos`` / ``sin`` / ``position_ids``.  This wrapper:
       1. transposes ``[S, B, H] -> [B, S, H]``,
       2. builds ``position_ids`` (local sequence) and the rotary ``cos`` / ``sin``,
       3. runs DSA,
       4. transposes the ``[B, S, H]`` output back to ``[S, B, H]``.
-    The Kimi skeleton therefore never observes the batch-first interior.
+    The DeepSeek-V3 skeleton therefore never observes the batch-first interior.
     """
 
-    def __init__(self, config: Glm5Config, ps: ParallelState):
+    def __init__(self, config: DeepseekV32Config, ps: ParallelState):
         super().__init__()
         self.ps = ps
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -191,7 +191,7 @@ class Glm5DSAAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
-        # Kimi feeds SBHD [S, B, H]; DSA needs batch-first [B, S, H].
+        # DeepSeek-V3 feeds SBHD [S, B, H]; DSA needs batch-first [B, S, H].
         x_bsh = x.transpose(0, 1).contiguous()
         batch, seq_len, _ = x_bsh.shape
         # Local (this-rank) position ids; DSA reconstructs the full sequence
@@ -215,21 +215,21 @@ class Glm5DSAAttention(nn.Module):
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )
-        # Back to SBHD [S, B, H] for the Kimi skeleton.
+        # Back to SBHD [S, B, H] for the DeepSeek-V3 skeleton.
         return out_bsh.transpose(0, 1).contiguous()
 
 
-class Glm5SigmoidTopKRouter(nn.Module):
-    """GLM-5 sigmoid router with group-limited routing and persistent expert bias.
+class DeepseekV32SigmoidTopKRouter(nn.Module):
+    """DeepSeek-V3.2 sigmoid router with group-limited routing and persistent expert bias.
 
-    Byte-identical to Kimi's ``KimiK2SigmoidTopKRouter`` except for the config
-    type and that GLM-5 has no ``aux_loss_alpha`` HF field -- the aux coefficient
+    Byte-identical to DeepSeek-V3's ``DeepseekV3SigmoidTopKRouter`` except for the config
+    type and that DeepSeek-V3.2 has no ``aux_loss_alpha`` HF field -- the aux coefficient
     therefore defaults to 0 (aux loss contributes 0).
     """
 
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepseekV32Config,
         ps: ParallelState,
         *,
         router_bias_rate: float = 0.0,
@@ -240,11 +240,11 @@ class Glm5SigmoidTopKRouter(nn.Module):
         super().__init__()
         if router_bias_rate > 0:
             raise NotImplementedError(
-                "GLM-5 expert-bias EMA update is not implemented in lite yet."
+                "DeepSeek-V3.2 expert-bias EMA update is not implemented in lite yet."
             )
         self.topk = config.num_experts_per_tok
         self.num_experts = config.n_routed_experts
-        # GLM-5 has no aux_loss_alpha HF field; default the coefficient to 0.
+        # DeepSeek-V3.2 has no aux_loss_alpha HF field; default the coefficient to 0.
         self.aux_loss_coeff = getattr(config, "aux_loss_alpha", 0.0)
         self.scaling_factor = config.routed_scaling_factor
         self.num_groups = config.n_group if (config.n_group and config.n_group > 1) else None
@@ -326,7 +326,7 @@ class Glm5SigmoidTopKRouter(nn.Module):
 
 
 class DenseMLP(nn.Module):
-    def __init__(self, config: Glm5Config, ps: ParallelState):
+    def __init__(self, config: DeepseekV32Config, ps: ParallelState):
         super().__init__()
         self.gate_up = ColumnParallelLinear(
             config.hidden_size,
@@ -343,11 +343,11 @@ class DenseMLP(nn.Module):
 
 
 class SharedExpert(nn.Module):
-    def __init__(self, config: Glm5Config, ps: ParallelState):
+    def __init__(self, config: DeepseekV32Config, ps: ParallelState):
         super().__init__()
         self.ps = ps
-        # GLM-5 has no shared_expert_intermediate_size property; compute it from
-        # n_shared_experts * moe_intermediate_size (matches Kimi's property).
+        # DeepSeek-V3.2 has no shared_expert_intermediate_size property; compute it from
+        # n_shared_experts * moe_intermediate_size (matches DeepSeek-V3's property).
         ffn = config.n_shared_experts * config.moe_intermediate_size
         self.gate_up = _LocalLinear(config.hidden_size, ffn * 2 // ps.tp_size)
         self.down = _LocalLinear(ffn // ps.tp_size, config.hidden_size)
@@ -381,7 +381,7 @@ class _LocalLinear(nn.Module):
 class MoELayer(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepseekV32Config,
         ps: ParallelState,
         *,
         use_deepep: bool,
@@ -391,8 +391,8 @@ class MoELayer(nn.Module):
     ):
         super().__init__()
         if fp8:
-            raise NotImplementedError("GLM-5 lite MoE fp8 training is not implemented yet.")
-        self.router = Glm5SigmoidTopKRouter(
+            raise NotImplementedError("DeepSeek-V3.2 lite MoE fp8 training is not implemented yet.")
+        self.router = DeepseekV32SigmoidTopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
@@ -434,10 +434,10 @@ class MoELayer(nn.Module):
         return output.to(x.dtype)
 
 
-class Glm5Layer(nn.Module):
+class DeepseekV32Layer(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepseekV32Config,
         ps: ParallelState,
         layer_idx: int,
         *,
@@ -450,11 +450,11 @@ class Glm5Layer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # GLM-5 ONLY: DSA attention (Kimi builds MultiLatentAttention here).
+        # DeepSeek-V3.2 ONLY: DSA attention (DeepSeek-V3 builds MultiLatentAttention here).
         # The wrapper preserves the SBHD self_attention(x, packed_seq_params=)
-        # contract so this layer's forward stays identical to Kimi's.
+        # contract so this layer's forward stays identical to DeepSeek-V3's.
         del use_thd  # DSA derives its own THD handling from packed_seq_params.
-        self.self_attention = Glm5DSAAttention(config, ps)
+        self.self_attention = DeepseekV32DSAAttention(config, ps)
         if config.is_moe_layer(layer_idx):
             self.mlp_norm: nn.Module | None = te.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -497,10 +497,10 @@ def _roll_mtp_left(
     return rolled, rolled.sum()
 
 
-class Glm5MTPLayer(nn.Module):
+class DeepseekV32MTPLayer(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepseekV32Config,
         ps: ParallelState,
         layer_idx: int,
         *,
@@ -525,7 +525,7 @@ class Glm5MTPLayer(nn.Module):
             sp=ps.tp_size > 1,
             gather_output=True,
         )
-        self.transformer_layer = Glm5Layer(
+        self.transformer_layer = DeepseekV32Layer(
             config,
             ps,
             config.num_hidden_layers + layer_idx,
@@ -569,10 +569,10 @@ class Glm5MTPLayer(nn.Module):
         return hidden_states, input_ids, position_ids
 
 
-class Glm5MTPBlock(nn.Module):
+class DeepseekV32MTPBlock(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepseekV32Config,
         ps: ParallelState,
         *,
         embedding: VocabParallelEmbedding,
@@ -590,7 +590,7 @@ class Glm5MTPBlock(nn.Module):
         layers_to_build = 1 if repeated_layer else self.num_layers
         self.layers = nn.ModuleList(
             [
-                Glm5MTPLayer(
+                DeepseekV32MTPLayer(
                     config,
                     ps,
                     idx,
@@ -632,7 +632,7 @@ class Glm5MTPBlock(nn.Module):
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
     if isinstance(temperature, torch.Tensor):
         if temperature.numel() != 1:
-            raise ValueError("Glm5Model supports scalar temperature only.")
+            raise ValueError("DeepseekV32Model supports scalar temperature only.")
         return float(temperature.detach().float().item())
     return float(temperature)
 
@@ -659,10 +659,10 @@ def _apply_attention_backend_override(backend: str | None) -> None:
     ) = env
 
 
-class Glm5Model(nn.Module):
+class DeepseekV32Model(nn.Module):
     def __init__(
         self,
-        config: Glm5Config,
+        config: DeepseekV32Config,
         train_config,
         ps: ParallelState,
         *,
@@ -691,7 +691,7 @@ class Glm5Model(nn.Module):
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed
         self.post_process = layout.has_head
-        # GLM-5 does not tie embeddings (no tie_word_embeddings HF field); the
+        # DeepSeek-V3.2 does not tie embeddings (no tie_word_embeddings HF field); the
         # attribute is preserved for the dist-opt / distckpt interface.
         self.share_embeddings_and_output_weights = bool(
             getattr(config, "tie_word_embeddings", False)
@@ -706,7 +706,7 @@ class Glm5Model(nn.Module):
         moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
-                Glm5Layer(
+                DeepseekV32Layer(
                     config,
                     ps,
                     idx,
@@ -727,13 +727,13 @@ class Glm5Model(nn.Module):
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
         self.mtp_embed: VocabParallelEmbedding | None = None
-        self.mtp: Glm5MTPBlock | None = None
+        self.mtp: DeepseekV32MTPBlock | None = None
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
                 mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
                 self.mtp_embed = mtp_embedding
-            self.mtp = Glm5MTPBlock(
+            self.mtp = DeepseekV32MTPBlock(
                 config,
                 ps,
                 embedding=mtp_embedding,
@@ -753,7 +753,7 @@ class Glm5Model(nn.Module):
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
             if len(input_tensor) > 1:
-                raise ValueError("Glm5Model expects a single pipeline input tensor.")
+                raise ValueError("DeepseekV32Model expects a single pipeline input tensor.")
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
@@ -950,12 +950,12 @@ class Glm5Model(nn.Module):
 __all__ = [
     "DenseMLP",
     "DynamicSparseAttention",
-    "Glm5DSAAttention",
-    "Glm5Layer",
-    "Glm5MTPBlock",
-    "Glm5MTPLayer",
-    "Glm5Model",
-    "Glm5SigmoidTopKRouter",
+    "DeepseekV32DSAAttention",
+    "DeepseekV32Layer",
+    "DeepseekV32MTPBlock",
+    "DeepseekV32MTPLayer",
+    "DeepseekV32Model",
+    "DeepseekV32SigmoidTopKRouter",
     "MoELayer",
     "MTPLossAutoScaler",
     "SharedExpert",

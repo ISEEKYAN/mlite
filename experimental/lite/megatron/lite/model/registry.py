@@ -92,18 +92,24 @@ register_model(
     impls={"lite": "megatron.lite.model.qwen3_5.lite.protocol"},
 )
 
+# DeepSeek-V3 (MLA) -- Kimi K2/K2.5/K2.6/K2.7 are config variants of this
+# architecture.  "kimi_k2" is kept only as an external HF model_type alias so
+# existing Kimi checkpoints (whose config.json declares model_type=kimi_k2)
+# still resolve; the native model name is deepseek_v3.
 register_model(
-    "kimi_k2",
-    package="megatron.lite.model.kimi_k2",
+    "deepseek_v3",
+    package="megatron.lite.model.deepseek_v3",
     hf_model_types=["kimi_k2", "deepseek_v3"],
-    impls={"lite": "megatron.lite.model.kimi_k2.lite.protocol"},
+    impls={"lite": "megatron.lite.model.deepseek_v3.lite.protocol"},
 )
 
+# DeepSeek-V3.2 (MLA + DSA) -- GLM-5.1 is a config variant of this architecture
+# (HF model_type "glm_moe_dsa").
 register_model(
-    "glm5",
-    package="megatron.lite.model.glm5",
+    "deepseek_v3_2",
+    package="megatron.lite.model.deepseek_v3_2",
     hf_model_types=["glm_moe_dsa"],
-    impls={"lite": "megatron.lite.model.glm5.lite.protocol"},
+    impls={"lite": "megatron.lite.model.deepseek_v3_2.lite.protocol"},
 )
 
 register_model(
