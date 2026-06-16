@@ -21,6 +21,7 @@ wrong-env invocation skips rather than errors.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -243,7 +244,11 @@ def _single_node_cuda_dist():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     created_pg = False
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # Short timeout so a desynced collective fails fast instead of stalling
+        # the whole job on the multi-minute NCCL watchdog default.
+        dist.init_process_group(
+            backend="nccl", init_method="env://", timeout=timedelta(seconds=180)
+        )
         created_pg = True
     yield
     try:
@@ -282,8 +287,10 @@ def _topology(model_name: str, backend: str) -> ParallelConfig:
         # concrete int because init_parallel computes expert_dp = world/(etp*ep*pp).
         return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
     if model_name in _TP1_ONLY:
-        # tp1 x pp2 x cp2 x dp2 = 8 ranks; ep2 within the expert space.
-        return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
+        # tp1 x pp2 x cp1 x dp4 = 8 ranks; ep2 within the expert space.
+        # CP is intentionally 1: save/load fidelity does not need the DSA CP path
+        # (covered by the dedicated CP smokes), and CP+tiny-seq risks fused-DSA hangs.
+        return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=1)
     # tp2 x pp2 x cp1 x dp2 = 8 ranks; ep2 within the expert space.
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
 
