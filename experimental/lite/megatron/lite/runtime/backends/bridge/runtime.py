@@ -15,7 +15,7 @@ import torch.distributed as dist
 from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_optimizer_config
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
-from megatron.lite.runtime.contracts.data import Batch, ForwardResult, ModelOutputs
+from megatron.lite.runtime.contracts.data import Batch, ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.megatron_utils import (
     build_sharded_state_dict,
@@ -496,6 +496,35 @@ def _as_data_iter(data: Any):
     return iter([data])
 
 
+# MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
+def _bridge_forward_kwargs_from_packed_batch(batch: PackedBatch) -> dict[str, Any]:
+    """Render transient Megatron-Core THD kwargs for BridgeRuntime.forward_step only."""
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    position_ids = torch.cat(
+        [torch.arange(s, device=batch.seq_lens.device) for s in batch.seq_lens.tolist()]
+    ).reshape(1, -1)
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=batch.seq_lens.device),
+            batch.seq_lens.cumsum(0).to(torch.int32),
+        ]
+    )
+    max_seqlen = int(batch.seq_lens.max().item()) if batch.seq_lens.numel() else 0
+    sample: dict[str, Any] = {
+        "input_ids": batch.input_ids.reshape(1, -1),
+        "labels": batch.labels.reshape(1, -1),
+        "position_ids": position_ids,
+        "packed_seq_params": PackedSeqParams.from_cu_seqlens(
+            cu_seqlens, max_seqlen=max_seqlen
+        ),
+    }
+    if batch.loss_mask is not None:
+        sample["loss_mask"] = batch.loss_mask.reshape(1, -1)
+    return sample
+# MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
+
+
 class BridgeRuntime(RuntimeBase):
     """Megatron-Bridge training backend using Megatron-Core optimizer state."""
 
@@ -602,19 +631,31 @@ class BridgeRuntime(RuntimeBase):
         model_list = handle._extras["model_list"]
         data_iter = _as_data_iter(data)
         last_loss: list[float | None] = [None]
+        last_output: list[torch.Tensor | None] = [None]
 
         def _fwd_step(data_iterator, model):
+            # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
             sample = next(data_iterator)
-            if isinstance(sample, Batch):
+            owns_transient_metadata = False
+            if isinstance(sample, PackedBatch):
+                sample = _bridge_forward_kwargs_from_packed_batch(sample)
+                owns_transient_metadata = True
+            elif isinstance(sample, Batch):
                 sample = {
                     "input_ids": sample["input_ids"],
                     "labels": sample["labels"],
-                    "position_ids": getattr(sample, "position_ids", None),
                 }
             if not isinstance(sample, dict):
                 raise TypeError(
                     f"BridgeRuntime expected dict or Batch data, got {type(sample).__name__}."
                 )
+            if not owns_transient_metadata:
+                leaked = {"packed_seq_params", "position_ids"}.intersection(sample)
+                if leaked:
+                    raise ValueError(
+                        "BridgeRuntime data must not carry model-internal keys "
+                        f"{sorted(leaked)}; pass a raw PackedBatch instead."
+                    )
 
             output_tensor = model(
                 input_ids=sample["input_ids"],
@@ -625,10 +666,17 @@ class BridgeRuntime(RuntimeBase):
             )
             if isinstance(output_tensor, tuple):
                 output_tensor = output_tensor[0]
+            last_output[0] = output_tensor
+            loss_sample = {
+                key: value
+                for key, value in sample.items()
+                if key not in {"packed_seq_params", "position_ids"}
+            }
+            # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
 
             def _bridge_loss_fn(output_tensor, non_loss_data=False):
                 if loss_fn is not None:
-                    loss, _metrics = loss_fn({"output_tensor": output_tensor}, sample)
+                    loss, _metrics = loss_fn({"output_tensor": output_tensor}, loss_sample)
                 else:
                     loss = output_tensor.mean()
                 last_loss[0] = float(loss.detach().item())
@@ -666,7 +714,7 @@ class BridgeRuntime(RuntimeBase):
 
         result_loss = torch.tensor(loss_val or 0.0)
         return ForwardResult(
-            model_output=ModelOutputs(loss=result_loss),
+            model_output=ModelOutputs(loss=result_loss, vocab_parallel_logits=last_output[0]),
             metrics={"loss": loss_val if loss_val is not None else 0.0},
         )
 

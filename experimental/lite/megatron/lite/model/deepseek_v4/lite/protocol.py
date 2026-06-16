@@ -170,7 +170,7 @@ def _base_model_forward_kwargs(batch: PackedBatch):
     if batch.loss_mask is not None:
         kwargs["loss_mask"] = _as_batch_row(batch.loss_mask)
     add_loss_context_kwargs(kwargs)
-    position_ids = _normalize_ds4_position_ids(batch.position_ids)
+    position_ids = _normalize_ds4_position_ids(getattr(batch, "position_ids", None))
     if position_ids is not None:
         kwargs["position_ids"] = position_ids
     return kwargs
