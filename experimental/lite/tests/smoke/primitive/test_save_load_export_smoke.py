@@ -75,7 +75,7 @@ def _qwen3_5():
         # path (the in_proj/conv1d/layer_norm sharding fixes) is covered.
         layer_types=["full_attention", "linear_attention"],
         partial_rotary_factor=1.0,
-        max_position_embeddings=64,
+        max_position_embeddings=4096,
     )
     return cfg, protocol
 
@@ -95,7 +95,7 @@ def _qwen3_moe():
         num_experts=4,
         num_experts_per_tok=1,
         moe_intermediate_size=8,
-        max_position_embeddings=16,
+        max_position_embeddings=4096,
         layer_types=["full_attention", "full_attention"],
     )
     return cfg, protocol
@@ -125,12 +125,12 @@ def _kimi_k2():
         qk_nope_head_dim=8,
         qk_rope_head_dim=8,
         v_head_dim=8,
-        max_position_embeddings=128,
+        max_position_embeddings=4096,
         rope_theta=10000.0,
         rope_scaling={
             "type": "yarn",
             "factor": 1.0,
-            "original_max_position_embeddings": 128,
+            "original_max_position_embeddings": 4096,
             "beta_fast": 1.0,
             "beta_slow": 1.0,
             "mscale": 1.0,
@@ -153,7 +153,7 @@ def _glm5():
         num_key_value_heads=64,
         head_dim=256,
         vocab_size=32,
-        max_position_embeddings=512,
+        max_position_embeddings=4096,
         initializer_range=0.002,
         q_lora_rank=16,
         kv_lora_rank=512,
@@ -196,7 +196,7 @@ def _deepseek_v4():
         n_shared_experts=1,
         num_experts_per_tok=2,
         routed_scaling_factor=1.5,
-        max_position_embeddings=512,
+        max_position_embeddings=4096,
         compress_ratios=[4],
         sliding_window=128,
         num_hash_layers=2,
@@ -363,9 +363,9 @@ def _shared_tmp_path(tmp_path, suffix: str) -> str:
 
 def _random_packed_batch(vocab_size: int) -> PackedBatch:
     return PackedBatch(
-        input_ids=torch.randint(0, vocab_size, (128,), device="cuda"),
-        labels=torch.randint(0, vocab_size, (128,), device="cuda"),
-        seq_lens=torch.full((2,), 64, dtype=torch.int64, device="cuda"),
+        input_ids=torch.randint(0, vocab_size, (2048,), device="cuda"),
+        labels=torch.randint(0, vocab_size, (2048,), device="cuda"),
+        seq_lens=torch.full((1,), 2048, dtype=torch.int64, device="cuda"),
     )
 
 
@@ -381,7 +381,7 @@ def _train_step(handle: ModelHandle, backend: str, cfg) -> None:
         # fsdp2: pure-DP path, drive the model + optimizer directly.
         model = handle._extras["model_chunks"][0]
         model.train()
-        input_ids = torch.randint(0, cfg.vocab_size, (1, 128), device="cuda")
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 2048), device="cuda")
         handle._optimizer.zero_grad()
         out = model(input_ids=input_ids)
         logits = out["logits"] if isinstance(out, dict) else out
