@@ -263,6 +263,20 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_to_nested(output, meta, contiguous=True)
 
 
+def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
+    """Router-replay targets for DS4: contiguous CP split (matches the fused DSA
+    indexer layout). Hash-routed layers are excluded upstream from replay."""
+    from megatron.lite.model import protocol_utils
+
+    return protocol_utils.pack_routed_experts(model, batch, routed_experts, contiguous=True)
+
+
+def unpack_routed_experts(model: nn.Module, batch: PackedBatch, recorded):
+    from megatron.lite.model import protocol_utils
+
+    return protocol_utils.unpack_routed_experts(model, batch, recorded, contiguous=True)
+
+
 def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     override = impl_cfg.num_nextn_predict_layers
     if override is None:

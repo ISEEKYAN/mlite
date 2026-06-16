@@ -139,6 +139,48 @@ def _write_glm5_moe_config(path) -> None:
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def _write_deepseek_v4_config(path) -> None:
+    config = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "vocab_size": 128,
+        "max_position_embeddings": 128,
+        "initializer_range": 0.02,
+        "q_lora_rank": 64,
+        "qk_rope_head_dim": 16,
+        "o_lora_rank": 64,
+        "o_groups": 4,
+        "index_head_dim": 16,
+        "index_n_heads": 4,
+        "index_topk": 4,
+        "moe_intermediate_size": 32,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "num_hash_layers": 1,
+        "num_nextn_predict_layers": 0,
+        "compress_ratios": [4, 4],
+        "compress_rope_theta": 160000.0,
+        "hc_mult": 2,
+        "hc_eps": 1e-6,
+        "hc_sinkhorn_iters": 4,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "sliding_window": 128,
+        "swiglu_limit": 10.0,
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 1.0,
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 def _optimizer_config() -> SimpleNamespace:
     return SimpleNamespace(
         optimizer="adam",
@@ -226,6 +268,7 @@ def _forward(engine, runtime_batch, loss_context, router_replay):
         ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [16, 24, 32]),
         ("qwen3_moe", "qwen3_moe", _write_qwen3_moe_config, 128, [16, 24, 32]),
         ("glm5", "glm_moe_dsa", _write_glm5_moe_config, 32, [16, 24, 32]),
+        ("deepseek_v4", "deepseek_v4", _write_deepseek_v4_config, 128, [16, 20, 24]),
     ],
 )
 def test_router_replay_record_then_replay_aligns(
