@@ -15,6 +15,7 @@ from megatron.lite.primitive.parallel.cp import (
 from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 from megatron.lite.primitive.parallel.pp import (
     PipelineChunkLayout,
+    auto_pipeline_layer_counts,
     build_pipeline_chunk_layout,
 )
 from megatron.lite.primitive.parallel.sp import (
@@ -61,6 +62,7 @@ __all__ = [
     "PackedSeqParams",
     "PackedTHDBatch",
     "PipelineChunkLayout",
+    "auto_pipeline_layer_counts",
     "ParallelState",
     "RowParallelLinear",
     "VanillaColumnParallelLinear",

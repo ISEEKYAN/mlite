@@ -299,7 +299,11 @@ class DeepseekV4Model(nn.Module):
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
 
         layout = build_pipeline_chunk_layout(
-            config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id
+            config.num_hidden_layers,
+            ps,
+            train_config.vpp,
+            vpp_chunk_id,
+            num_mtp_layers=config.num_nextn_predict_layers if mtp_enable else 0,
         )
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed

@@ -6,6 +6,7 @@ import torch
 
 from megatron.lite.primitive.parallel import (
     ParallelState,
+    auto_pipeline_layer_counts,
     build_pipeline_chunk_layout,
     pack_nested_thd,
     parallel_state_from_model,
@@ -71,6 +72,63 @@ def test_pp_layout_rejects_non_divisible_vpp_layer_counts():
 
     with pytest.raises(ValueError, match="10 is not divisible by 6"):
         build_pipeline_chunk_layout(10, ps, vpp=3, vpp_chunk_id=0)
+
+
+def _ranks(pp_size: int) -> list[ParallelState]:
+    return [
+        ParallelState(
+            pp_size=pp_size,
+            pp_rank=r,
+            pp_is_first=(r == 0),
+            pp_is_last=(r == pp_size - 1),
+        )
+        for r in range(pp_size)
+    ]
+
+
+def _plain_layout_indices(num_layers: int, pp_size: int, **kw) -> list[list[int]]:
+    return [
+        build_pipeline_chunk_layout(num_layers, ps, **kw).layer_indices for ps in _ranks(pp_size)
+    ]
+
+
+def test_auto_layer_counts_balance_and_cover_when_not_divisible():
+    # 10 layers over 4 stages: balanced, contiguous, no layer dropped/duplicated.
+    counts = auto_pipeline_layer_counts(10, 4)
+    assert sum(counts) == 10
+    assert max(counts) - min(counts) <= 1
+    # embedding (+first) and head/MTP (+last) pull layers off the end stages.
+    counts_acc = auto_pipeline_layer_counts(10, 4, extra_first=1, extra_last=1 + 2)
+    assert sum(counts_acc) == 10
+    assert counts_acc[-1] <= counts[-1]  # MTP-laden last stage gets no more layers
+
+
+def test_pp_layout_auto_balances_non_divisible_counts_without_error():
+    # 10 layers, pp=4 — previously raised "not divisible"; now auto-balanced.
+    indices = _plain_layout_indices(10, 4)
+    flat = [i for stage in indices for i in stage]
+    assert flat == list(range(10))  # contiguous, ordered, complete
+    sizes = [len(s) for s in indices]
+    assert sum(sizes) == 10 and max(sizes) - min(sizes) <= 1
+    # vpp=1 (the model default) takes the same non-interleaved path.
+    assert _plain_layout_indices(10, 4, vpp=1) == indices
+
+
+def test_pp_layout_accounts_for_mtp_on_last_stage_when_non_divisible():
+    # With MTP layers on the last stage, the last stage should not carry more
+    # transformer layers than without accounting.
+    plain = _plain_layout_indices(7, 2)
+    with_mtp = _plain_layout_indices(7, 2, num_mtp_layers=2)
+    assert [i for s in with_mtp for i in s] == list(range(7))
+    assert len(with_mtp[-1]) <= len(plain[-1])
+
+
+def test_pp_layout_divisible_split_is_unchanged_by_auto_layout():
+    # Divisible counts must keep the plain even split (no checkpoint/layout drift),
+    # regardless of vpp=1 or MTP accounting.
+    assert _plain_layout_indices(8, 4) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert _plain_layout_indices(8, 4, vpp=1) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert _plain_layout_indices(8, 4, num_mtp_layers=3) == [[0, 1], [2, 3], [4, 5], [6, 7]]
 
 
 def test_virtual_pipeline_rank_is_tracked_on_lite_parallel_state():
