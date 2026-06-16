@@ -11,6 +11,7 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -134,11 +135,15 @@ def _batch_get(batch, key: str):
 
 
 def _apply_external_loss(
-    out: dict, batch, loss_fn
+    out: dict, batch, loss_fn, loss_context=None
 ) -> tuple[torch.Tensor, dict] | tuple[None, None]:
     if loss_fn is None:
         return None, None
-    loss, metrics = loss_fn(out, batch)
+    # Mirror run_microbatch_loop: pass loss_context as 3rd arg when present.
+    if loss_context is None:
+        loss, metrics = loss_fn(out, batch)
+    else:
+        loss, metrics = loss_fn(out, batch, loss_context)
     out["loss"] = loss
     out["_loss_fn_metrics"] = metrics
     return loss, metrics
@@ -229,7 +234,9 @@ def _1f1b_schedule(
     num_warmup = min(ps.pp_size - ps.pp_rank - 1, num_microbatches)
     num_steady = num_microbatches - num_warmup
 
-    batches = [next(data_iter) for _ in range(num_microbatches)]
+    # Split each microbatch into (PackedBatch, LossContext) like run_microbatch_loop; the connector
+    # yields (batch, loss_context) tuples, so forward_step must receive the unwrapped batch.
+    batches = [split_loss_context(next(data_iter)) for _ in range(num_microbatches)]
     mb_idx = 0
 
     input_tensors: list[torch.Tensor | None] = []
@@ -249,13 +256,14 @@ def _1f1b_schedule(
         else None
     )
 
-    def _run_forward(input_tensor, batch):
+    def _run_forward(input_tensor, batch, loss_context=None):
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         if not ps.pp_is_first:
             model.set_input_tensor(input_tensor)
-        out = forward_step_fn(model, batch)
-        if ps.pp_is_last:
-            _apply_external_loss(out, batch, loss_fn)
+        with use_loss_context(loss_context):
+            out = forward_step_fn(model, batch)
+            if ps.pp_is_last:
+                _apply_external_loss(out, batch, loss_fn, loss_context)
         return out
 
     def _run_backward(inp_t, hid_t, loss_t, grad_t):
@@ -285,10 +293,10 @@ def _1f1b_schedule(
         if not ps.pp_is_first and k == 0:
             fwd_input, _ = _p2p(recv_fwd=True)
 
-        batch = batches[mb_idx]
+        batch, loss_ctx = batches[mb_idx]
         mb_idx += 1
         current_input = fwd_input
-        out = _run_forward(fwd_input, batch)
+        out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
@@ -312,9 +320,9 @@ def _1f1b_schedule(
         if not ps.pp_is_first and k == 0 and num_warmup == 0:
             fwd_input, _ = _p2p(recv_fwd=True)
 
-        batch = batches[mb_idx]
+        batch, loss_ctx = batches[mb_idx]
         mb_idx += 1
-        out = _run_forward(fwd_input, batch)
+        out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
