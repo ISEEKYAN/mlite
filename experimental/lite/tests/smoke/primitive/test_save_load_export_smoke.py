@@ -553,9 +553,7 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
 # 3 delivery models x 2 optimizers on the 8-GPU proxy2 topology.
 # ──────────────────────────────────────────────────────────────────────────
 
-# qwen3_5 offload is validated separately (its GatedDeltaNet linear-attention
-# path and run env differ); the others run here.
-DELIVERY_MODELS = ("deepseek_v4", "glm5", "kimi_k2")
+DELIVERY_MODELS = ("qwen3_5", "deepseek_v4", "glm5", "kimi_k2")
 
 
 def _offload_topology(model_name: str) -> ParallelConfig:
@@ -566,6 +564,11 @@ def _offload_topology(model_name: str) -> ParallelConfig:
     if forced:
         tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
         return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
+    if model_name == "qwen3_5":
+        # qwen3.5's GatedDeltaNet linear attention does not support context
+        # parallelism, so it runs cp1 (tp2·pp2·dp2=8, ep2 within dp2) — its
+        # canonical config.  offload is CP-orthogonal, so cp1 fully exercises it.
+        return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
     if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
