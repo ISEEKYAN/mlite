@@ -204,6 +204,21 @@ def _optimizer_config() -> SimpleNamespace:
     )
 
 
+def _parallel_dims(world):
+    """Parallel layout from $MLITE_RR_PARALLEL (e.g. 'pp2cp2tp2ep2'); default cp=world."""
+    import os
+    import re
+
+    spec = os.environ.get("MLITE_RR_PARALLEL", "")
+    dims = {"tp": 1, "ep": 1, "pp": 1, "cp": 1}
+    if not spec:
+        dims["cp"] = world
+        return dims
+    for key, val in re.findall(r"(tp|ep|pp|cp)(\d+)", spec):
+        dims[key] = int(val)
+    return dims
+
+
 def _build_engine(tmp_path, model_name, model_type, write_config, world):
     from verl_mlite.compat import apply_runtime_patches
 
@@ -213,6 +228,7 @@ def _build_engine(tmp_path, model_name, model_type, write_config, world):
 
     hf_path = tmp_path / f"tiny-{model_name}"
     write_config(hf_path)
+    dims = _parallel_dims(world)
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path=str(hf_path),
@@ -221,7 +237,10 @@ def _build_engine(tmp_path, model_name, model_type, write_config, world):
         ),
         engine_config=MegatronLiteEngineConfig(
             model_name=model_name,
-            cp=world,
+            tp=dims["tp"],
+            ep=dims["ep"],
+            pp=dims["pp"],
+            cp=dims["cp"],
             impl_cfg={
                 "use_thd": True,
                 "optimizer": None,
