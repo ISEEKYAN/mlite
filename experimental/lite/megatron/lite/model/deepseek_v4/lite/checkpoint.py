@@ -1,5 +1,53 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from collections.abc import Iterable
+"""DeepSeek V4 (ds4flash) lite native checkpoint mapping.
+
+Structurally identical to ``megatron/lite/model/kimi_k2/lite/checkpoint.py`` and
+``megatron/lite/model/glm5/lite/checkpoint.py``: a ``DeepseekV4WeightSpec``
+encodes the per-param native <-> HF name mapping (and TP/EP sharding spec), and
+``export_hf_weights`` / ``save_hf_weights`` route through the SHARED
+``primitive/ckpt/hf_weights.py`` ``_export`` / ``save_safetensors``.  The shared
+exporter does the TP/ETP/EP/PP gather correctly (all ranks reach the PP
+``all_gather_object`` before any ``rank0_only`` filter), so DS4 no longer
+desyncs under PP>1 (the previous bespoke ``_gather_pp_hf_state`` /
+``_local_hf_state`` did an EP collective inside a rank0-skewed path and hung).
+
+DS4 native naming differs from Kimi in two structural ways the spec accounts for:
+
+  * DS4's chunks are ``DeepseekV4ForCausalLM`` (a ``model.`` prefix wraps the
+    inner ``DeepseekV4Model``), whereas Kimi's chunks are the bare model.  The
+    spec therefore matches ``model.layers.<idx>.*`` / ``model.mtp.<idx>.*`` /
+    ``model.embed_tokens.*`` etc.
+  * DS4's ``self.layers`` is an ``nn.ModuleDict`` keyed by the GLOBAL layer
+    index (Kimi uses an ``nn.ModuleList`` keyed locally).  The native names are
+    therefore already global; the shared exporter's local->global remap is an
+    identity for DS4 (global keys never collide with the positional range on
+    non-zero PP ranks), and the spec maps the global names 1:1 to HF names.
+
+DS4-specific weights handled by the spec (see ``native_to_hf``):
+
+  * CSA attention (``self_attn.self_attn.*``): MLA-style ``wq_a`` / ``q_norm`` /
+    ``wq_b`` / ``wkv`` / ``kv_norm`` / ``wo_a`` / ``wo_b`` plus ``sinks`` (HF
+    ``attn_sink``) and the ``compressor.*`` / ``indexer.*`` submodules, all
+    passed through 1:1 to ``layers.<i>.attn.*`` -- the exact names the previous
+    bespoke export produced.
+  * mHC: per-layer ``attn_hc`` / ``ffn_hc`` ``HyperConnection`` (``fn`` /
+    ``base`` / ``scale``) -> ``hc_attn_*`` / ``hc_ffn_*``, and the model-wide /
+    per-MTP ``hc_head`` ``MultiHeadHyperConnectionHead`` (``hc_fn`` / ``hc_base``
+    / ``hc_scale``) -> ``hc_head_*``.
+  * MTP: ``e_proj`` / ``h_proj`` / ``enorm`` / ``hnorm`` / ``norm`` carried 1:1
+    under ``mtp.<i>.*``.
+  * MoE: ``mlp.experts.fc{1,2}.weight<id>`` -> ``ffn.experts.<id>.w{1,3,2}``
+    (fc1 splits gate/up into w1/w3), shared expert ``mlp.shared_experts.*`` ->
+    ``ffn.shared_experts.w{1,3,2}``, dense ``mlp.gate_up`` / ``mlp.down`` ->
+    ``ffn.{gate_up,down}.*``, router ``mlp.gate.*`` -> ``ffn.gate.*``.
+
+CSA is NOT tensor-parallel-capable: DS4 runs TP=ETP=1 (the protocol gate raises
+for TP>1), exactly like GLM-5.  The spec's ``tp_spec`` therefore declares only
+the EP/ETP expert splits and the embed/head/eh_proj vocab split; nothing TP-only.
+"""
+
+from __future__ import annotations
+
 import math
 import re
 
@@ -12,7 +60,8 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _cast_export_tensor,
     _resolve_export_dtype,
-    save_safetensors,
+    parse_expert_idx,
+    to_global_layer_name,
     unwrap_model,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -47,12 +96,18 @@ def PLACEMENT_FN(param_name: str) -> list:
     return [Replicate(), Replicate(), Replicate(), Replicate()]
 
 
+# ======================================================================
+# Native <-> HF name mapping (shared by export spec and load path).
+#
+# These operate on the DS4 native ``state_dict`` / ``named_*`` names, i.e. with
+# the ``DeepseekV4ForCausalLM`` ``model.`` prefix and GLOBAL layer indices.
+# ======================================================================
+
 _BLOCK_KEY_RE = re.compile(r"^model\.(layers|mtp)\.(\d+)\.(.+)$")
 _GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.fc([12])\.weight(\d+)$")
 _PROJ_TO_HF = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
-# Native top-level param names changed when the model was re-skeletoned on the
-# Kimi clone: the embedding is now a VocabParallelEmbedding
+# Native top-level param names: the embedding is a VocabParallelEmbedding
 # (``embed_tokens.embedding.weight``) and the head a VocabParallelOutput
 # (``lm_head.col.linear.weight``).  The HF target names are unchanged.
 _TOP_LEVEL = {
@@ -102,6 +157,54 @@ def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
         return attr
     return None
 
+
+def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: ParallelState) -> int:
+    num_local = ensure_divisible(config.n_routed_experts, ps.ep_size)
+    return ps.ep_rank * num_local + local_idx
+
+
+def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
+    """Map a DS4 native ``state_dict`` key to its HF target name(s).
+
+    ``name`` is the global native name (``model.`` prefix, global layer idx).
+    Expert names are expected to already carry the GLOBAL expert id in their
+    ``weight<id>`` suffix (the load path and the shared exporter both supply
+    global expert ids before calling into this helper).
+    """
+    mapped = _TOP_LEVEL.get(name)
+    if mapped is not None:
+        return [mapped]
+    match = _BLOCK_KEY_RE.match(name)
+    if match is None:
+        return []
+    block, index, attr = match.groups()
+    prefix = f"layers.{index}" if block == "layers" else f"mtp.{index}"
+    # CSA lives under ``self_attn.self_attn.*`` (the SBHD wrapper adds one extra
+    # ``self_attn`` level).  Collapse it so the HF attention names are unchanged.
+    if attr.startswith("self_attn.self_attn."):
+        attr = "self_attn." + attr.removeprefix("self_attn.self_attn.")
+    if attr.startswith("self_attn.compressor."):
+        return [f"{prefix}.attn.compressor.{attr.removeprefix('self_attn.compressor.')}"]
+    if attr.startswith("self_attn.indexer."):
+        return [f"{prefix}.attn.indexer.{attr.removeprefix('self_attn.indexer.')}"]
+    mapped = _map_block_attr(attr, block)
+    if mapped is not None:
+        if isinstance(mapped, tuple):
+            return [f"{prefix}.{part}" for part in mapped]
+        return [f"{prefix}.{mapped}"]
+    expert = _GROUPED_EXPERT_RE.match(attr)
+    if expert is None:
+        return []
+    fc, expert_id = expert.groups()
+    expert_prefix = f"{prefix}.ffn.experts.{int(expert_id)}"
+    if fc == "1":
+        return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
+    return [f"{expert_prefix}.w2.weight"]
+
+
+# ======================================================================
+# FP4 / scaled-tensor dequant helpers (load path).
+# ======================================================================
 
 _FP4_E2M1_TABLE = (
     0.0,
@@ -211,45 +314,6 @@ def _copy_param(
     param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
 
-def _global_expert_idx(local_idx: int, config: DeepseekV4Config, ps: ParallelState) -> int:
-    num_local = ensure_divisible(config.n_routed_experts, ps.ep_size)
-    return ps.ep_rank * num_local + local_idx
-
-
-def _hf_names_for_state_key(name: str, config: DeepseekV4Config, ps: ParallelState) -> list[str]:
-    mapped = _TOP_LEVEL.get(name)
-    if mapped is not None:
-        return [mapped]
-    match = _BLOCK_KEY_RE.match(name)
-    if match is None:
-        return []
-    block, index, attr = match.groups()
-    prefix = f"layers.{index}" if block == "layers" else f"mtp.{index}"
-    # The Kimi-derived model wraps CSA in a ``DeepseekV4CSAAttention`` shim, so
-    # the native CSA params now live under ``self_attn.self_attn.*`` (one extra
-    # ``self_attn`` level).  Collapse it so the HF attention names are unchanged.
-    if attr.startswith("self_attn.self_attn."):
-        attr = "self_attn." + attr.removeprefix("self_attn.self_attn.")
-    if attr.startswith("self_attn.compressor."):
-        return [f"{prefix}.attn.compressor.{attr.removeprefix('self_attn.compressor.')}"]
-    if attr.startswith("self_attn.indexer."):
-        return [f"{prefix}.attn.indexer.{attr.removeprefix('self_attn.indexer.')}"]
-    mapped = _map_block_attr(attr, block)
-    if mapped is not None:
-        if isinstance(mapped, tuple):
-            return [f"{prefix}.{part}" for part in mapped]
-        return [f"{prefix}.{mapped}"]
-    expert = _GROUPED_EXPERT_RE.match(attr)
-    if expert is None:
-        return []
-    fc, local_idx = expert.groups()
-    expert_id = _global_expert_idx(int(local_idx), config, ps)
-    expert_prefix = f"{prefix}.ffn.experts.{expert_id}"
-    if fc == "1":
-        return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
-    return [f"{expert_prefix}.w2.weight"]
-
-
 def _read_hf_tensor(
     reader: SafeTensorReader, hf_name: str, target_shape: torch.Size | tuple[int, ...]
 ) -> torch.Tensor:
@@ -264,6 +328,14 @@ def _read_hf_tensor(
 def load_hf_weights(
     model: nn.Module, path: str, config: DeepseekV4Config, ps: ParallelState
 ) -> None:
+    """Load HF safetensors into the DS4 model.
+
+    Kept as DS4's native loader (the inverse of the spec's ``native_to_hf``):
+    it walks the native ``state_dict`` and resolves each key's HF name(s) via
+    ``_hf_names_for_state_key`` -- the SAME mapping the export spec uses, so the
+    round-trip names stay consistent.  EP-local expert ids are converted to
+    global before mapping.  CSA is TP=ETP=1, so there is no TP split here.
+    """
     if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=ETP=1.")
 
@@ -275,7 +347,7 @@ def load_hf_weights(
     for name, target in state.items():
         if _is_native_metadata_key(name):
             continue
-        hf_names = _hf_names_for_state_key(name, config, ps)
+        hf_names = _hf_names_for_state_key(_to_global_expert_name(name, config, ps), config)
         if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
             missing.append(name)
             continue
@@ -302,87 +374,163 @@ def load_hf_weights(
         log_rank0(f"WARNING: DeepSeek V4 checkpoint tensor missing: {name}")
 
 
-def _iter_unwrapped_chunks(model: nn.Module | Iterable[nn.Module]) -> Iterable[nn.Module]:
-    if isinstance(model, nn.Module):
-        yield unwrap_model(model)
-        return
-    for chunk in model:
-        if not isinstance(chunk, nn.Module):
-            raise TypeError(
-                f"DeepSeek V4 HF export expects nn.Module chunks, got {type(chunk).__name__}."
-            )
-        yield unwrap_model(chunk)
+def _to_global_expert_name(name: str, config: DeepseekV4Config, ps: ParallelState) -> str:
+    """Rewrite an EP-local expert ``weight<local>`` suffix to its global id.
+
+    The native ``state_dict`` carries the EP-local expert index; the HF target
+    name uses the global expert id.  Non-expert names pass through unchanged.
+    """
+    match = _BLOCK_KEY_RE.match(name)
+    if match is None:
+        return name
+    block, index, attr = match.groups()
+    expert = _GROUPED_EXPERT_RE.match(attr)
+    if expert is None:
+        return name
+    fc, local_idx = expert.groups()
+    global_idx = _global_expert_idx_from_local(int(local_idx), config, ps)
+    return f"model.{block}.{index}.mlp.experts.fc{fc}.weight{global_idx}"
 
 
-def _local_hf_state(
-    model: nn.Module | Iterable[nn.Module], config: DeepseekV4Config, ps: ParallelState
-) -> dict[str, torch.Tensor]:
-    exported: dict[str, torch.Tensor] = {}
-    for chunk in _iter_unwrapped_chunks(model):
-        for native_name, tensor in chunk.state_dict().items():
-            if _is_native_metadata_key(native_name):
-                continue
-            hf_names = _hf_names_for_state_key(native_name, config, ps)
-            if not hf_names:
-                raise KeyError(f"DeepSeek V4 native state key has no HF mapping: {native_name}")
-            pieces = (
-                tensor.detach().cpu().contiguous().chunk(2, dim=0)
-                if len(hf_names) == 2
-                else (tensor.detach().cpu().contiguous(),)
-            )
-            for hf_name, hf_tensor in zip(hf_names, pieces, strict=True):
-                exported[hf_name] = hf_tensor
-    return exported
+# ======================================================================
+# Export: shared TP/ETP/EP/PP gather via DeepseekV4WeightSpec.
+# ======================================================================
 
 
-def _gather_pp_hf_state(
-    local_state: dict[str, torch.Tensor], ps: ParallelState
-) -> dict[str, torch.Tensor]:
-    if ps.pp_size <= 1:
-        return local_state
-    if not dist.is_initialized() or ps.pp_group is None:
-        raise RuntimeError("DeepSeek V4 HF export with PP>1 requires an initialized PP group.")
-    gathered: list[dict[str, torch.Tensor] | None] = [None] * ps.pp_size
-    dist.all_gather_object(gathered, local_state, group=ps.pp_group)
-    merged: dict[str, torch.Tensor] = {}
-    for shard in gathered:
-        if shard:
-            merged.update(shard)
-    return merged
+class DeepseekV4WeightSpec:
+    """Export DS4 lite weights to HF DeepSeek-V4 names (CSA / mHC / MTP / MoE).
+
+    Mirrors ``KimiK2WeightSpec`` / ``Glm5WeightSpec`` but operates on DS4's
+    native names: the ``DeepseekV4ForCausalLM`` ``model.`` prefix and GLOBAL
+    layer indices (``self.layers`` is an ``nn.ModuleDict`` keyed by global idx).
+    The shared exporter rewrites EP-local expert ``weight<local>`` suffixes to
+    global ids before calling ``native_to_hf``, so the HF expert ids are global.
+    """
+
+    def __init__(self, config: DeepseekV4Config):
+        self.config = config
+
+    @property
+    def num_experts(self) -> int:
+        return self.config.n_routed_experts
+
+    def weight_map(self) -> dict[str, list[str]]:
+        return {}
+
+    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+        del native_name
+        return hf_tensors[0]
+
+    def native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        # ``native_name`` is the global native name; experts already carry the
+        # global expert id (shared exporter rewrote weight<local> -> weight<gid>).
+        hf_names = _hf_names_for_state_key(native_name, self.config)
+        if not hf_names:
+            return []
+        if len(hf_names) == 1:
+            return [(hf_names[0], tensor)]
+        if len(hf_names) == 2:
+            # 2 targets == fused gate/up split into (w1, w3) for shared/routed
+            # experts; split the leading dim exactly as the bespoke export did.
+            first, second = tensor.chunk(2, dim=0)
+            return [
+                (hf_names[0], first.contiguous()),
+                (hf_names[1], second.contiguous()),
+            ]
+        raise AssertionError(f"Unexpected HF name fan-out for {native_name}: {hf_names}")
+
+    def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
+        del native_name
+        return None
+
+    def tp_spec(self, native_name: str) -> tuple[int, int] | None:
+        # DS4 is TP=ETP=1 (CSA is not TP-capable); only EP shards experts.  The
+        # expert (split_dim, ETP) entries are declared so the shared ETP path
+        # would be correct if ETP were ever enabled; embed/head/eh_proj carry
+        # the vocab split-dim spec for completeness (no-op at TP=1).
+        if self.is_expert(native_name):
+            if ".fc1." in native_name:
+                return (0, 1)
+            if ".fc2." in native_name:
+                return (1, 1)
+            return None
+        if native_name.endswith(".eh_proj.linear.weight"):
+            return (0, 0)
+        if native_name in {
+            "model.embed_tokens.embedding.weight",
+            "lm_head.col.linear.weight",
+        }:
+            return (0, 0)
+        return None
+
+    def is_expert(self, native_name: str) -> bool:
+        return ".mlp.experts." in native_name and ".shared_experts." not in native_name
+
+    def expert_global_id(self, native_name: str) -> int | None:
+        if self.is_expert(native_name):
+            return parse_expert_idx(native_name)
+        return None
+
+    def expert_local_name(self, native_name: str, local_idx: int) -> str:
+        prefix = native_name.rsplit(".weight", 1)[0]
+        return f"{prefix}.weight{local_idx}"
 
 
-def export_hf_weights(
-    model: nn.Module | Iterable[nn.Module],
-    config: DeepseekV4Config,
-    ps: ParallelState,
-    *,
-    rank0_only: bool = False,
-    export_dtype: str | torch.dtype | None = None,
-    limit: int | None = None,
-    **_kwargs,
-):
+def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
+    """Export DS4 weights as HF (name, tensor) pairs via the SHARED exporter.
+
+    Identical structure to kimi/glm5: delegate to the shared ``_export`` (which
+    does the TP/ETP/EP/PP gather, including the PP ``all_gather_object`` reached
+    by ALL ranks before any ``rank0_only`` filter), then append the persistent
+    router buffers (``tid2eid`` for hash layers, ``expert_bias`` for non-hash
+    layers) which the parameter-only ``_export`` does not visit.
+    """
+    from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
+
+    spec = DeepseekV4WeightSpec(config)
+    rank0_only = bool(kwargs.get("rank0_only", False))
+    export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
+    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+
     rank = dist.get_rank() if dist.is_initialized() else 0
-    export_dtype_resolved = _resolve_export_dtype(export_dtype)
-    exported = _gather_pp_hf_state(_local_hf_state(model, config, ps), ps)
     if rank0_only and rank != 0:
         return
-    for index, hf_name in enumerate(sorted(exported)):
-        if limit is not None and index >= limit:
-            return
-        yield hf_name, _cast_export_tensor(exported[hf_name], export_dtype_resolved)
+    chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
+    for chunk in chunks:
+        base_chunk = unwrap_model(chunk)
+        layer_map = (
+            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            if hasattr(base_chunk, "layer_indices")
+            else {}
+        )
+        for name, buffer in base_chunk.named_buffers():
+            # Persistent router buffers carried into HF: hash-layer ``tid2eid``
+            # and the (made-persistent for non-hash layers) ``expert_bias``.
+            if not (name.endswith(".mlp.gate.tid2eid") or name.endswith(".mlp.gate.expert_bias")):
+                continue
+            global_name = to_global_layer_name(name, layer_map)
+            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
+                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
-def save_hf_weights(
-    model: nn.Module | Iterable[nn.Module],
-    path: str,
-    config: DeepseekV4Config,
-    ps: ParallelState,
-    *,
-    export_dtype: str | torch.dtype | None = None,
-) -> None:
+def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:
+    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+
     rank = dist.get_rank() if dist.is_initialized() else 0
-    tensors = dict(export_hf_weights(model, config, ps, rank0_only=True, export_dtype=export_dtype))
-    if rank == 0:
-        save_safetensors(tensors, path)
+    out = dict(export_hf_weights(model, config, ps, rank0_only=True, **kwargs))
+    if rank == 0 and out:
+        save_safetensors(out, path)
     if dist.is_initialized():
         dist.barrier()
+
+
+__all__ = [
+    "EXPERT_CLASSIFIER",
+    "DeepseekV4WeightSpec",
+    "PLACEMENT_FN",
+    "export_hf_weights",
+    "load_hf_weights",
+    "save_hf_weights",
+]

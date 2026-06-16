@@ -454,7 +454,7 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
 
     shards = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
     assert shards, f"no safetensors exported to {out_dir}"
-    n_tensors = 0
+    keys: set[str] = set()
     for shard in shards:
         with safe_open(os.path.join(out_dir, shard), framework="pt") as fh:
             for key in fh.keys():
@@ -464,8 +464,17 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
                 assert key.startswith("model.") or key in ("lm_head.weight",), (
                     f"unexpected non-HF export key: {key}"
                 )
-                n_tensors += 1
-    assert n_tensors > 0, "exported zero tensors"
+                keys.add(key)
+    assert keys, "exported zero tensors"
+    # PP-gather completeness: the rank-0 export must carry EVERY decoder layer's
+    # weights (all pipeline stages gathered), not just the first stage's — guards
+    # against a pp-blind export silently dropping later stages' layers.
+    num_layers = int(getattr(cfg, "num_hidden_layers"))
+    missing = [i for i in range(num_layers) if not any(f".layers.{i}." in k for k in keys)]
+    assert not missing, (
+        f"export missing decoder layers {missing} (PP gather incomplete); "
+        f"sample keys: {sorted(keys)[:6]}"
+    )
     dist.barrier()
 
 
