@@ -172,18 +172,25 @@ def _make_mlite_model_config_hook(cfg: BenchCliConfig):
 
         def truncate_layers_hook(model_cfg):
             old_layers = getattr(model_cfg, "num_hidden_layers", None)
-            layer_types = getattr(model_cfg, "layer_types", None)
-            if old_layers is None or layer_types is None:
-                raise ValueError("truncate_layers requires num_hidden_layers and layer_types.")
+            if old_layers is None:
+                raise ValueError("truncate_layers requires num_hidden_layers.")
             if keep_layers <= 0 or keep_layers > old_layers:
                 raise ValueError(
                     f"truncate_layers must be in [1, {old_layers}], got {keep_layers}."
                 )
-            return replace(
-                model_cfg,
-                num_hidden_layers=keep_layers,
-                layer_types=list(layer_types[:keep_layers]),
-            )
+            fields_ = getattr(model_cfg, "__dataclass_fields__", {})
+            updates: dict[str, Any] = {"num_hidden_layers": keep_layers}
+            # Per-layer pattern lists must be truncated to match. qwen3.5 uses
+            # layer_types; glm5 uses mlp_layer_types; deepseek-family has neither.
+            for attr in ("layer_types", "mlp_layer_types"):
+                if attr in fields_ and getattr(model_cfg, attr) is not None:
+                    updates[attr] = list(getattr(model_cfg, attr)[:keep_layers])
+            # Keep the dense-MLP prefix within the truncated depth so the config stays valid.
+            if "first_k_dense_replace" in fields_:
+                fkdr = getattr(model_cfg, "first_k_dense_replace")
+                if fkdr is not None and fkdr > keep_layers:
+                    updates["first_k_dense_replace"] = keep_layers
+            return replace(model_cfg, **updates)
 
         hooks.append(truncate_layers_hook)
 
