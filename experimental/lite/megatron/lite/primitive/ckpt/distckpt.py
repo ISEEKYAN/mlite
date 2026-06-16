@@ -113,7 +113,22 @@ def load_dist_opt_checkpoint(
             )
         finally:
             _restore_state_dict_patches(patches)
-    state_dict = dist_checkpointing.load(load_sd, checkpoint_dir, validate_access_integrity=False)
+    # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
+    # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
+    # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
+    _orig_torch_load = torch.load
+
+    def _trusted_torch_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_torch_load(*args, **kwargs)
+
+    torch.load = _trusted_torch_load
+    try:
+        state_dict = dist_checkpointing.load(
+            load_sd, checkpoint_dir, validate_access_integrity=False
+        )
+    finally:
+        torch.load = _orig_torch_load
     if load_model:
         _load_model_state_dict(model, state_dict)
     if load_optimizer and optimizer is not None and "optimizer" in state_dict:
