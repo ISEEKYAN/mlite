@@ -167,9 +167,9 @@ def _glm5():
         intermediate_size=20,
         moe_intermediate_size=6,
         first_k_dense_replace=1,
-        n_routed_experts=3,
+        n_routed_experts=4,
         n_shared_experts=1,
-        num_experts_per_tok=3,
+        num_experts_per_tok=2,
     )
     return cfg, protocol
 
@@ -197,7 +197,7 @@ def _deepseek_v4():
         num_experts_per_tok=2,
         routed_scaling_factor=1.5,
         max_position_embeddings=4096,
-        compress_ratios=[4],
+        compress_ratios=[4, 4],
         sliding_window=128,
         num_hash_layers=2,
         hc_mult=2,
