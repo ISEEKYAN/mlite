@@ -10,6 +10,7 @@ import torch.nn as nn
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
     export_hf_weights as _export_hf_weights_impl,
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
@@ -396,7 +397,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             is_expert=is_expert_param,
             deterministic=impl_cfg.deterministic,
         )
-        attach_model_sharded_state_dict(chunks, ps, is_expert=is_expert_param)
+        attach_model_sharded_state_dict(
+            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+        )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
     elif optimizer_name == "fsdp2":

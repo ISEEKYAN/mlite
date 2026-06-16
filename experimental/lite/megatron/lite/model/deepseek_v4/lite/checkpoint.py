@@ -23,6 +23,30 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
     return ".experts." in name and ".shared_experts." not in name
 
 
+def PLACEMENT_FN(param_name: str) -> list:
+    # distckpt sharded placement (TP=ETP=1 for ds4; shares kimi/glm5's
+    # Experts/SwiGLUMLP/VocabParallel structure). EP-sharded experts must carry
+    # an explicit placement or the dist-opt checkpoint won't restore them
+    # bit-exactly. The CSA/mHC/MTP-norm params fall through to all-Replicate.
+    from torch.distributed.tensor import Replicate, Shard
+
+    if ".experts." in param_name and ".shared_experts." not in param_name:
+        if "fc1" in param_name:
+            return [Replicate(), Replicate(), Shard(0), Shard(0)]
+        if "fc2" in param_name:
+            return [Replicate(), Replicate(), Shard(0), Shard(1)]
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
+    if "eh_proj.linear.weight" in param_name:
+        return [Replicate(), Replicate(), Replicate(), Shard(0)]
+    if "gate_up" in param_name:
+        return [Replicate(), Replicate(), Replicate(), Shard(0)]
+    if "down" in param_name:
+        return [Replicate(), Replicate(), Replicate(), Shard(1)]
+    if "embed" in param_name or "head" in param_name:
+        return [Replicate(), Replicate(), Replicate(), Shard(0)]
+    return [Replicate(), Replicate(), Replicate(), Replicate()]
+
+
 _BLOCK_KEY_RE = re.compile(r"^model\.(layers|mtp)\.(\d+)\.(.+)$")
 _GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.fc([12])\.weight(\d+)$")
 _PROJ_TO_HF = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
