@@ -415,8 +415,12 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
     rhs_params = _local_named_params(rhs)
     assert lhs_params.keys() == rhs_params.keys()
     assert lhs_params, "expected at least one local parameter to compare."
+    mismatches = []
     for name in lhs_params:
-        torch.testing.assert_close(lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0)
+        if not torch.equal(lhs_params[name], rhs_params[name]):
+            diff = (lhs_params[name] - rhs_params[name]).abs().max().item()
+            mismatches.append(f"{name} (max_abs_diff={diff})")
+    assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(mismatches)
 
 
 def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None:
