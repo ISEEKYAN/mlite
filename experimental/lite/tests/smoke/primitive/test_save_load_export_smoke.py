@@ -297,7 +297,9 @@ def _topology(model_name: str, backend: str) -> ParallelConfig:
         # fsdp2 shards over the full data-parallel mesh (pure DP); etp must be a
         # concrete int because init_parallel computes expert_dp = world/(etp*ep*pp).
         return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
-    if model_name in _TP1_ONLY:
+    # Diagnostic hook: force the tp1/pp2 topology on any model to isolate
+    # whether a tp1+pp2 pipeline-P2P bug is generic (not DSA-specific).
+    if model_name in _TP1_ONLY or os.environ.get("MLITE_FORCE_TP1"):
         # tp1 x pp2 x cp1 x dp4 = 8 ranks; ep2 within the expert space.
         # CP is intentionally 1: save/load fidelity does not need the DSA CP path
         # (covered by the dedicated CP smokes), and CP+tiny-seq risks fused-DSA hangs.
