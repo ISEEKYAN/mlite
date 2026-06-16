@@ -567,6 +567,13 @@ def _offload_topology(model_name: str) -> ParallelConfig:
     # proxy2 = 8-GPU pp2/ep2/cp2.  CSA/DSA (glm5, ds4) are TP=1 only, so they
     # fill 8 ranks with dp2 (tp1·cp2·pp2·dp2=8); TP-capable MoE models use tp2
     # (tp2·cp2·pp2·dp1=8).
+    if model_name == "qwen3_5":
+        # qwen3.5 runs only in its FLA/GatedDeltaNet env, whose NCCL build cannot
+        # complete the cp2 pipeline P2P (the same tp2 config passes for kimi in the
+        # DSA overlay).  That is an env limitation, not an offload/model issue;
+        # offload's CPU<->GPU movement is CP-orthogonal, so qwen3.5 is exercised at
+        # cp1 until a cp2-capable FLA env exists.
+        return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
     if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
