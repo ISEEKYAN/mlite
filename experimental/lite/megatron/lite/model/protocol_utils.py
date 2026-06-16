@@ -113,12 +113,14 @@ def pack_routed_experts(
     per-layer targets the runtime feeds to ``RouterReplay.set_replay_data``.
     """
     ps = _parallel_state(model)
+    # Padding always uses the zigzag (2*cp) TE alignment — every model packs that
+    # way; only the CP split direction differs (zigzag interleave vs contiguous
+    # block, e.g. DeepSeek-V4's fused DSA indexer).
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
-        contiguous=contiguous,
     )
     rows = (
         list(routed_experts.unbind(0))
@@ -146,13 +148,19 @@ def pack_routed_experts(
             )
         start = int(meta.cu_seqlens_padded[idx].item())
         full[start : start + length] = row.to(device=device, dtype=torch.long)
-    local = split_packed_to_cp_local(
-        full,
-        cu_seqlens_padded=meta.cu_seqlens_padded,
-        cp_size=ps.cp_size,
-        cp_rank=ps.cp_rank,
-        dim=0,
-    )
+    if contiguous:
+        if ps.cp_size > 1:
+            local_len = total_padded // ps.cp_size
+            full = full[ps.cp_rank * local_len : (ps.cp_rank + 1) * local_len]
+        local = full
+    else:
+        local = split_packed_to_cp_local(
+            full,
+            cu_seqlens_padded=meta.cu_seqlens_padded,
+            cp_size=ps.cp_size,
+            cp_rank=ps.cp_rank,
+            dim=0,
+        )
     return [local[:, layer, :].contiguous() for layer in range(num_layers)]
 
 

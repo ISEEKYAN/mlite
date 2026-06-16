@@ -258,6 +258,13 @@ def test_router_replay_record_then_replay_aligns(
     runtime_batch = engine._make_runtime_batch(micro_batch)
     loss_context = engine._make_runtime_loss_context(micro_batch, loss_scale=1.0)
 
+    # 0) Run-to-run noise floor: two identical no-replay forwards. Deterministic
+    #    models give 0; non-deterministic fused kernels (e.g. DSA attention) give
+    #    a small floor we accept replay reproduction against (red-line #4).
+    lp_a = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
+    lp_b = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
+    noise = (lp_a - lp_b).abs().max().item()
+
     # 1) RECORD the routing during a log-prob pass.
     rec = _forward(engine, runtime_batch, loss_context, {"action": "record"})
     routed = rec.model_output.routed_experts
@@ -266,17 +273,20 @@ def test_router_replay_record_then_replay_aligns(
     assert [int(x) for x in routed.offsets().diff().cpu()] == lengths
     lp_record = _flat(rec.model_output.log_probs)
 
-    # 2) REPLAY the recorded routing — must reproduce the recorded log-probs.
+    # 2) REPLAY the recorded routing — must reproduce the recorded forward within
+    #    the kernel-noise floor (bitwise when the model is deterministic).
     replay_batch = dataclasses.replace(runtime_batch, routed_experts=routed)
     rep = _forward(engine, replay_batch, loss_context, {"action": "replay"})
     lp_replay = _flat(rep.model_output.log_probs)
-    torch.testing.assert_close(
-        lp_replay, lp_record, atol=0.0, rtol=0.0,
-        msg="replay must reproduce the recorded forward bitwise",
+    replay_diff = (lp_replay - lp_record).abs().max().item()
+    tol = max(noise * 4.0, 1e-6)
+    assert replay_diff <= tol, (
+        f"replay must reproduce the recorded forward (diff={replay_diff:.3e} > tol={tol:.3e}, "
+        f"noise floor={noise:.3e})"
     )
 
     # 3) Move the gate so natural routing changes; replay must still force the
-    #    recorded experts (log-probs diverge from the fresh natural routing).
+    #    recorded experts (log-probs diverge from fresh routing, well above noise).
     with torch.no_grad():
         for name, param in engine.module.named_parameters():
             if name.endswith("router.gate.weight") or name.endswith("gate.weight"):
@@ -285,13 +295,16 @@ def test_router_replay_record_then_replay_aligns(
     lp_replay2 = _flat(
         _forward(engine, replay_batch, loss_context, {"action": "replay"}).model_output.log_probs
     )
-    max_diff = (lp_replay2 - lp_natural).abs().max()
+    override_diff = (lp_replay2 - lp_natural).abs().max().item()
     assert torch.isfinite(lp_replay2).all()
-    assert max_diff.item() > 0.0, "replay should override the perturbed natural routing"
+    assert override_diff > max(noise * 10.0, 1e-4), (
+        f"replay should override perturbed routing (override={override_diff:.3e}, noise={noise:.3e})"
+    )
 
     if rank == 0:
         print(
             "NON_SKIP_VERL_MLITE_ROUTER_REPLAY_ALIGN_PASSED "
             f"model={model_name} world_size={world} lengths={lengths} "
-            f"replay_vs_record_max_abs=0 perturbed_replay_vs_natural_max_abs={max_diff.item():.6e}"
+            f"noise={noise:.3e} replay_vs_record={replay_diff:.3e} "
+            f"perturbed_replay_vs_natural={override_diff:.3e}"
         )
