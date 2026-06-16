@@ -289,6 +289,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             model_name=cfg.model_name,
             parallel=parallel,
             optimizer=optimizer,
+            use_thd=cfg.use_thd,
             load_hf_weights=not cfg.skip_load_hf_weights,
             build_optimizer=not cfg.skip_optimizer_build,
             override_ddp_config=_json_mapping(cfg.override_ddp_json, name="override_ddp_json"),
