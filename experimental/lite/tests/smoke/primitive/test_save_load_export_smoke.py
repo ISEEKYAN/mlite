@@ -203,7 +203,9 @@ def _deepseek_v4():
         index_head_dim=64,
         index_n_heads=8,
         index_topk=64,
-        num_nextn_predict_layers=0,
+        # DeepSeek-V4 really has MTP; its ImplConfig defaults mtp_enable=True and
+        # requires >=1 nextn layer, so give it one (exercises MTP weight IO too).
+        num_nextn_predict_layers=1,
         rms_norm_eps=1e-6,
     )
     return cfg, protocol
@@ -269,13 +271,21 @@ def _reset_parallel_state_between_tests():
         mpu.destroy_model_parallel()
 
 
-def _topology(backend: str) -> ParallelConfig:
-    if backend == "dist_opt":
-        # tp2 x pp2 x cp1 x dp2 = 8 ranks; ep2 within the expert space.
-        return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
-    # fsdp2 shards over the full data-parallel mesh (pure DP); etp must be a
-    # concrete int because init_parallel computes expert_dp = world/(etp*ep*pp).
-    return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
+# GLM5 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
+# through primitives), so their dist_opt topology shards via ep/pp/cp instead.
+_TP1_ONLY = {"glm5", "deepseek_v4"}
+
+
+def _topology(model_name: str, backend: str) -> ParallelConfig:
+    if backend == "fsdp2":
+        # fsdp2 shards over the full data-parallel mesh (pure DP); etp must be a
+        # concrete int because init_parallel computes expert_dp = world/(etp*ep*pp).
+        return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
+    if model_name in _TP1_ONLY:
+        # tp1 x pp2 x cp2 x dp2 = 8 ranks; ep2 within the expert space.
+        return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
+    # tp2 x pp2 x cp1 x dp2 = 8 ranks; ep2 within the expert space.
+    return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
 
 
 def _optimizer_config() -> OptimizerConfig:
@@ -296,7 +306,7 @@ def _build_handle(model_name: str, backend: str, *, seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    parallel = _topology(backend)
+    parallel = _topology(model_name, backend)
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
         optimizer=backend,
@@ -395,13 +405,26 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
 
 
 def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None:
-    """Export HF weights (bf16) and assert the reloaded shards are valid."""
-    if not hasattr(protocol, "save_hf_weights"):
-        pytest.skip(f"{protocol.__name__} has no save_hf_weights export path.")
+    """Export HF weights (bf16) and assert the reloaded shards are valid.
 
+    Prefer the model's ``save_hf_weights`` wrapper; some models only expose the
+    ``export_hf_weights`` generator, so fall back to gathering it and writing
+    the safetensors ourselves (rank 0). Every supported model must offer one of
+    the two — otherwise it has no export path at all, which is a hard failure.
+    """
     chunks = handle._extras["model_chunks"]
     ps = handle._parallel_state
-    protocol.save_hf_weights(chunks, out_dir, cfg, ps)
+
+    if hasattr(protocol, "save_hf_weights"):
+        protocol.save_hf_weights(chunks, out_dir, cfg, ps)
+    elif hasattr(protocol, "export_hf_weights"):
+        from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+
+        weights = dict(protocol.export_hf_weights(chunks, cfg, ps, rank0_only=True))
+        if dist.get_rank() == 0 and weights:
+            save_safetensors(weights, out_dir)
+    else:
+        raise AssertionError(f"{protocol.__name__} exposes no HF export path.")
     dist.barrier()
 
     if dist.get_rank() != 0:
