@@ -67,7 +67,14 @@ class DeepseekV4MoE(nn.Module):
             scores = F.softplus(logits.float()).sqrt()
         else:
             scores = logits.float().sigmoid()
-        indices = self.gate.tid2eid[input_ids.reshape(-1).to(torch.int64)]
+        flat_ids = input_ids.reshape(-1).to(torch.int64)
+        # mHC expands each token into hc_mult contiguous streams (x is
+        # [..., hc_mult, H] flattened), all sharing one input id; repeat the
+        # ids to match the flattened token count so routing aligns with x.
+        repeat = x.shape[0] // flat_ids.shape[0]
+        if repeat > 1:
+            flat_ids = flat_ids.repeat_interleave(repeat)
+        indices = self.gate.tid2eid[flat_ids]
         weights = scores.gather(1, indices)
         if self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
