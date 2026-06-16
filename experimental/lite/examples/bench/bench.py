@@ -133,20 +133,36 @@ def _disable_mtp(config_obj: Any) -> Any:
     return root
 
 
+def _moe_expert_count_field(config_obj: Any) -> str | None:
+    """Name of the MoE routed-expert-count field on a model or HF config.
+
+    qwen-family configs expose ``num_experts``; deepseek-family configs (glm5,
+    kimi_k2, deepseek_v4) use ``n_routed_experts`` (where ``num_experts`` may be
+    a read-only property). Prefer a real dataclass field so ``replace`` works.
+    """
+    fields_ = getattr(config_obj, "__dataclass_fields__", None)
+    candidates = ("num_experts", "n_routed_experts")
+    if fields_ is not None:
+        return next((name for name in candidates if name in fields_), None)
+    return next((name for name in candidates if getattr(config_obj, name, None) is not None), None)
+
+
 def _make_mlite_model_config_hook(cfg: BenchCliConfig):
     hooks = []
     if cfg.keep_experts is not None:
         keep_experts = cfg.keep_experts
 
         def keep_experts_hook(model_cfg):
-            old_num = getattr(model_cfg, "num_experts", None)
+            field = _moe_expert_count_field(model_cfg)
             old_topk = getattr(model_cfg, "num_experts_per_tok", None)
-            if old_num is None or old_topk is None:
+            if field is None or old_topk is None:
                 raise ValueError("keep_experts requires model config with MoE expert metadata.")
+            old_num = getattr(model_cfg, field)
             if keep_experts <= 0 or keep_experts > old_num:
                 raise ValueError(f"keep_experts must be in [1, {old_num}], got {keep_experts}.")
             return replace(
-                model_cfg, num_experts=keep_experts, num_experts_per_tok=min(old_topk, keep_experts)
+                model_cfg,
+                **{field: keep_experts, "num_experts_per_tok": min(old_topk, keep_experts)},
             )
 
         hooks.append(keep_experts_hook)
@@ -192,13 +208,14 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
 
         def keep_experts_hook(bridge) -> None:
             hf_cfg = _get_bridge_config_root(bridge)
-            old_num = getattr(hf_cfg, "num_experts", None)
+            field = _moe_expert_count_field(hf_cfg)
             old_topk = getattr(hf_cfg, "num_experts_per_tok", None)
-            if old_num is None or old_topk is None:
+            if field is None or old_topk is None:
                 raise ValueError("keep_experts requires HF config with MoE expert metadata.")
+            old_num = getattr(hf_cfg, field)
             if keep_experts <= 0 or keep_experts > old_num:
                 raise ValueError(f"keep_experts must be in [1, {old_num}], got {keep_experts}.")
-            hf_cfg.num_experts = keep_experts
+            setattr(hf_cfg, field, keep_experts)
             hf_cfg.num_experts_per_tok = min(old_topk, keep_experts)
             _refresh_bridge_config(bridge)
 
