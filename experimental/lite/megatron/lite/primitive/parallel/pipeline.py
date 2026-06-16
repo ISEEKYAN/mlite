@@ -259,7 +259,10 @@ def _1f1b_schedule(
     def _run_forward(input_tensor, batch, loss_context=None):
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         if not ps.pp_is_first:
-            model.set_input_tensor(input_tensor)
+            # `model` is the dist_opt DDP-wrapped chunk; set_input_tensor lives on the base lite model.
+            from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+            unwrap_model(model).set_input_tensor(input_tensor)
         with use_loss_context(loss_context):
             out = forward_step_fn(model, batch)
             if ps.pp_is_last:
