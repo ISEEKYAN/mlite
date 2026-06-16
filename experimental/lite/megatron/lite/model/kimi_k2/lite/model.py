@@ -12,8 +12,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
-
 from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -24,7 +24,6 @@ from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entro
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.ops.sp_ops import ReduceScatterDim0
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,

@@ -224,7 +224,6 @@ def test_attach_skips_router_replay_excluded_modules():
     """DeepSeek-V4 hash-routed layers set ``_router_replay_exclude`` so they stay
     out of the replay registry (their routing is weight-independent)."""
     import torch.nn as nn
-
     from megatron.lite.primitive.modules.router import RouterReplay, attach_router_replay
 
     class _FakeRouter(nn.Module):

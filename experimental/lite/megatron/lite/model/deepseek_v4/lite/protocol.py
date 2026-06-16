@@ -6,13 +6,18 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     EXPERT_CLASSIFIER,
     PLACEMENT_FN,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     export_hf_weights as _export_hf_weights_impl,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.protocol_utils import add_loss_context_kwargs
@@ -24,7 +29,11 @@ from megatron.lite.primitive.parallel.cp import (
     local_position_ids_for_cp,
     local_sequence_tensor_for_cp,
 )
-from megatron.lite.primitive.parallel.thd import pack_nested_thd, thd_pack_meta, unpack_thd_to_nested
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    thd_pack_meta,
+    unpack_thd_to_nested,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 

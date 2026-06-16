@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 

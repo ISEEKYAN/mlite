@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
