@@ -218,3 +218,54 @@ def test_set_replay_data_length_mismatch_raises():
     _topk_router(True)  # registers exactly one instance
     with pytest.raises(ValueError):
         RouterReplay.set_replay_data([torch.zeros(2, 2, dtype=torch.long)] * 2)
+
+
+def test_attach_skips_router_replay_excluded_modules():
+    """DeepSeek-V4 hash-routed layers set ``_router_replay_exclude`` so they stay
+    out of the replay registry (their routing is weight-independent)."""
+    import torch.nn as nn
+
+    from megatron.lite.primitive.modules.router import RouterReplay, attach_router_replay
+
+    class _FakeRouter(nn.Module):
+        def __init__(self, exclude=False):
+            super().__init__()
+            self.router_replay = None
+            if exclude:
+                self._router_replay_exclude = True
+
+    model = nn.ModuleList([_FakeRouter(), _FakeRouter(exclude=True), _FakeRouter()])
+    count = attach_router_replay(model)
+    assert count == 2
+    assert len(RouterReplay.global_router_replay_instances) == 2
+
+
+@pytest.mark.parametrize("contiguous", [False, True], ids=["zigzag", "contiguous"])
+def test_routed_experts_pack_unpack_round_trip(contiguous):
+    """pack -> stack -> unpack recovers the routing (CP=1; pure tensor path,
+    covers both the shared zigzag layout and DS4's contiguous layout)."""
+    from megatron.lite.model.protocol_utils import pack_routed_experts, unpack_routed_experts
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    seq_lens = torch.tensor([3, 5], dtype=torch.int64)
+    total = int(seq_lens.sum())
+    model = SimpleNamespace(ps=ParallelState())  # cp1 tp1
+    batch = PackedBatch(
+        input_ids=torch.zeros(total, dtype=torch.long),
+        labels=torch.zeros(total, dtype=torch.long),
+        seq_lens=seq_lens,
+    )
+    num_layers, topk = 2, 2
+    rows = [
+        torch.randint(0, 8, (int(n), num_layers, topk), dtype=torch.long) for n in seq_lens
+    ]
+    routed = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    targets = pack_routed_experts(model, batch, routed, contiguous=contiguous)
+    assert len(targets) == num_layers
+    stacked = torch.stack(targets, dim=1)  # [tokens_padded, num_layers, topk]
+    recovered = unpack_routed_experts(model, batch, stacked, contiguous=contiguous)
+
+    for original, got in zip(rows, recovered.unbind(0), strict=True):
+        assert torch.equal(original, got)

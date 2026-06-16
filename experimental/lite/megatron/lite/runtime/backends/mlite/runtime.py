@@ -484,12 +484,17 @@ class MegatronLiteRuntime(RuntimeBase):
                             metrics[k] = v
                 metrics["_micro_outputs"] = outputs
 
+            if replay_driver is not None and replay_driver.action == "record":
+                routed_experts = replay_driver.collect_recorded()
+            else:
+                routed_experts = out.get("routed_experts") if out else None
+
             return ForwardResult(
                 model_output=ModelOutputs(
                     loss=loss_tensor,
                     vocab_parallel_logits=out.get("logits") if out else None,
                     log_probs=out.get("log_probs") if out else None,
-                    routed_experts=out.get("routed_experts") if out else None,
+                    routed_experts=routed_experts,
                 ),
                 metrics=metrics,
             )

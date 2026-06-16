@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from megatron.lite.model import protocol_utils
 from megatron.lite.primitive.modules.router import (
     RouterReplay,
@@ -27,6 +28,7 @@ from megatron.lite.primitive.modules.router import (
     attach_router_replay,
     detach_router_replay,
 )
+from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 
 _RECORD = "record"
 _REPLAY = "replay"
@@ -54,6 +56,11 @@ class RouterReplayDriver:
         self._chunks = handle._extras.get("model_chunks", [handle._model])
         self._protocol = handle._extras.get("protocol")
         self._num_routers = 0
+        self._ps = None
+        self._pp_offset = 0  # this rank's first global MoE-layer index
+        self._pp_total = 0  # total MoE layers across all pipeline stages
+        self._last_batch = None  # stashed for post-schedule record collection
+        self._last_model = None
 
     @classmethod
     def maybe_create(cls, handle, router_replay: Any) -> RouterReplayDriver | None:
@@ -75,8 +82,25 @@ class RouterReplayDriver:
         )
         if self._num_routers == 0:
             raise RuntimeError("router replay requested but the model has no MoE routers.")
+        self._ps = parallel_state_from_model(self._chunks[-1])
+        self._compute_pp_layout()
         if self.action == _RECORD:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+    def _compute_pp_layout(self) -> None:
+        """All-gather per-rank MoE-router counts so record/replay can map this
+        stage's local routers to their global MoE-layer indices."""
+        ps = self._ps
+        if ps is None or ps.pp_size <= 1:
+            self._pp_offset, self._pp_total = 0, self._num_routers
+            return
+        counts = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)]
+        dist.all_gather(
+            counts, torch.tensor([self._num_routers], dtype=torch.long, device="cuda"), group=ps.pp_group
+        )
+        counts = [int(c.item()) for c in counts]
+        self._pp_offset = sum(counts[: ps.pp_rank])
+        self._pp_total = sum(counts)
 
     def wrap(self, forward_step: Callable) -> Callable:
         if self.action == _RECORD:
@@ -94,14 +118,9 @@ class RouterReplayDriver:
         def _stepped(model, batch):
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
             out = forward_step(model, batch)
-            recorded = RouterReplay.get_recorded_data()
-            if any(item is None for item in recorded):
-                raise RuntimeError("router replay record completed with missing per-layer indices.")
-            stacked = torch.stack([item.to(torch.long) for item in recorded], dim=1)
-            nested = _unpack_routed_experts(self._protocol, model, batch, stacked)
-            out = dict(out)
-            out["routed_experts"] = _to_uint8_if_small(nested)
-            RouterReplay.clear_global_indices()
+            # Collection is deferred to collect_recorded() after the schedule so a
+            # pipeline stage's local layers can be PP-gathered into global order.
+            self._last_batch, self._last_model = batch, model
             return out
 
         return _stepped
@@ -111,12 +130,52 @@ class RouterReplayDriver:
             routed = getattr(batch, "routed_experts", None)
             if routed is None:
                 raise ValueError("router replay 'replay' mode requires batch.routed_experts.")
+            routed = self._select_local_layers(routed)
             targets = _pack_routed_experts(self._protocol, model, batch, routed)
             RouterReplay.set_replay_data(targets)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             return forward_step(model, batch)
 
         return _stepped
+
+    def collect_recorded(self):
+        """Assemble the recorded routing as jagged ``[bs, seq, total_layers, topk]``
+        (PP-gathered), or ``None`` if nothing was recorded."""
+        if self.action != _RECORD or self._last_batch is None:
+            return None
+        recorded = RouterReplay.get_recorded_data()
+        if not recorded or any(item is None for item in recorded):
+            raise RuntimeError("router replay record finished with missing per-layer indices.")
+        local = torch.stack([item.to(torch.long) for item in recorded], dim=1)  # [tok, n_local, topk]
+        full = self._pp_gather_layers(local)
+        nested = _unpack_routed_experts(self._protocol, self._last_model, self._last_batch, full)
+        return _to_uint8_if_small(nested)
+
+    # ── pipeline helpers ──
+    def _select_local_layers(self, routed):
+        """Slice the full routing down to this pipeline stage's MoE layers."""
+        ps = self._ps
+        if ps is None or ps.pp_size <= 1:
+            return routed
+        lo, hi = self._pp_offset, self._pp_offset + self._num_routers
+        rows = [row[:, lo:hi, :] for row in routed.unbind(0)]
+        return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    def _pp_gather_layers(self, local: torch.Tensor) -> torch.Tensor:
+        """All-gather per-stage routing ``[tok, n_local, topk]`` and concat along
+        the layer axis in pipeline-rank order. Assumes a uniform per-stage layer
+        count (even split); uneven layouts are not yet supported."""
+        ps = self._ps
+        if ps is None or ps.pp_size <= 1:
+            return local
+        if self._pp_total != self._num_routers * ps.pp_size:
+            raise NotImplementedError(
+                "router replay PP gather requires an even MoE-layer split across stages "
+                f"(got total={self._pp_total}, local={self._num_routers}, pp={ps.pp_size})."
+            )
+        parts = [torch.empty_like(local) for _ in range(ps.pp_size)]
+        dist.all_gather(parts, local.contiguous(), group=ps.pp_group)
+        return torch.cat(parts, dim=1)
 
 
 def _to_uint8_if_small(nested):
