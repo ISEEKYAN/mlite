@@ -550,11 +550,13 @@ class CompressedSparseAttention(nn.Module):
                 window_idxs,
                 compress_topk_idxs,
                 batch_size=batch,
+                seqlen_kv=kv_full.size(0),
             )
         else:
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
                 window_idxs,
                 batch_size=batch,
+                seqlen_kv=kv_full.size(0),
             )
 
         out = dsa_kernels.dsa_sparse_attn(
