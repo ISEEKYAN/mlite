@@ -17,6 +17,7 @@ from megatron.lite.primitive.modules.attention import (
     build_rotary_embeddings,
 )
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -207,23 +208,6 @@ class Glm5Router(nn.Module):
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return weights * self.route_scale, indices
-
-
-def _build_glm5_pipeline_layers(num_hidden_layers: int, ps: ParallelState) -> list[int]:
-    if ps.pp_size > 2 and num_hidden_layers % ps.pp_size:
-        middle_layers = -(-num_hidden_layers // ps.pp_size)
-        edge_layers = num_hidden_layers - middle_layers * (ps.pp_size - 2)
-        first_layers = edge_layers // 2
-        last_layers = edge_layers - first_layers
-        counts = [first_layers, *([middle_layers] * (ps.pp_size - 2)), last_layers]
-        start = sum(counts[: ps.pp_rank])
-        return list(range(start, start + counts[ps.pp_rank]))
-
-    layers_per_stage = num_hidden_layers // ps.pp_size
-    remainder = num_hidden_layers % ps.pp_size
-    local_count = layers_per_stage + (1 if ps.pp_rank < remainder else 0)
-    start = ps.pp_rank * layers_per_stage + min(ps.pp_rank, remainder)
-    return list(range(start, start + local_count))
 
 
 class Glm5MoE(nn.Module):
@@ -469,6 +453,8 @@ class Glm5Model(nn.Module):
         config: Glm5Config,
         ps: ParallelState | None = None,
         *,
+        vpp: int | None = None,
+        vpp_chunk_id: int | None = None,
         use_deepep: bool = False,
         mtp_enable: bool = False,
         mtp_detach_encoder: bool = False,
@@ -476,19 +462,24 @@ class Glm5Model(nn.Module):
         super().__init__()
         self.config = config
         self.ps = ps or ParallelState()
-        self.layer_indices = _build_glm5_pipeline_layers(config.num_hidden_layers, self.ps)
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers, self.ps, vpp, vpp_chunk_id
+        )
+        self.layer_indices = layout.layer_indices
+        self.pre_process = layout.has_embed
+        self.post_process = layout.has_head
         self.embed_tokens = (
-            nn.Embedding(config.vocab_size, config.hidden_size) if self.ps.pp_is_first else None
+            nn.Embedding(config.vocab_size, config.hidden_size) if layout.has_embed else None
         )
         self.layers = nn.ModuleList(
             [Glm5Layer(config, i, self.ps, use_deepep=use_deepep) for i in self.layer_indices]
         )
         self.norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if self.ps.pp_is_last else None
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if layout.has_head else None
         )
         self.mtp_embed: nn.Embedding | None = None
         self.mtp: Glm5MTPBlock | None = None
-        if mtp_enable and config.num_nextn_predict_layers > 0 and self.ps.pp_is_last:
+        if mtp_enable and config.num_nextn_predict_layers > 0 and layout.has_head:
             mtp_embedding = self.embed_tokens
             if mtp_embedding is None:
                 mtp_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -564,6 +555,8 @@ class Glm5ForCausalLM(nn.Module):
         train_cfg: SimpleNamespace | None = None,
         ps: ParallelState | None = None,
         *,
+        vpp: int | None = None,
+        vpp_chunk_id: int | None = None,
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
@@ -576,14 +569,18 @@ class Glm5ForCausalLM(nn.Module):
         self.model = Glm5Model(
             config,
             self.ps,
+            vpp=vpp,
+            vpp_chunk_id=vpp_chunk_id,
             use_deepep=bool(getattr(self.train_cfg, "use_deepep", False)),
             mtp_enable=mtp_enable,
             mtp_detach_encoder=mtp_detach_encoder,
         )
         self.layer_indices = self.model.layer_indices
+        self.pre_process = self.model.pre_process
+        self.post_process = self.model.post_process
         self.lm_head = (
             nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-            if self.ps.pp_is_last
+            if self.model.post_process
             else None
         )
         self._input_tensor: torch.Tensor | None = None

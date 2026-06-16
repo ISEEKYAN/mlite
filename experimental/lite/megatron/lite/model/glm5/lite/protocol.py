@@ -105,14 +105,15 @@ def _apply_glm5_recompute(
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
     etp = 1 if p.etp is None else p.etp
-    if (p.tp, etp, p.vpp) != (1, 1, 1):
+    if (p.tp, etp) != (1, 1):
         raise NotImplementedError(
-            "GLM5 native lite currently supports TP=ETP=VPP=1. "
-            "EP/PP/CP are wired through existing Megatron Lite primitives."
+            "GLM5 native lite currently supports TP=ETP=1. "
+            "EP/PP/CP/VPP are wired through existing Megatron Lite primitives."
         )
-    if p.ep < 1 or p.pp < 1 or p.cp < 1:
+    if p.ep < 1 or p.pp < 1 or p.cp < 1 or p.vpp < 1:
         raise ValueError(
-            "ParallelConfig ep/pp/cp must be >= 1, " f"got ep={p.ep}, pp={p.pp}, cp={p.cp}."
+            "ParallelConfig ep/pp/cp/vpp must be >= 1, "
+            f"got ep={p.ep}, pp={p.pp}, cp={p.cp}, vpp={p.vpp}."
         )
 
 
@@ -134,26 +135,34 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     ps = init_parallel(impl_cfg.parallel)
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     train_cfg = SimpleNamespace(use_deepep=impl_cfg.use_deepep)
-    chunk = (
-        Glm5ForCausalLM(
-            model_cfg,
-            train_cfg=train_cfg,
-            ps=ps,
-            mtp_enable=mtp_enable,
-            mtp_enable_train=mtp_enable_train,
-            mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-        )
-        .to(torch.bfloat16)
-        .cuda()
+    vpp = None if impl_cfg.parallel.vpp == 1 else impl_cfg.parallel.vpp
+    model_kwargs = dict(
+        train_cfg=train_cfg,
+        ps=ps,
+        mtp_enable=mtp_enable,
+        mtp_enable_train=mtp_enable_train,
+        mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
     )
-    chunks = [chunk]
+    if vpp is None:
+        chunks = [
+            Glm5ForCausalLM(model_cfg, **model_kwargs).to(torch.bfloat16).cuda()
+        ]
+    else:
+        chunks = [
+            Glm5ForCausalLM(model_cfg, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
+            .to(torch.bfloat16)
+            .cuda()
+            for i in range(vpp)
+        ]
 
-    _apply_glm5_recompute(chunk.model.layers, recompute_spec, ps)
+    for chunk in chunks:
+        _apply_glm5_recompute(chunk.model.layers, recompute_spec, ps)
 
     if impl_cfg.offload:
         from megatron.lite.primitive.recompute import apply_offload
 
-        apply_offload(chunk.model.layers, impl_cfg.offload, MODULE_MAP)
+        for chunk in chunks:
+            apply_offload(chunk.model.layers, impl_cfg.offload, MODULE_MAP)
 
     optimizer = None
     optimizer_backend = "none"
@@ -180,7 +189,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
                     unit_modules=(Glm5Layer,),
                     expert_classifier=is_expert_param,
                     deterministic=impl_cfg.deterministic,
-                    vpp=1,
+                    vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
                 )
             }

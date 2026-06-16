@@ -17,6 +17,8 @@ from megatron.lite.primitive.modules.attention.mhc import MultiHeadHyperConnecti
 from megatron.lite.primitive.parallel.mhc import (
     contract_mhc_hidden_for_pipeline,
     expand_mhc_hidden_for_pipeline,
+    fold_mhc_hidden_for_pipeline,
+    unfold_mhc_hidden_from_pipeline,
 )
 from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.state import ParallelState
@@ -200,14 +202,17 @@ class DeepseekV4Model(nn.Module):
         if input_ids is not None and input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         if self.embed_tokens is not None:
+            # First PP stage: embed [B, S, H] then lift to the hc_mult residual streams.
             hidden = expand_mhc_hidden_for_pipeline(
                 self.embed_tokens(input_ids),
                 hc_mult=self.config.hc_mult,
             )
             batch, seq_len = input_ids.shape
         else:
-            hidden = hidden_states
-            hidden = expand_mhc_hidden_for_pipeline(hidden, hc_mult=self.config.hc_mult)
+            # Non-first PP stage: the previous stage sent the hc_mult streams folded into the
+            # hidden dim ([B, S, hc_mult * H]); unfold back to [B, S, hc_mult, H] instead of
+            # re-expanding (which would discard the cross-stream state).
+            hidden = unfold_mhc_hidden_from_pipeline(hidden_states, hc_mult=self.config.hc_mult)
             batch, seq_len = hidden.size(0), hidden.size(1)
         if position_ids is None:
             device = input_ids.device if input_ids is not None else hidden.device
@@ -219,6 +224,13 @@ class DeepseekV4Model(nn.Module):
                 attention_mask=attention_mask,
                 input_ids=input_ids,
             )
+        if self.norm is None or self.hc_head is None:
+            # Non-last PP stage: fold the hc_mult streams into the hidden dim so the pipeline
+            # P2P buffer ([B, S, hc_mult * H]) carries the full hyper-connection state.
+            folded = fold_mhc_hidden_for_pipeline(hidden)
+            if return_mtp_source:
+                return folded, None
+            return folded
         return contract_mhc_hidden_for_pipeline(
             hidden,
             norm=self.norm,
