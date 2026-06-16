@@ -49,7 +49,9 @@ def _init_dist_or_skip():
 def _write_kimi_config(path) -> None:
     config = {
         "model_type": "deepseek_v3",
-        "num_hidden_layers": 3,
+        # 2 all-MoE layers: even split across pp2 (one MoE router per stage), so
+        # the same config exercises cp2 and the proxy2 pp2ep2cp2tp2 layout.
+        "num_hidden_layers": 2,
         "hidden_size": 64,
         "num_attention_heads": 4,
         "num_key_value_heads": 4,
@@ -61,7 +63,7 @@ def _write_kimi_config(path) -> None:
         "num_experts_per_tok": 2,
         "n_group": 2,
         "topk_group": 1,
-        "first_k_dense_replace": 1,
+        "first_k_dense_replace": 0,
         "q_lora_rank": 16,
         "kv_lora_rank": 12,
         "qk_nope_head_dim": 8,
