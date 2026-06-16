@@ -297,6 +297,12 @@ def _topology(model_name: str, backend: str) -> ParallelConfig:
         # fsdp2 shards over the full data-parallel mesh (pure DP); etp must be a
         # concrete int because init_parallel computes expert_dp = world/(etp*ep*pp).
         return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
+    # Diagnostic hook: MLITE_FORCE_TOPO="tp,ep,etp,pp,cp" overrides any model's
+    # topology to isolate which parallel dim triggers a hang.
+    forced = os.environ.get("MLITE_FORCE_TOPO")
+    if forced:
+        tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
+        return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
     # Diagnostic hook: force the tp1/pp2 topology on any model to isolate
     # whether a tp1+pp2 pipeline-P2P bug is generic (not DSA-specific).
     if model_name in _TP1_ONLY or os.environ.get("MLITE_FORCE_TP1"):
