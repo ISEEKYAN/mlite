@@ -513,6 +513,11 @@ class Glm5ForCausalLM(nn.Module):
         self.layer_indices = self.model.layer_indices
         self.pre_process = self.model.pre_process
         self.post_process = self.model.post_process
+        # Megatron dist-opt / distckpt interface attribute (glm5 does not tie
+        # embeddings; mirrors deepseek_v4).
+        self.share_embeddings_and_output_weights = bool(
+            getattr(config, "tie_word_embeddings", False)
+        )
         self.lm_head = (
             nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             if self.model.post_process
