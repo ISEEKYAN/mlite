@@ -265,7 +265,10 @@ def _build_engine(tmp_path, model_name, model_type, write_config, world):
 
 
 def _flat(log_probs):
-    """Raw runtime log_probs are packed/strided; nested only after protocol unpack."""
+    """Raw runtime log_probs are packed/strided; nested only after protocol unpack.
+    ``None`` on non-last pipeline stages (only the last stage emits log_probs)."""
+    if log_probs is None:
+        return None
     return log_probs.values() if getattr(log_probs, "is_nested", False) else log_probs
 
 
@@ -303,7 +306,9 @@ def test_router_replay_record_then_replay_aligns(
     rank = dist.get_rank()
     engine = _build_engine(tmp_path, model_name, model_type, write_config, world)
 
-    torch.manual_seed(1234 + rank)
+    # Same seed on every rank: CP/PP all see identical full sequences (CP splits
+    # internally; PP stages must agree on the batch).
+    torch.manual_seed(1234)
     input_ids = torch.nested.as_nested_tensor(
         [torch.randint(0, vocab_size, (n,), device=device, dtype=torch.long) for n in lengths],
         layout=torch.jagged,
@@ -320,18 +325,24 @@ def test_router_replay_record_then_replay_aligns(
     runtime_batch = engine._make_runtime_batch(micro_batch)
     loss_context = engine._make_runtime_loss_context(micro_batch, loss_scale=1.0)
 
+    # All forwards run on every rank (collective: pipeline comm + the PP-gather in
+    # record). Only the last pipeline stage produces log_probs, so log-prob
+    # assertions are guarded on availability; routed_experts is PP-gathered to all
+    # ranks, so its shape is checked everywhere.
+
     # 0) Run-to-run noise floor: two identical no-replay forwards. Deterministic
     #    models give 0; non-deterministic fused kernels (e.g. DSA attention) give
     #    a small floor we accept replay reproduction against (red-line #4).
     lp_a = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
     lp_b = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
-    noise = (lp_a - lp_b).abs().max().item()
+    has_lp = lp_a is not None
+    noise = (lp_a - lp_b).abs().max().item() if has_lp else 0.0
 
     # 1) RECORD the routing during a log-prob pass.
     rec = _forward(engine, runtime_batch, loss_context, {"action": "record"})
     routed = rec.model_output.routed_experts
     assert routed is not None, "record mode must emit routed_experts"
-    # [bs, seq, num_moe_layers, topk]
+    # [bs, seq, num_moe_layers, topk] — PP-gathered to every rank.
     assert [int(x) for x in routed.offsets().diff().cpu()] == lengths
     lp_record = _flat(rec.model_output.log_probs)
 
@@ -340,12 +351,13 @@ def test_router_replay_record_then_replay_aligns(
     replay_batch = dataclasses.replace(runtime_batch, routed_experts=routed)
     rep = _forward(engine, replay_batch, loss_context, {"action": "replay"})
     lp_replay = _flat(rep.model_output.log_probs)
-    replay_diff = (lp_replay - lp_record).abs().max().item()
+    replay_diff = (lp_replay - lp_record).abs().max().item() if has_lp else 0.0
     tol = max(noise * 4.0, 1e-6)
-    assert replay_diff <= tol, (
-        f"replay must reproduce the recorded forward (diff={replay_diff:.3e} > tol={tol:.3e}, "
-        f"noise floor={noise:.3e})"
-    )
+    if has_lp:
+        assert replay_diff <= tol, (
+            f"replay must reproduce the recorded forward (diff={replay_diff:.3e} > tol={tol:.3e}, "
+            f"noise floor={noise:.3e})"
+        )
 
     # 3) Move the gate so natural routing changes; replay must still force the
     #    recorded experts (log-probs diverge from fresh routing, well above noise).
@@ -357,13 +369,12 @@ def test_router_replay_record_then_replay_aligns(
     lp_replay2 = _flat(
         _forward(engine, replay_batch, loss_context, {"action": "replay"}).model_output.log_probs
     )
-    override_diff = (lp_replay2 - lp_natural).abs().max().item()
-    assert torch.isfinite(lp_replay2).all()
-    assert override_diff > max(noise * 10.0, 1e-4), (
-        f"replay should override perturbed routing (override={override_diff:.3e}, noise={noise:.3e})"
-    )
-
-    if rank == 0:
+    override_diff = (lp_replay2 - lp_natural).abs().max().item() if has_lp else None
+    if has_lp:
+        assert torch.isfinite(lp_replay2).all()
+        assert override_diff > max(noise * 10.0, 1e-4), (
+            f"replay should override perturbed routing (override={override_diff:.3e}, noise={noise:.3e})"
+        )
         print(
             "NON_SKIP_VERL_MLITE_ROUTER_REPLAY_ALIGN_PASSED "
             f"model={model_name} world_size={world} lengths={lengths} "
