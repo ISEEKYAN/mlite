@@ -163,7 +163,7 @@ def _glm5():
         v_head_dim=256,
         index_head_dim=128,
         index_n_heads=32,
-        index_topk=512,
+        index_topk=32,
         intermediate_size=20,
         moe_intermediate_size=6,
         first_k_dense_replace=1,
@@ -203,7 +203,7 @@ def _deepseek_v4():
         hc_mult=2,
         index_head_dim=64,
         index_n_heads=8,
-        index_topk=64,
+        index_topk=32,
         # DeepSeek-V4 really has MTP; its ImplConfig defaults mtp_enable=True and
         # requires >=1 nextn layer, so give it one (exercises MTP weight IO too).
         num_nextn_predict_layers=1,
@@ -363,9 +363,9 @@ def _shared_tmp_path(tmp_path, suffix: str) -> str:
 
 def _random_packed_batch(vocab_size: int) -> PackedBatch:
     return PackedBatch(
-        input_ids=torch.randint(0, vocab_size, (8,), device="cuda"),
-        labels=torch.randint(0, vocab_size, (8,), device="cuda"),
-        seq_lens=torch.full((2,), 4, dtype=torch.int64, device="cuda"),
+        input_ids=torch.randint(0, vocab_size, (128,), device="cuda"),
+        labels=torch.randint(0, vocab_size, (128,), device="cuda"),
+        seq_lens=torch.full((2,), 64, dtype=torch.int64, device="cuda"),
     )
 
 
@@ -381,7 +381,7 @@ def _train_step(handle: ModelHandle, backend: str, cfg) -> None:
         # fsdp2: pure-DP path, drive the model + optimizer directly.
         model = handle._extras["model_chunks"][0]
         model.train()
-        input_ids = torch.randint(0, cfg.vocab_size, (1, 16), device="cuda")
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 128), device="cuda")
         handle._optimizer.zero_grad()
         out = model(input_ids=input_ids)
         logits = out["logits"] if isinstance(out, dict) else out
