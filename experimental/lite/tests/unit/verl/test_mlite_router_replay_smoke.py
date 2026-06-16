@@ -303,7 +303,6 @@ def test_router_replay_record_then_replay_aligns(
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
-    rank = dist.get_rank()
     engine = _build_engine(tmp_path, model_name, model_type, write_config, world)
 
     # Same seed on every rank: CP/PP all see identical full sequences (CP splits
