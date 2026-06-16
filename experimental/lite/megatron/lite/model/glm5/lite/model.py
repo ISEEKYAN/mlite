@@ -436,6 +436,10 @@ class Glm5Model(nn.Module):
             if self.embed_tokens is None:
                 raise ValueError("input_ids are only accepted on the first pipeline stage")
             hidden_states = self.embed_tokens(input_ids)
+        elif self.embed_tokens is None:
+            # Received from the pipeline P2P, which uses the Megatron SBHD
+            # [S, B, H] convention; the DSA layers run batch-first [B, S, H].
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
         batch, seq_len, _ = hidden_states.shape
         if position_ids is None and packed_seq_params is not None:
             raise ValueError("GLM5 packed THD forward requires explicit position_ids.")
@@ -473,7 +477,10 @@ class Glm5Model(nn.Module):
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
-        return self.norm(h) if self.norm is not None else h
+        if self.norm is not None:
+            return self.norm(h)
+        # Non-last stage: hand back to the pipeline P2P in SBHD [S, B, H].
+        return h.transpose(0, 1).contiguous()
 
 
 class Glm5ForCausalLM(nn.Module):
