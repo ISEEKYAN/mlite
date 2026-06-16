@@ -495,6 +495,11 @@ def _as_data_iter(data: Any):
     return iter([data])
 
 
+# Megatron-Core models whose attention rejects packed/THD sequences and so must
+# be driven with a single dense (BSHD) sequence in the bridge forward step.
+_DENSE_FORWARD_MODELS = frozenset({"qwen3_5"})
+
+
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
 def _nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
     """Split a 1-D packed (true, unpadded) tensor into a jagged nested tensor."""
@@ -573,6 +578,37 @@ def _bridge_forward_kwargs_from_packed_batch(
         for key, tensor in zip(tensor_keys, tensors, strict=True):
             if tensor is not None or key in sample:
                 sample[key] = tensor
+    return sample
+
+
+def _packed_batch_to_dense_inputs(batch: PackedBatch) -> dict[str, Any]:
+    """Render dense (BSHD) Megatron-Core forward kwargs from a PackedBatch.
+
+    Some Megatron-Core attention variants reject packed/THD sequences — notably
+    Qwen3.5's GatedDeltaNet linear attention raises ``NotImplementedError`` for
+    ``packed_seq_params``. For those models the bridge feeds a single full,
+    unpadded sequence in dense ``[batch=1, seq]`` layout with an all-ones
+    attention mask and full MRoPE ``position_ids`` ``(3, 1, T)``. With one
+    unpadded sequence this is the same computation as the native MLite THD path
+    on the same tokens, so the mlite-vs-mbridge comparison stays fair. CP=1 only.
+    """
+    seq_lens = batch.seq_lens.to(torch.int32)
+    device = seq_lens.device
+    total = int(seq_lens.sum().item())
+    input_ids = batch.input_ids.reshape(1, total).contiguous()
+    labels = batch.labels.reshape(1, total).contiguous() if batch.labels is not None else None
+    attention_mask = torch.ones((1, total), dtype=torch.long, device=device)
+    position_ids = (
+        torch.arange(total, device=device).view(1, 1, -1).expand(3, 1, total).contiguous()
+    )
+    sample: dict[str, Any] = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    if batch.loss_mask is not None:
+        sample["loss_mask"] = batch.loss_mask.reshape(1, total).contiguous()
     return sample
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
 
@@ -693,13 +729,23 @@ class BridgeRuntime(RuntimeBase):
             "cp_rank": mpu.get_context_parallel_rank(),
             "cp_group": mpu.get_context_parallel_group() if cp_size > 1 else None,
         }
+        # Models whose Megatron-Core attention rejects THD are driven dense (BSHD).
+        use_dense_forward = getattr(handle.config, "model_name", None) in _DENSE_FORWARD_MODELS
+        if use_dense_forward and cp_size > 1:
+            raise NotImplementedError(
+                f"Dense bridge forward for {handle.config.model_name!r} requires CP=1, "
+                f"got cp_size={cp_size}."
+            )
 
         def _fwd_step(data_iterator, model):
             # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
             sample = next(data_iterator)
             owns_transient_metadata = False
             if isinstance(sample, PackedBatch):
-                sample = _bridge_forward_kwargs_from_packed_batch(sample, **cp_kwargs)
+                if use_dense_forward:
+                    sample = _packed_batch_to_dense_inputs(sample)
+                else:
+                    sample = _bridge_forward_kwargs_from_packed_batch(sample, **cp_kwargs)
                 owns_transient_metadata = True
             elif isinstance(sample, Batch):
                 sample = {
