@@ -324,16 +324,21 @@ class MegatronLiteRuntime(RuntimeBase):
         )
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+        # ``cpu`` is honored at this backend boundary (mirroring BridgeRuntime),
+        # not forwarded to the model export primitive which does not accept it.
+        cpu = kwargs.pop("cpu", False)
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
         if proto and hasattr(proto, "export_hf_weights"):
-            yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
+            pairs = proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
         else:
-            for chunk in model_chunks:
-                yield from chunk.named_parameters()
+            pairs = (item for chunk in model_chunks for item in chunk.named_parameters())
+
+        for name, tensor in pairs:
+            yield name, tensor.detach().cpu() if cpu else tensor
 
     # ── Memory ──
 
