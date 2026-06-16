@@ -32,6 +32,13 @@ def _clean_replay_registry():
     RouterReplay.clear_global_router_replay_instances()
 
 
+def _device():
+    # TopKRouter.gate uses TE's router_gating_linear (CUDA-only gemm); run on GPU
+    # when one is present (e.g. inside the container), CPU otherwise (login node
+    # with the TE import stub handling the fallback).
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _topk_router(enable_routing_replay: bool):
     from megatron.lite.primitive.modules.router import TopKRouter
     from megatron.lite.primitive.parallel import ParallelState
@@ -44,7 +51,7 @@ def _topk_router(enable_routing_replay: bool):
         ParallelState(),
         compute_aux_loss=False,
         enable_routing_replay=enable_routing_replay,
-    )
+    ).to(_device())
 
 
 def _sigmoid_router(enable_routing_replay: bool):
@@ -64,7 +71,7 @@ def _sigmoid_router(enable_routing_replay: bool):
         ParallelState(),
         compute_aux_loss=False,
         enable_routing_replay=enable_routing_replay,
-    )
+    ).to(_device())
 
 
 ROUTER_FACTORIES = {"topk_softmax": _topk_router, "sigmoid_topk": _sigmoid_router}
@@ -76,7 +83,7 @@ def test_record_captures_topk_indices(factory):
 
     router = factory(True)
     router.eval()
-    hidden = torch.randn(6, router.gate.in_features)
+    hidden = torch.randn(6, router.gate.in_features, device=_device())
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
     scores, indices = router(hidden)
@@ -94,7 +101,7 @@ def test_replay_forward_reproduces_recorded_indices(factory):
 
     router = factory(True)
     router.eval()
-    hidden = torch.randn(6, router.gate.in_features)
+    hidden = torch.randn(6, router.gate.in_features, device=_device())
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
     _, recorded_indices = router(hidden)
@@ -119,7 +126,7 @@ def test_replay_forward_overrides_recomputed_routing(factory):
 
     router = factory(True)
     router.eval()
-    hidden = torch.randn(6, router.gate.in_features)
+    hidden = torch.randn(6, router.gate.in_features, device=_device())
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
     _, recorded_indices = router(hidden)
@@ -148,7 +155,7 @@ def test_replay_forward_keeps_gate_gradient(factory):
 
     router = factory(True)
     router.train()
-    hidden = torch.randn(6, router.gate.in_features)
+    hidden = torch.randn(6, router.gate.in_features, device=_device())
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
     _, recorded_indices = router(hidden)
@@ -156,7 +163,9 @@ def test_replay_forward_keeps_gate_gradient(factory):
     RouterReplay.set_replay_data([recorded_indices.clone()])
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
     replay_scores, _ = router(hidden)
-    replay_scores.sum().backward()
+    # Sum-of-squares, not sum: a post-softmax router's topk scores sum to 1 per
+    # token (constant), so a plain .sum() would have zero gradient by design.
+    (replay_scores.float() ** 2).sum().backward()
 
     assert router.gate.weight.grad is not None
     assert torch.isfinite(router.gate.weight.grad).all()
@@ -168,7 +177,7 @@ def test_replay_backward_pops_target_in_order():
 
     router = _topk_router(True)
     router.eval()
-    hidden = torch.randn(6, router.gate.in_features)
+    hidden = torch.randn(6, router.gate.in_features, device=_device())
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
     _, recorded_indices = router(hidden)
@@ -193,7 +202,7 @@ def test_disabled_replay_is_noop():
 
     router = _topk_router(False)
     router.eval()
-    hidden = torch.randn(6, router.gate.in_features)
+    hidden = torch.randn(6, router.gate.in_features, device=_device())
 
     # No instance is registered when replay is disabled.
     assert RouterReplay.global_router_replay_instances == []

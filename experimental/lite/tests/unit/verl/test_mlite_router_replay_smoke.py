@@ -83,6 +83,62 @@ def _write_kimi_config(path) -> None:
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def _write_qwen3_moe_config(path) -> None:
+    config = {
+        "model_type": "qwen3_moe",
+        "num_hidden_layers": 2,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "vocab_size": 128,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "rope_theta": 1000000.0,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 128,
+        "router_aux_loss_coef": 0.001,
+        "num_nextn_predict_layers": 0,
+        "layer_types": ["full_attention", "full_attention"],
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def _write_glm5_moe_config(path) -> None:
+    config = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "head_dim": 256,
+        "vocab_size": 32,
+        "max_position_embeddings": 64,
+        "initializer_range": 0.002,
+        "q_lora_rank": 16,
+        "kv_lora_rank": 512,
+        "qk_head_dim": 256,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "index_topk": 512,
+        "intermediate_size": 20,
+        "moe_intermediate_size": 6,
+        "first_k_dense_replace": 1,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 3,
+        "num_nextn_predict_layers": 0,
+        "mlp_layer_types": ["dense", "sparse"],
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 def _optimizer_config() -> SimpleNamespace:
     return SimpleNamespace(
         optimizer="adam",
@@ -147,6 +203,11 @@ def _build_engine(tmp_path, model_name, model_type, write_config, world):
     return engine
 
 
+def _flat(log_probs):
+    """Raw runtime log_probs are packed/strided; nested only after protocol unpack."""
+    return log_probs.values() if getattr(log_probs, "is_nested", False) else log_probs
+
+
 def _forward(engine, runtime_batch, loss_context, router_replay):
     result = engine.runtime.forward_backward(
         engine.handle,
@@ -161,7 +222,11 @@ def _forward(engine, runtime_batch, loss_context, router_replay):
 
 @pytest.mark.parametrize(
     ("model_name", "model_type", "write_config", "vocab_size", "lengths"),
-    [("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [16, 24, 32])],
+    [
+        ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [16, 24, 32]),
+        ("qwen3_moe", "qwen3_moe", _write_qwen3_moe_config, 128, [16, 24, 32]),
+        ("glm5", "glm_moe_dsa", _write_glm5_moe_config, 32, [16, 24, 32]),
+    ],
 )
 def test_router_replay_record_then_replay_aligns(
     tmp_path, model_name, model_type, write_config, vocab_size, lengths
@@ -199,14 +264,14 @@ def test_router_replay_record_then_replay_aligns(
     assert routed is not None, "record mode must emit routed_experts"
     # [bs, seq, num_moe_layers, topk]
     assert [int(x) for x in routed.offsets().diff().cpu()] == lengths
-    lp_record = rec.model_output.log_probs
+    lp_record = _flat(rec.model_output.log_probs)
 
     # 2) REPLAY the recorded routing — must reproduce the recorded log-probs.
     replay_batch = dataclasses.replace(runtime_batch, routed_experts=routed)
     rep = _forward(engine, replay_batch, loss_context, {"action": "replay"})
-    lp_replay = rep.model_output.log_probs
+    lp_replay = _flat(rep.model_output.log_probs)
     torch.testing.assert_close(
-        lp_replay.values(), lp_record.values(), atol=0.0, rtol=0.0,
+        lp_replay, lp_record, atol=0.0, rtol=0.0,
         msg="replay must reproduce the recorded forward bitwise",
     )
 
@@ -216,10 +281,12 @@ def test_router_replay_record_then_replay_aligns(
         for name, param in engine.module.named_parameters():
             if name.endswith("router.gate.weight") or name.endswith("gate.weight"):
                 param.add_(torch.randn_like(param) * 3.0)
-    lp_natural = _forward(engine, runtime_batch, loss_context, None).model_output.log_probs
-    lp_replay2 = _forward(engine, replay_batch, loss_context, {"action": "replay"}).model_output.log_probs
-    max_diff = (lp_replay2.values() - lp_natural.values()).abs().max()
-    assert torch.isfinite(lp_replay2.values()).all()
+    lp_natural = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
+    lp_replay2 = _flat(
+        _forward(engine, replay_batch, loss_context, {"action": "replay"}).model_output.log_probs
+    )
+    max_diff = (lp_replay2 - lp_natural).abs().max()
+    assert torch.isfinite(lp_replay2).all()
     assert max_diff.item() > 0.0, "replay should override the perturbed natural routing"
 
     if rank == 0:
