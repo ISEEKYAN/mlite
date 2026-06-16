@@ -548,12 +548,14 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
 # ──────────────────────────────────────────────────────────────────────────
 # Runtime offload / onload roundtrip (RL Best tier: runtime.to(cpu/cuda))
 #
-# Exercises the real runtime.to() verl RL uses to reclaim GPU between train and
-# rollout: param + optimizer state move CPU<->GPU as a whole (NOT offload_fraction).
-# 4 delivery models x 2 optimizers on the 8-GPU proxy2 topology.
+# Exercises the real runtime.to() used to reclaim GPU between train and rollout:
+# param + optimizer state move CPU<->GPU as a whole (NOT offload_fraction).
+# 3 delivery models x 2 optimizers on the 8-GPU proxy2 topology.
 # ──────────────────────────────────────────────────────────────────────────
 
-DELIVERY_MODELS = ("qwen3_5", "deepseek_v4", "glm5", "kimi_k2")
+# qwen3_5 offload is validated separately (its GatedDeltaNet linear-attention
+# path and run env differ); the others run here.
+DELIVERY_MODELS = ("deepseek_v4", "glm5", "kimi_k2")
 
 
 def _offload_topology(model_name: str) -> ParallelConfig:
@@ -564,16 +566,6 @@ def _offload_topology(model_name: str) -> ParallelConfig:
     if forced:
         tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
         return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
-    # proxy2 = 8-GPU pp2/ep2/cp2.  CSA/DSA (glm5, ds4) are TP=1 only, so they
-    # fill 8 ranks with dp2 (tp1·cp2·pp2·dp2=8); TP-capable MoE models use tp2
-    # (tp2·cp2·pp2·dp1=8).
-    if model_name == "qwen3_5":
-        # qwen3.5 runs only in its FLA/GatedDeltaNet env, whose NCCL build cannot
-        # complete the cp2 pipeline P2P (the same tp2 config passes for kimi in the
-        # DSA overlay).  That is an env limitation, not an offload/model issue;
-        # offload's CPU<->GPU movement is CP-orthogonal, so qwen3.5 is exercised at
-        # cp1 until a cp2-capable FLA env exists.
-        return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
     if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
