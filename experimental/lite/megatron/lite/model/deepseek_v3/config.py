@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Kimi K2 / DeepSeekV3-style model configuration."""
+"""DeepSeek-V3 / DeepSeekV3-style model configuration."""
 
 from __future__ import annotations
 
@@ -47,8 +47,8 @@ _HF_FIELDS = frozenset(
 
 
 @dataclass
-class KimiK2Config:
-    """Pure architecture parameters for Kimi K2 Instruct."""
+class DeepseekV3Config:
+    """Pure architecture parameters for DeepSeek-V3 Instruct."""
 
     num_hidden_layers: int = 61
     hidden_size: int = 7168
@@ -145,18 +145,18 @@ class KimiK2Config:
         _check(0 <= self.first_k_dense_replace <= self.num_hidden_layers, "bad dense prefix")
         _check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
         if errors:
-            raise ValueError("Invalid KimiK2Config:\n  " + "\n  ".join(errors))
+            raise ValueError("Invalid DeepseekV3Config:\n  " + "\n  ".join(errors))
 
     @classmethod
-    def from_hf(cls, path: str, **overrides) -> KimiK2Config:
+    def from_hf(cls, path: str, **overrides) -> DeepseekV3Config:
         return cls._from_hf_dict(load_hf_config_dict(path), **overrides)
 
     @classmethod
-    def from_hf_config(cls, hf_config, **overrides) -> KimiK2Config:
+    def from_hf_config(cls, hf_config, **overrides) -> DeepseekV3Config:
         return cls._from_hf_dict(hf_config.to_dict(), **overrides)
 
     @classmethod
-    def _from_hf_dict(cls, hf: dict, **overrides) -> KimiK2Config:
+    def _from_hf_dict(cls, hf: dict, **overrides) -> DeepseekV3Config:
         if "text_config" in hf and isinstance(hf["text_config"], dict):
             hf = hf["text_config"]
         kwargs = {k: v for k, v in hf.items() if k in _HF_FIELDS}
@@ -172,4 +172,4 @@ class KimiK2Config:
         return (layer_idx - self.first_k_dense_replace) % freq == 0
 
 
-__all__ = ["KimiK2Config"]
+__all__ = ["DeepseekV3Config"]

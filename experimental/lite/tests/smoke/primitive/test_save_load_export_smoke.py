@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Save / load / export coverage smoke across the supported models and backends.
 
-Matrix: {qwen3_5, qwen3_moe, kimi_k2, glm5, deepseek_v4} x {dist_opt, fsdp2}.
+Matrix: {qwen3_5, qwen3_moe, deepseek_v3, deepseek_v3_2, deepseek_v4} x {dist_opt, fsdp2}.
 
 Each (model, backend) case does a faithful round-trip:
   build -> train one real step -> save checkpoint -> build fresh -> load ->
@@ -101,12 +101,12 @@ def _qwen3_moe():
     return cfg, protocol
 
 
-def _kimi_k2():
+def _deepseek_v3():
     _require_te()
-    from megatron.lite.model.kimi_k2.config import KimiK2Config
-    from megatron.lite.model.kimi_k2.lite import protocol
+    from megatron.lite.model.deepseek_v3.config import DeepseekV3Config
+    from megatron.lite.model.deepseek_v3.lite import protocol
 
-    cfg = KimiK2Config(
+    cfg = DeepseekV3Config(
         num_hidden_layers=2,
         hidden_size=64,
         num_attention_heads=4,
@@ -140,13 +140,13 @@ def _kimi_k2():
     return cfg, protocol
 
 
-def _glm5():
-    pytest.importorskip("cudnn", reason="glm5 fused DSA needs the cudnn DSA stack.")
+def _deepseek_v3_2():
+    pytest.importorskip("cudnn", reason="deepseek_v3_2 fused DSA needs the cudnn DSA stack.")
     _require_te()
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite import protocol
+    from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
+    from megatron.lite.model.deepseek_v3_2.lite import protocol
 
-    cfg = Glm5Config(
+    cfg = DeepseekV32Config(
         num_hidden_layers=2,
         hidden_size=128,
         num_attention_heads=64,
@@ -215,8 +215,8 @@ def _deepseek_v4():
 MODELS = {
     "qwen3_5": _qwen3_5,
     "qwen3_moe": _qwen3_moe,
-    "kimi_k2": _kimi_k2,
-    "glm5": _glm5,
+    "deepseek_v3": _deepseek_v3,
+    "deepseek_v3_2": _deepseek_v3_2,
     "deepseek_v4": _deepseek_v4,
 }
 
@@ -287,9 +287,9 @@ def _reset_parallel_state_between_tests():
         mpu.destroy_model_parallel()
 
 
-# GLM5 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
+# DeepSeek-V3.2 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
 # through primitives), so their dist_opt topology shards via ep/pp/cp instead.
-_TP1_ONLY = {"glm5", "deepseek_v4"}
+_TP1_ONLY = {"deepseek_v3_2", "deepseek_v4"}
 
 
 def _topology(model_name: str, backend: str) -> ParallelConfig:
@@ -466,17 +466,19 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
                 if tensor.dtype.is_floating_point:
-                    assert tensor.dtype == torch.bfloat16, (
-                        f"{key} exported as {tensor.dtype}, want bf16"
-                    )
+                    assert (
+                        tensor.dtype == torch.bfloat16
+                    ), f"{key} exported as {tensor.dtype}, want bf16"
                 else:
-                    assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
-                        f"{key} exported as unexpected non-float dtype {tensor.dtype}"
-                    )
+                    assert tensor.dtype in (
+                        torch.int64,
+                        torch.int32,
+                        torch.bool,
+                    ), f"{key} exported as unexpected non-float dtype {tensor.dtype}"
                 assert torch.isfinite(tensor.float()).all(), f"{key} has non-finite values"
-                assert key.startswith("model.") or key in ("lm_head.weight",), (
-                    f"unexpected non-HF export key: {key}"
-                )
+                assert key.startswith("model.") or key in (
+                    "lm_head.weight",
+                ), f"unexpected non-HF export key: {key}"
                 keys.add(key)
     assert keys, "exported zero tensors"
     # PP-gather completeness: the rank-0 export must carry EVERY decoder layer's

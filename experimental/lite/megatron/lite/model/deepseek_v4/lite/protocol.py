@@ -24,7 +24,11 @@ from megatron.lite.primitive.parallel.cp import (
     local_position_ids_for_cp,
     local_sequence_tensor_for_cp,
 )
-from megatron.lite.primitive.parallel.thd import pack_nested_thd, thd_pack_meta, unpack_thd_to_nested
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    thd_pack_meta,
+    unpack_thd_to_nested,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
@@ -63,7 +67,7 @@ MODULE_MAP = {
     "ffn_norm": lambda layer: layer.post_attention_layernorm,
 }
 
-# The Kimi-derived model has no ``attention_mask`` arg (CSA derives its causal /
+# The DeepSeek-V3-derived model has no ``attention_mask`` arg (CSA derives its causal /
 # sliding-window masking from ``position_ids``, as the previous DS4 did with
 # attention_mask=None); keep it out of the forward whitelist.
 _MODEL_FORWARD_KEYS = (
@@ -305,8 +309,8 @@ def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
 def _validate_parallel_scope(p: ParallelConfig) -> None:
     """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
 
-    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
-    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
+    PP / VPP / EP / CP are inherited from the DeepSeek-V3 skeleton and work; only
+    TP>1 / ETP>1 are unsupported.  Mirrors DeepSeek-V3.2's gate.
     """
     etp = 1 if p.etp is None else p.etp
     if p.tp > 1:

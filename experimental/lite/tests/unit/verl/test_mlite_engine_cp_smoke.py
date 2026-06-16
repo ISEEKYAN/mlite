@@ -34,7 +34,7 @@ def _init_dist_or_skip():
     return torch.device("cuda", local_rank)
 
 
-def _write_kimi_config(path) -> None:
+def _write_deepseek_v3_config(path) -> None:
     config = {
         "model_type": "deepseek_v3",
         "num_hidden_layers": 2,
@@ -71,7 +71,7 @@ def _write_kimi_config(path) -> None:
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
-def _write_glm5_config(path) -> None:
+def _write_deepseek_v3_2_config(path) -> None:
     config = {
         "model_type": "glm_moe_dsa",
         "num_hidden_layers": 2,
@@ -172,8 +172,8 @@ def _optimizer_config() -> SimpleNamespace:
 @pytest.mark.parametrize(
     ("model_name", "model_type", "write_config", "vocab_size", "lengths"),
     [
-        ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [5, 7, 9]),
-        ("glm5", "glm_moe_dsa", _write_glm5_config, 32, [16, 20, 24]),
+        ("deepseek_v3", "deepseek_v3", _write_deepseek_v3_config, 128, [5, 7, 9]),
+        ("deepseek_v3_2", "glm_moe_dsa", _write_deepseek_v3_2_config, 32, [16, 20, 24]),
         ("deepseek_v4", "deepseek_v4", _write_deepseek_v4_config, 128, [16, 20, 24]),
     ],
 )

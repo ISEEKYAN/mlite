@@ -10,7 +10,7 @@ def _init_dist_or_skip():
     import torch.distributed as dist
 
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for GLM5 CP smoke.")
+        pytest.skip("CUDA is required for DeepSeek-V3.2 CP smoke.")
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Run with torchrun so CP ranks are available.")
 
@@ -19,7 +19,7 @@ def _init_dist_or_skip():
     if not dist.is_initialized():
         dist.init_process_group("nccl")
     if dist.get_world_size() < 2:
-        pytest.skip("GLM5 CP smoke requires at least 2 ranks.")
+        pytest.skip("DeepSeek-V3.2 CP smoke requires at least 2 ranks.")
     return torch.device("cuda", local_rank)
 
 
@@ -60,7 +60,9 @@ def _tiny_hf_parity_config_kwargs():
 def _fused_dsa_seq_len(world: int) -> int:
     seq = 512
     if seq % (2 * world) != 0:
-        pytest.skip(f"GLM5 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}.")
+        pytest.skip(
+            f"DeepSeek-V3.2 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}."
+        )
     return seq
 
 
@@ -117,7 +119,7 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
     return float(stats[0].item()), float((stats[0] / stats[1]).item())
 
 
-def _hf_state_dict_for_glm5_loader(model):
+def _hf_state_dict_for_deepseek_v3_2_loader(model):
     return {
         name: tensor.detach().cpu().contiguous().clone()
         for name, tensor in model.state_dict().items()
@@ -146,7 +148,7 @@ def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
 
 
 @pytest.mark.gpu
-def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
+def test_deepseek_v3_2_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch
     import torch.distributed as dist
 
@@ -191,26 +193,28 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
 
 
 @pytest.mark.gpu
-def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
+def test_deepseek_v3_2_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
+    from megatron.lite.model.deepseek_v3_2.lite.model import DeepseekV32ForCausalLM
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
     rank = dist.get_rank()
-    cfg = Glm5Config(**_tiny_config_kwargs())
+    cfg = DeepseekV32Config(**_tiny_config_kwargs())
     cfg.mlp_layer_types = ["dense", "dense"]
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(777)
-    cp_model = Glm5ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
+    cp_model = DeepseekV32ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     torch.manual_seed(777)
-    ref_model = Glm5ForCausalLM(cfg, ps=ParallelState()).to(device=device, dtype=torch.bfloat16)
+    ref_model = DeepseekV32ForCausalLM(cfg, ps=ParallelState()).to(
+        device=device, dtype=torch.bfloat16
+    )
     cp_model.eval()
     ref_model.eval()
 
@@ -228,24 +232,24 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 
 
 @pytest.mark.gpu
-def test_glm5_tiny_model_cp2_forward_backward_smoke():
+def test_deepseek_v3_2_tiny_model_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
+    from megatron.lite.model.deepseek_v3_2.lite.model import DeepseekV32ForCausalLM
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
     rank = dist.get_rank()
-    cfg = Glm5Config(**_tiny_config_kwargs())
+    cfg = DeepseekV32Config(**_tiny_config_kwargs())
     cfg.mlp_layer_types = ["dense", "dense"]
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(1234)
-    model = Glm5ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
+    model = DeepseekV32ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     model.initialize_weights()
 
     batch, seq = 1, _fused_dsa_seq_len(world)
@@ -269,12 +273,12 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
 
 
 @pytest.mark.gpu
-def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
+def test_deepseek_v3_2_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
+    from megatron.lite.model.deepseek_v3_2.lite.model import DeepseekV32ForCausalLM
     from megatron.lite.primitive.parallel.state import ParallelState
     from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
 
@@ -283,12 +287,12 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     rank = dist.get_rank()
     cfg_kwargs = _tiny_config_kwargs()
     cfg_kwargs.update(max_position_embeddings=64, num_nextn_predict_layers=1)
-    cfg = Glm5Config(**cfg_kwargs)
+    cfg = DeepseekV32Config(**cfg_kwargs)
     cfg.mlp_layer_types = ["dense", "dense"]
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(20260614)
-    model = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True, mtp_enable_train=True).to(
+    model = DeepseekV32ForCausalLM(cfg, ps=ps, mtp_enable=True, mtp_enable_train=True).to(
         device=device, dtype=torch.bfloat16
     )
     model.train()
@@ -344,7 +348,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
 
     if rank == 0:
         print(
-            "NON_SKIP_GLM5_THD_CP_SMOKE_PASSED "
+            "NON_SKIP_DeepSeek-V3.2_THD_CP_SMOKE_PASSED "
             f"world_size={world} lengths={lengths} "
             f"loss={float(out['loss'].detach().item()):.6e} "
             f"grad_norm={float(grad_norm.detach().item()):.6e}"
@@ -352,14 +356,14 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
 
 
 @pytest.mark.gpu
-def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
+def test_deepseek_v3_2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     import torch
     import torch.distributed as dist
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
+    from megatron.lite.model.deepseek_v3_2.config import DeepseekV32Config
+    from megatron.lite.model.deepseek_v3_2.lite.checkpoint import load_hf_weights
+    from megatron.lite.model.deepseek_v3_2.lite.model import DeepseekV32ForCausalLM
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -367,7 +371,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     device = _init_dist_or_skip()
     world = dist.get_world_size()
     rank = dist.get_rank()
-    cfg = Glm5Config(**_tiny_hf_parity_config_kwargs())
+    cfg = DeepseekV32Config(**_tiny_hf_parity_config_kwargs())
 
     torch.manual_seed(20260611)
     hf_ref = DeepseekV3ForCausalLM(_to_hf_deepseek_v3_config(cfg)).to(
@@ -375,10 +379,10 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     )
     hf_ref.eval()
     rank_tmp_path = tmp_path / f"rank{rank}"
-    save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref), str(rank_tmp_path))
+    save_safetensors(_hf_state_dict_for_deepseek_v3_2_loader(hf_ref), str(rank_tmp_path))
 
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
-    native = Glm5ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
+    native = DeepseekV32ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     native.eval()
     load_hf_weights(native, str(rank_tmp_path), cfg, ps)
 
@@ -410,7 +414,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     with torch.no_grad():
         if rank == 0:
             print(
-                "glm5_hf_native_parity reference=transformers.DeepseekV3ForCausalLM "
+                "deepseek_v3_2_hf_native_parity reference=transformers.DeepseekV3ForCausalLM "
                 "mode=dense_mla_reference_with_full_topk_dsa"
             )
         hf_logits = hf_ref(full_ids).logits
@@ -428,7 +432,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(
-                f"glm5_hf_native_parity layer={layer_idx} "
+                f"deepseek_v3_2_hf_native_parity layer={layer_idx} "
                 f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
             )
         torch.testing.assert_close(actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
@@ -437,6 +441,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     max_abs, max_rel = _distributed_diff_stats(native_logits, expected)
     if rank == 0:
         print(
-            "glm5_hf_native_parity logits " f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
+            "deepseek_v3_2_hf_native_parity logits "
+            f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
         )
     torch.testing.assert_close(native_logits.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
