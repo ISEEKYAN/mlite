@@ -161,24 +161,31 @@ def pack_routed_experts(
             cp_rank=ps.cp_rank,
             dim=0,
         )
+    # The router runs on the sequence-parallel (TP) shard of the CP-local tokens,
+    # so slice this TP rank's contiguous chunk to match what the gate sees.
+    if ps.tp_size > 1:
+        tp_local = local.size(0) // ps.tp_size
+        local = local[ps.tp_rank * tp_local : (ps.tp_rank + 1) * tp_local]
     return [local[:, layer, :].contiguous() for layer in range(num_layers)]
 
 
 def unpack_routed_experts(model, batch: PackedBatch, recorded, *, contiguous: bool = False):
     """Reverse recorded per-layer routing back to jagged ``[bs, seq, layers, topk]``.
 
-    ``recorded`` is this rank's stacked routing ``[local_padded_tokens, num_layers,
-    topk]``; CP-gathers and strips padding via the shared THD unpack (mirrors
-    ``unpack_thd_forward_output``).
+    ``recorded`` is this rank's stacked routing ``[tp_local_tokens, num_layers,
+    topk]``; TP-gather the sequence-parallel shards, then CP-gather and strip
+    padding via the shared THD unpack. Padding is always the zigzag (2*cp) TE
+    alignment; ``contiguous`` only selects the CP reconstruct mode (DS4).
     """
     ps = _parallel_state(model)
     num_layers, topk = int(recorded.size(1)), int(recorded.size(2))
+    if ps.tp_size > 1:
+        recorded = _gather_tp_sequence(recorded, ps)
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
-        contiguous=contiguous,
     )
     # Flatten (layers, topk) into one feature dim so unpack_thd_to_nested's
     # singleton-squeeze heuristic can't drop a 1-layer model's layer axis, then
@@ -187,6 +194,15 @@ def unpack_routed_experts(model, batch: PackedBatch, recorded, *, contiguous: bo
     nested = unpack_thd_to_nested(flat, meta, contiguous=contiguous)
     rows = [row.reshape(row.size(0), num_layers, topk) for row in nested.unbind(0)]
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+
+def _gather_tp_sequence(tensor: torch.Tensor, ps: ParallelState) -> torch.Tensor:
+    """All-gather a sequence-parallel-sharded tensor along dim 0 across TP ranks."""
+    import torch.distributed as dist
+
+    parts = [torch.empty_like(tensor) for _ in range(ps.tp_size)]
+    dist.all_gather(parts, tensor.contiguous(), group=ps.tp_group)
+    return torch.cat(parts, dim=0)
 
 
 def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs: bool = False) -> None:
