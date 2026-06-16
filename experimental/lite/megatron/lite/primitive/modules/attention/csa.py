@@ -250,7 +250,14 @@ class CompressedSparseAttention(nn.Module):
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.num_heads_per_group = config.num_attention_heads // config.o_groups
-        self.compress_ratio = config.compress_ratios[layer_idx] if config.compress_ratios else 0
+        # MTP layers use layer_idx == num_hidden_layers (+i), which is past the
+        # per-decoder-layer compress_ratios list (length num_hidden_layers); fall
+        # back to the last real layer's ratio so the MTP CSA still builds.
+        if config.compress_ratios:
+            _cr_idx = min(layer_idx, len(config.compress_ratios) - 1)
+            self.compress_ratio = config.compress_ratios[_cr_idx]
+        else:
+            self.compress_ratio = 0
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
