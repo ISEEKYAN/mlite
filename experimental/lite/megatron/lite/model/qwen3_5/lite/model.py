@@ -665,7 +665,7 @@ def _hook_vision_params_avg_grad_across_tp(module: nn.Module) -> None:
         param.average_gradients_across_tp_domain = True  # type: ignore[assignment]
 
 
-def _build_native_vision_model(hf_path: str) -> nn.Module:
+def _build_native_vision_model(hf_path: str) -> nn.Module | None:
     if not hf_path:
         raise ValueError("mount_vision_model requires hf_path.")
     try:
@@ -676,12 +676,22 @@ def _build_native_vision_model(hf_path: str) -> nn.Module:
     hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
     vision_config = getattr(hf_config, "vision_config", None)
     if vision_config is None:
-        raise RuntimeError("HF config does not expose vision_config; cannot build vision_model.")
-    hf_vision_cls = _resolve_hf_vision_cls(hf_config, hf_path)
-    if hasattr(hf_vision_cls, "_from_config"):
-        vision = hf_vision_cls._from_config(vision_config)
+        # Text-only checkpoint (no vision tower): nothing to mount -> graceful skip.
+        return None
+    auto_map = getattr(hf_config, "auto_map", None) or {}
+    if auto_map:
+        # Remote-code checkpoint: resolve the vision class from its dynamic module.
+        hf_vision_cls = _resolve_hf_vision_cls(hf_config, hf_path)
+        if hasattr(hf_vision_cls, "_from_config"):
+            vision = hf_vision_cls._from_config(vision_config)
+        else:
+            vision = hf_vision_cls(vision_config)
     else:
-        vision = hf_vision_cls(vision_config)
+        # Native-transformers checkpoint (auto_map=None, e.g. Qwen3.5-35B-A3B): build the vision tower
+        # directly from its vision_config via the native AutoModel registry (no remote code).
+        from transformers import AutoModel
+
+        vision = AutoModel.from_config(vision_config)
     _hook_fp32_rotary_emb(vision)
     _hook_vision_params_avg_grad_across_tp(vision)
     return vision.to(torch.bfloat16)
