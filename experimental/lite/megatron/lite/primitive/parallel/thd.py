@@ -257,6 +257,78 @@ def prepare_packed_thd_kwargs_for_context_parallel(
             kwargs[key] = tensor
 
 
+@dataclass(frozen=True)
+class ThdPackMeta:
+    """Per-sequence THD padding layout, recomputable from true seq lengths.
+
+    Shared by a model's pack/unpack pair so the connector never needs to hold
+    ``PackedSeqParams`` or padded token tensors to reverse a model output.
+    """
+
+    lengths: torch.Tensor
+    padded_lengths: torch.Tensor
+    cu_seqlens_padded: torch.Tensor
+    cp_size: int
+    cp_group: Any | None
+
+
+def thd_pack_meta(
+    seq_lens: torch.Tensor,
+    *,
+    tp_size: int = 1,
+    cp_size: int = 1,
+    cp_group: Any | None = None,
+    contiguous: bool = False,
+) -> ThdPackMeta:
+    """Compute the padded THD layout for ``seq_lens`` without copying tokens.
+
+    ``contiguous=False`` aligns to Megatron/TE zigzag CP (``2*cp``); ``True``
+    aligns to contiguous CP (``cp``). Mirrors :func:`pack_nested_thd` padding.
+    """
+    lengths = seq_lens.to(dtype=torch.int32)
+    cp_align = (cp_size if contiguous else 2 * cp_size) if cp_size > 1 else 1
+    align_size = max(int(tp_size), 1) * cp_align
+    pad_size = (align_size - lengths % align_size) % align_size
+    padded_lengths = lengths + pad_size
+    cu_seqlens_padded = torch.zeros(
+        lengths.numel() + 1, dtype=torch.int32, device=lengths.device
+    )
+    cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
+    return ThdPackMeta(lengths, padded_lengths, cu_seqlens_padded, cp_size, cp_group)
+
+
+def unpack_thd_to_nested(
+    output: torch.Tensor, meta: ThdPackMeta, *, contiguous: bool = False
+) -> torch.Tensor:
+    """Reverse a model output back to jagged true-length form using ``meta``.
+
+    Gathers CP-local shards (zigzag or contiguous reconstruct) then slices each
+    sequence's true length out of the padded layout.
+    """
+    if output.dim() >= 2 and output.shape[0] == 1:
+        flat = output[0]
+    elif output.dim() >= 2 and output.shape[1] == 1:
+        flat = output[:, 0]
+    else:
+        flat = output
+
+    if meta.cp_size > 1:
+        parts = _all_gather_cp_tensor(flat, cp_size=meta.cp_size, cp_group=meta.cp_group)
+        if contiguous:
+            flat = torch.cat(parts, dim=0)
+        else:
+            flat = _reconstruct_full_from_cp_parts(
+                parts, cu_seqlens_padded=meta.cu_seqlens_padded, cp_size=meta.cp_size, dim=0
+            )
+
+    pieces = []
+    for idx, length_t in enumerate(meta.lengths):
+        length = int(length_t.item())
+        start = int(meta.cu_seqlens_padded[idx].item())
+        pieces.append(flat[start : start + length])
+    return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
+
+
 def _all_gather_cp_tensor(
     tensor: torch.Tensor, *, cp_size: int, cp_group: Any
 ) -> list[torch.Tensor]:
@@ -526,6 +598,7 @@ def unpack_packed_thd_to_nested(output: torch.Tensor, batch: PackedTHDBatch) -> 
 __all__ = [
     "PackedSeqParams",
     "PackedTHDBatch",
+    "ThdPackMeta",
     "has_packed_thd_params",
     "pack_nested_thd",
     "parallel_state_from_model",
@@ -534,5 +607,7 @@ __all__ = [
     "reconstruct_packed_from_cp_parts",
     "roll_packed_thd_left",
     "split_packed_to_cp_local",
+    "thd_pack_meta",
     "unpack_packed_thd_to_nested",
+    "unpack_thd_to_nested",
 ]

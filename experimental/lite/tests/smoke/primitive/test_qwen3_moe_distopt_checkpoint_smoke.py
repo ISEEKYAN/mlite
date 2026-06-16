@@ -12,6 +12,7 @@ import torch.distributed as dist
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
@@ -122,29 +123,26 @@ def _shared_tmp_path(tmp_path) -> str:
     return payload[0]
 
 
-def _random_batch(vocab_size: int) -> dict[str, torch.Tensor | bool]:
-    return {
-        "input_ids": torch.randint(0, vocab_size, (2, 4), device="cuda"),
-        "labels": torch.randint(0, vocab_size, (2, 4), device="cuda"),
-        "return_log_probs": False,
-    }
+def _random_batch(vocab_size: int) -> PackedBatch:
+    # Raw THD PackedBatch: 1-D packed tokens + true seq lengths (protocol packs).
+    return PackedBatch(
+        input_ids=torch.randint(0, vocab_size, (8,), device="cuda"),
+        labels=torch.randint(0, vocab_size, (8,), device="cuda"),
+        seq_lens=torch.full((2,), 4, dtype=torch.int64, device="cuda"),
+    )
 
 
-def _clone_batch(batch: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value.detach().clone() if torch.is_tensor(value) else value
-        for key, value in batch.items()
-    }
+def _clone_batch(batch: PackedBatch) -> PackedBatch:
+    return PackedBatch(
+        input_ids=batch.input_ids.detach().clone(),
+        labels=batch.labels.detach().clone(),
+        seq_lens=batch.seq_lens.detach().clone(),
+    )
 
 
-def _assert_batch_equal(actual: dict[str, Any], expected: dict[str, Any]) -> None:
-    assert actual.keys() == expected.keys()
-    for key, expected_value in expected.items():
-        actual_value = actual[key]
-        if torch.is_tensor(expected_value):
-            assert torch.equal(actual_value, expected_value), key
-        else:
-            assert actual_value == expected_value
+def _assert_batch_equal(actual: PackedBatch, expected: PackedBatch) -> None:
+    assert torch.equal(actual.input_ids, expected.input_ids)
+    assert torch.equal(actual.labels, expected.labels)
 
 
 def _train_step(runtime: MegatronLiteRuntime, handle: ModelHandle, batch: dict[str, Any]) -> None:

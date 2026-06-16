@@ -10,13 +10,19 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.model.protocol_utils import (
+    add_cross_entropy_fusion,
+    add_loss_context_kwargs,
+    pack_thd_forward_kwargs,
+    set_cross_entropy_fusion,
+    unpack_thd_forward_output,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.parallel.thd import prepare_packed_thd_kwargs_for_context_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -69,6 +75,7 @@ class ImplConfig:
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
     use_thd: bool = False
+    cross_entropy_fusion: bool = False
     hf_path: str = ""
     attention_backend_override: str | None = None
     router_aux_loss_coef: float | None = None
@@ -93,20 +100,15 @@ def build_model_config(source: str | Path | dict, **overrides) -> KimiK2Config:
     return cfg
 
 
-def _forward_step(model: nn.Module, batch: dict) -> dict:
-    kwargs: dict[str, Any] = {
-        "input_ids": batch["input_ids"],
-        "labels": batch["labels"],
-    }
-    if "packed_seq_params" in batch:
-        kwargs["packed_seq_params"] = batch["packed_seq_params"]
-    for key in ("loss_mask", "temperature", "use_fused_kernels", "calculate_entropy"):
-        if key in batch:
-            kwargs[key] = batch[key]
-    if kwargs["input_ids"].dim() == 1:
-        kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(0)
-    prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
+def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
+    kwargs = pack_thd_forward_kwargs(model, batch)
+    add_loss_context_kwargs(kwargs)
+    add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
+
+
+def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
+    return unpack_thd_forward_output(model, batch, output)
 
 
 def _make_aux_loss_hook():
@@ -195,6 +197,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
             .cuda()
             for i in range(vpp)
         ]
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     if recompute_spec:
         for chunk in chunks:
