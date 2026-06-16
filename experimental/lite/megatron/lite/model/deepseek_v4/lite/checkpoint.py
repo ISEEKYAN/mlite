@@ -1,59 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DeepSeek V4 (ds4flash) lite native checkpoint mapping.
+"""DeepSeek V4 (ds4flash) lite native <-> HF checkpoint mapping.
 
-Structurally identical to ``megatron/lite/model/kimi_k2/lite/checkpoint.py`` and
-``megatron/lite/model/glm5/lite/checkpoint.py``: a ``DeepseekV4WeightSpec``
-encodes the per-param native <-> HF name mapping (and TP/EP sharding spec), and
-``export_hf_weights`` / ``save_hf_weights`` route through the SHARED
-``primitive/ckpt/hf_weights.py`` ``_export`` / ``save_safetensors``.  The shared
-exporter does the TP/ETP/EP/PP gather correctly (all ranks reach the PP
-``all_gather_object`` before any ``rank0_only`` filter), so DS4 no longer
-desyncs under PP>1 (the previous bespoke ``_gather_pp_hf_state`` /
-``_local_hf_state`` did an EP collective inside a rank0-skewed path and hung).
+Like kimi_k2 / glm5: ``DeepseekV4WeightSpec`` encodes the per-param native -> HF
+name (+ TP/EP shard spec); export/save route through the shared
+``primitive/ckpt/hf_weights.py`` exporter (its PP ``all_gather_object`` is
+reached by all ranks before any ``rank0_only`` filter, so PP>1 export doesn't
+desync).  Native names are bare ``DeepseekV4Model`` keys; ``self.layers`` is a
+ModuleDict keyed by GLOBAL layer index (kimi uses a local ModuleList), so the
+exporter's local->global remap is an identity here.
 
-DS4 native naming differs from Kimi in two structural ways the spec accounts for:
+HF targets are canonical HF DeepSeek (``model.embed_tokens.weight`` /
+``model.norm.weight`` / ``lm_head.weight`` / ``model.layers.<i>.self_attn.*`` /
+``...mlp.experts.<id>.{gate,up,down}_proj.weight``).  DS4 extras:
+  * CSA: ``self_attn.*`` incl. ``compressor.*`` / ``indexer.*``; ``sinks`` ->
+    ``self_attn.attn_sink``.
+  * mHC: ``attn_hc`` / ``ffn_hc`` -> ``...self_attn.hc_*`` / ``...mlp.hc_*``;
+    model-wide ``hc_head`` -> ``model.hc_head.*`` (no HF analogue, kept
+    model.-rooted; fidelity vs Megatron's latest mHC is a TODO).
+  * MTP: folded into the decoder namespace at ``model.layers.<num_hidden+i>``.
 
-  * DS4's chunks are ``DeepseekV4ForCausalLM`` (a ``model.`` prefix wraps the
-    inner ``DeepseekV4Model``), whereas Kimi's chunks are the bare model.  The
-    spec therefore matches ``model.layers.<idx>.*`` / ``model.mtp.<idx>.*`` /
-    ``model.embed_tokens.*`` etc.
-  * DS4's ``self.layers`` is an ``nn.ModuleDict`` keyed by the GLOBAL layer
-    index (Kimi uses an ``nn.ModuleList`` keyed locally).  The native names are
-    therefore already global; the shared exporter's local->global remap is an
-    identity for DS4 (global keys never collide with the positional range on
-    non-zero PP ranks), and the spec maps the global names 1:1 to HF names.
-
-Every HF target name is ``model.``-rooted (or ``lm_head.weight``), matching the
-canonical HF DeepSeek layout that Kimi/GLM-5 export to -- top-level
-``embed_tokens.embedding.weight`` -> ``model.embed_tokens.weight``,
-``norm.weight`` -> ``model.norm.weight``, ``lm_head.col.linear.weight`` ->
-``lm_head.weight``.  DS4-specific weights handled by the spec
-(see ``native_to_hf``):
-
-  * CSA attention (``self_attn.self_attn.*``): MLA-style ``wq_a`` / ``q_norm`` /
-    ``wq_b`` / ``wkv`` / ``kv_norm`` / ``wo_a`` / ``wo_b`` plus ``sinks`` (HF
-    ``attn_sink``) and the ``compressor.*`` / ``indexer.*`` submodules, mapped to
-    ``model.layers.<i>.self_attn.*`` (incl. ``.self_attn.compressor.*`` /
-    ``.self_attn.indexer.*``).
-  * mHC: per-layer ``attn_hc`` / ``ffn_hc`` ``HyperConnection`` (``fn`` /
-    ``base`` / ``scale``) -> ``model.layers.<i>.self_attn.hc_*`` /
-    ``...mlp.hc_*``, and the model-wide / per-MTP ``hc_head``
-    ``MultiHeadHyperConnectionHead`` -> ``model.hc_head.*`` (these have no
-    upstream HF analogue; kept ``model.``-rooted for a self-consistent, complete
-    export; mHC HF-name fidelity vs Megatron's latest is a TODO, not yet
-    cross-checked against an upstream DeepSeek-V4 checkpoint).
-  * MTP: HF folds MTP layers into the decoder namespace at continued global
-    indices (``model.layers.<num_hidden_layers + i>.*``); ``e_proj`` /
-    ``h_proj`` / ``enorm`` / ``hnorm`` / ``norm`` carried 1:1 there.
-  * MoE: ``mlp.experts.fc{1,2}.weight<id>`` ->
-    ``model.layers.<i>.mlp.experts.<id>.{gate_proj,up_proj,down_proj}.weight``
-    (fc1 splits gate/up), shared expert -> ``...mlp.shared_experts.*``, router
-    ``mlp.gate.*`` -> ``model.layers.<i>.mlp.gate.*`` (``expert_bias`` ->
-    ``e_score_correction_bias``).
-
-CSA is NOT tensor-parallel-capable: DS4 runs TP=ETP=1 (the protocol gate raises
-for TP>1), exactly like GLM-5.  The spec's ``tp_spec`` therefore declares only
-the EP/ETP expert splits and the embed/head/eh_proj vocab split; nothing TP-only.
+CSA is not TP-capable: DS4 runs TP=ETP=1 (only EP shards experts), like GLM-5.
 """
 
 from __future__ import annotations
@@ -106,29 +72,20 @@ def PLACEMENT_FN(param_name: str) -> list:
     return [Replicate(), Replicate(), Replicate(), Replicate()]
 
 
-# ======================================================================
-# Native <-> HF name mapping (shared by export spec and load path).
-#
-# These operate on the DS4 native ``state_dict`` / ``named_*`` names, i.e. with
-# the ``DeepseekV4ForCausalLM`` ``model.`` prefix and GLOBAL layer indices.
-# ======================================================================
-
-_BLOCK_KEY_RE = re.compile(r"^model\.(layers|mtp)\.(\d+)\.(.+)$")
+# Native <-> HF name mapping (shared by export spec and load path).  Native
+# names are bare DeepseekV4Model state_dict keys with GLOBAL layer indices.
+_BLOCK_KEY_RE = re.compile(r"^(layers|mtp)\.(\d+)\.(.+)$")
 _GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.fc([12])\.weight(\d+)$")
 _PROJ_TO_HF = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
-# Native top-level param names -> HF target names.  The embedding is a
-# VocabParallelEmbedding (``embed_tokens.embedding.weight``) and the head a
-# VocabParallelOutput (``lm_head.col.linear.weight``); both collapse to the
-# canonical HF DeepSeek names.  mHC head params have no upstream HF analogue,
-# so they keep a ``model.hc_head.*`` prefix (still ``model.``-rooted so the HF
-# export stays self-consistent and complete).
+# Native top-level params -> HF target names.  mHC ``hc_head`` has no HF
+# analogue, so it keeps a ``model.``-rooted name to stay self-consistent.
 _TOP_LEVEL = {
-    "model.embed_tokens.embedding.weight": "model.embed_tokens.weight",
-    "model.norm.weight": "model.norm.weight",
-    "model.hc_head.hc_fn": "model.hc_head.hc_fn",
-    "model.hc_head.hc_base": "model.hc_head.hc_base",
-    "model.hc_head.hc_scale": "model.hc_head.hc_scale",
+    "embed_tokens.embedding.weight": "model.embed_tokens.weight",
+    "norm.weight": "model.norm.weight",
+    "hc_head.hc_fn": "model.hc_head.hc_fn",
+    "hc_head.hc_base": "model.hc_head.hc_base",
+    "hc_head.hc_scale": "model.hc_head.hc_scale",
     "lm_head.col.linear.weight": "lm_head.weight",
 }
 
@@ -179,12 +136,9 @@ def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: 
 
 
 def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
-    """Map a DS4 native ``state_dict`` key to its HF target name(s).
+    """Map a bare DS4 native key (global layer idx, global expert id) to HF name(s).
 
-    ``name`` is the global native name (``model.`` prefix, global layer idx).
-    Expert names are expected to already carry the GLOBAL expert id in their
-    ``weight<id>`` suffix (the load path and the shared exporter both supply
-    global expert ids before calling into this helper).
+    Callers (load path + shared exporter) supply global expert ids first.
     """
     mapped = _TOP_LEVEL.get(name)
     if mapped is not None:
@@ -409,7 +363,7 @@ def _to_global_expert_name(name: str, config: DeepseekV4Config, ps: ParallelStat
         return name
     fc, local_idx = expert.groups()
     global_idx = _global_expert_idx_from_local(int(local_idx), config, ps)
-    return f"model.{block}.{index}.mlp.experts.fc{fc}.weight{global_idx}"
+    return f"{block}.{index}.mlp.experts.fc{fc}.weight{global_idx}"
 
 
 # ======================================================================
@@ -420,11 +374,9 @@ def _to_global_expert_name(name: str, config: DeepseekV4Config, ps: ParallelStat
 class DeepseekV4WeightSpec:
     """Export DS4 lite weights to HF DeepSeek-V4 names (CSA / mHC / MTP / MoE).
 
-    Mirrors ``KimiK2WeightSpec`` / ``Glm5WeightSpec`` but operates on DS4's
-    native names: the ``DeepseekV4ForCausalLM`` ``model.`` prefix and GLOBAL
-    layer indices (``self.layers`` is an ``nn.ModuleDict`` keyed by global idx).
-    The shared exporter rewrites EP-local expert ``weight<local>`` suffixes to
-    global ids before calling ``native_to_hf``, so the HF expert ids are global.
+    Mirrors ``KimiK2WeightSpec`` / ``Glm5WeightSpec`` on DS4's bare native names
+    with global layer indices.  The shared exporter rewrites EP-local expert
+    ``weight<local>`` ids to global before calling ``native_to_hf``.
     """
 
     def __init__(self, config: DeepseekV4Config):
@@ -479,7 +431,7 @@ class DeepseekV4WeightSpec:
         if native_name.endswith(".eh_proj.linear.weight"):
             return (0, 0)
         if native_name in {
-            "model.embed_tokens.embedding.weight",
+            "embed_tokens.embedding.weight",
             "lm_head.col.linear.weight",
         }:
             return (0, 0)

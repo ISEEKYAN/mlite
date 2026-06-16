@@ -322,7 +322,7 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4ForCausalLM
+    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
 
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
@@ -344,11 +344,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
     def _chunk(i: int | None = None):
         return (
-            DeepseekV4ForCausalLM(
+            DeepseekV4Model(
                 model_cfg,
-                train_cfg=train_cfg,
-                ps=ps,
-                vpp=vpp,
+                train_cfg,
+                ps,
                 vpp_chunk_id=i,
                 use_deepep=impl_cfg.use_deepep,
                 use_thd=impl_cfg.use_thd,

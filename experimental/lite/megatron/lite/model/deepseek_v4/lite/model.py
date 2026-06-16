@@ -1,56 +1,31 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek V4 (ds4flash) lite native model.
 
-This model is a clone of the Kimi-K2 (deepseek_v3) lite model
-(``megatron/lite/model/kimi_k2/lite/model.py``) -- the SAME clean approach used
-for GLM-5.  It inherits Kimi's Megatron plumbing: the SBHD ``[S, B, H]`` layout
-convention, sequence-parallel scatter/gather (no-ops at DS4's enforced TP=1),
-``VocabParallelEmbedding`` / ``VocabParallelOutput`` head wiring,
-``set_input_tensor``, ``share_embeddings_and_output_weights``,
-``build_pipeline_chunk_layout``-based pipeline boundaries, MTP via
-``layout.has_head``, and the dist-opt / distckpt integration through the
-protocol.
+A clone of the Kimi-K2 (deepseek_v3) lite model -- same approach as GLM-5 --
+inheriting Kimi's Megatron plumbing (SBHD ``[S, B, H]`` layout, VocabParallel
+embed/head, ``set_input_tensor``, ``build_pipeline_chunk_layout`` boundaries,
+MTP via ``layout.has_head``, dist-opt/distckpt via the protocol).  Three
+model-wide DS4 deviations (documented inline at each site):
 
-DS4 differs from Kimi in three model-wide ways (documented inline at every
-deviation):
+1. Attention = CSA, not MLA.  The CSA primitive is batch-first ``[B, S, H]`` and
+   needs explicit ``position_ids``; ``DeepseekV4CSAAttention`` wraps it with an
+   SBHD<->BSHD shim (like GLM-5's DSA shim).  Per-layer behaviour is driven by
+   ``config.compress_ratios[layer_idx]`` inside CSA.
 
-1. **Attention = CSA (Compressed Sparse Attention)**, NOT MLA.  The CSA
-   primitive (``primitive/modules/attention/csa.py``) is hard-wired batch-first
-   ``[B, S, H]`` and needs explicit ``position_ids``.  ``DeepseekV4CSAAttention``
-   wraps it with a ``[S, B, H] <-> [B, S, H]`` transpose shim (mirroring GLM-5's
-   DSA shim) so the surrounding skeleton stays SBHD.  Per-layer behaviour is
-   driven by ``config.compress_ratios[layer_idx]`` inside the CSA module itself
-   (compress_ratio==4 enables the indexer; >1 enables the compressor; the
-   "heavily-compressed" layers are simply the higher-ratio entries) -- DS4 uses
-   CSA in every layer, exactly as the previous DS4 implementation did.
+2. mHC (multi-head hyper-connection): the hidden carries ``hc_mult`` parallel
+   residual streams (4-D ``[S, B, hc_mult, H]`` in SBHD), expanded after embed
+   and contracted before the head, persisting across layers and PP stages; each
+   layer wraps attn/FFN in a ``HyperConnection``.  At PP boundaries the 4-D
+   hidden folds to 3-D ``[S, B, hc_mult*H]`` to match the P2P buffer
+   (``_infer_pipeline_tensor_shape`` scales hidden by ``hc_mult``); fold/unfold
+   live in ``primitive/parallel/mhc.py``.
 
-2. **mHC = multi-head hyper-connection**: a MODEL-WIDE hidden change.  The hidden
-   carries ``hc_mult`` parallel residual streams.  In SBHD that hidden is 4-D
-   ``[S, B, hc_mult, H]``.  The streams are EXPANDED right after embed and
-   CONTRACTED right before the head, and PERSIST across every layer (and across
-   pipeline stages).  Each layer wraps its attention and FFN sub-blocks in a
-   ``HyperConnection`` (``primitive/modules/attention/hca.py``) instead of
-   Kimi's plain ``x = x + sublayer(norm(x))`` residual.  This is the one place
-   the kimi skeleton's per-layer arithmetic is forced to change beyond
-   attention; everything outside the layer body (embed/head/MTP/SP/PP) keeps the
-   Kimi shape, with the hidden simply being 4-D instead of 3-D.
+3. MoE = hash-routed DeepSeek: first ``num_hash_layers`` use a token-id hash
+   route, the rest the shared sigmoid-topk router (``DeepseekV4MoE`` over the
+   shared Experts/Router/Dispatcher).
 
-   At a pipeline-stage boundary the 4-D ``[S, B, hc_mult, H]`` hidden is folded
-   to 3-D ``[S, B, hc_mult * H]`` so it matches the runtime P2P buffer
-   (``_infer_pipeline_tensor_shape`` multiplies hidden by ``hc_mult``); the
-   receiving stage unfolds it back.  Fold/unfold live in
-   ``primitive/parallel/mhc.py`` and are layout-agnostic (they only collapse the
-   trailing ``(hc_mult, H)`` dims), so they work unchanged on SBHD tensors.
-
-3. **MoE = hash-routed DeepSeek family**: the first ``num_hash_layers`` use a
-   token-id hash route; the rest use the shared sigmoid-topk router.  This is
-   owned by ``DeepseekV4MoE`` (already an assembly over the SHARED ``Experts`` /
-   ``SigmoidTopKRouter`` / ``TokenDispatcher`` -- reused, not reinvented), so it
-   is kept as DS4's real MoE rather than swapped for Kimi's MoELayer.
-
-NOTE: CSA is NOT tensor-parallel-capable, so DS4 is a documented TP=1 special
-case (the protocol gate raises for TP>1 / ETP>1).  VPP / PP / EP / CP work,
-inherited from the Kimi skeleton.
+CSA is not TP-capable, so DS4 is a documented TP=1 case (protocol gate raises
+for TP>1/ETP>1); VPP/PP/EP/CP work, inherited from the Kimi skeleton.
 """
 
 from __future__ import annotations
@@ -616,73 +591,9 @@ class DeepseekV4Model(nn.Module):
         )
 
 
-class DeepseekV4ForCausalLM(nn.Module):
-    """Thin runtime wrapper preserved from the previous DS4 model.
-
-    The runtime / protocol address ``model``, ``pre_process`` / ``post_process``,
-    ``set_input_tensor``, ``share_embeddings_and_output_weights`` and ``ps`` on
-    the top-level module; this wrapper exposes them while delegating to
-    ``DeepseekV4Model`` (which holds the Kimi-derived skeleton).
-    """
-
-    def __init__(
-        self,
-        config: DeepseekV4Config,
-        train_cfg=None,
-        ps: ParallelState | None = None,
-        *,
-        vpp: int | None = None,
-        vpp_chunk_id: int | None = None,
-        use_deepep: bool = False,
-        use_thd: bool = False,
-        hf_path: str = "",
-        attention_backend_override: str | None = None,
-        mtp_enable: bool = False,
-        mtp_enable_train: bool = False,
-        mtp_detach_encoder: bool = False,
-    ):
-        super().__init__()
-        self.config = config
-        self.ps = ps or ParallelState()
-        if train_cfg is None:
-            from types import SimpleNamespace
-
-            train_cfg = SimpleNamespace(fp8=False, vpp=vpp)
-        elif not hasattr(train_cfg, "vpp"):
-            train_cfg.vpp = vpp
-        self.train_cfg = train_cfg
-        self.model = DeepseekV4Model(
-            config,
-            train_cfg,
-            self.ps,
-            vpp_chunk_id=vpp_chunk_id,
-            use_deepep=use_deepep,
-            use_thd=use_thd,
-            hf_path=hf_path,
-            attention_backend_override=attention_backend_override,
-            mtp_enable=mtp_enable,
-            mtp_enable_train=mtp_enable_train,
-            mtp_detach_encoder=mtp_detach_encoder,
-        )
-        self.pre_process = self.model.pre_process
-        self.post_process = self.model.post_process
-        self.share_embeddings_and_output_weights = self.model.share_embeddings_and_output_weights
-
-    @property
-    def layer_indices(self):
-        return self.model.layer_indices
-
-    def set_input_tensor(self, input_tensor):
-        self.model.set_input_tensor(input_tensor)
-
-    def forward(self, *args, **kwargs) -> dict:
-        return self.model(*args, **kwargs)
-
-
 __all__ = [
     "CompressedSparseAttention",
     "DeepseekV4CSAAttention",
-    "DeepseekV4ForCausalLM",
     "DeepseekV4Layer",
     "DeepseekV4Model",
     "DeepseekV4MTPLayer",
