@@ -32,6 +32,10 @@ class DeepseekV4MoE(nn.Module):
         self.is_hash_layer = layer_idx < config.num_hash_layers
         self.gate = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
         if self.is_hash_layer:
+            # Hash layers route by token id (tid2eid), never through the gate's
+            # topk — their routing is weight-independent, so they are excluded
+            # from router replay (recording/replaying them would be a no-op).
+            self.gate._router_replay_exclude = True
             self.gate.register_buffer(
                 "tid2eid",
                 torch.zeros(config.vocab_size, self.topk, dtype=torch.int64),

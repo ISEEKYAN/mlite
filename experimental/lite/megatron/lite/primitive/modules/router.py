@@ -143,23 +143,33 @@ class RouterReplay:
         return target
 
 
-def attach_router_replay(model: nn.Module) -> int:
-    """Enable router replay on every MoE router in ``model`` (one shared path).
+def _is_replay_capable_router(module: nn.Module) -> bool:
+    """A module joins the replay registry iff it has a ``router_replay`` slot and
+    is not explicitly excluded (e.g. DeepSeek-V4 input-deterministic hash-routed
+    layers, whose routing never depends on weights and so needs no replay)."""
+    return hasattr(module, "router_replay") and not getattr(
+        module, "_router_replay_exclude", False
+    )
 
-    Walks the module tree and gives each replay-capable router (any module that
-    exposes a ``router_replay`` slot — all mlite routers do) a fresh
-    :class:`RouterReplay`, registered in module-traversal (== layer) order. This
-    lets the model-agnostic runtime turn replay on for all five models without
-    threading a constructor flag through any model. Returns the router count.
 
-    Each rank attaches only its *local* routers (its pipeline stage's layers),
-    so the per-layer registry is naturally local; the runtime gathers/scatters
-    routing tensors across pipeline ranks.
+def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
+    """Enable router replay on every replay-capable MoE router in ``model``.
+
+    Walks the module tree and gives each router a fresh :class:`RouterReplay`,
+    registered in module-traversal (== layer) order. This lets the model-agnostic
+    runtime turn replay on for all five models without threading a constructor
+    flag through any model. Returns the router count.
+
+    ``reset=False`` appends to the existing registry instead of clearing it, so a
+    multi-chunk (PP/VPP) model can be attached chunk-by-chunk while keeping global
+    layer order. Each rank attaches only its *local* routers; the runtime
+    gathers/scatters routing tensors across pipeline ranks.
     """
-    RouterReplay.clear_global_router_replay_instances()
+    if reset:
+        RouterReplay.clear_global_router_replay_instances()
     count = 0
     for module in model.modules():
-        if hasattr(module, "router_replay"):
+        if _is_replay_capable_router(module):
             module.router_replay = RouterReplay()
             count += 1
     return count

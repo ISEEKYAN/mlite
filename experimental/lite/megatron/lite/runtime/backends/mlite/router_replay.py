@@ -67,19 +67,12 @@ class RouterReplayDriver:
 
     # ── lifecycle ──
     def begin(self) -> None:
-        # Single pass across all chunks so the global per-layer registry is in
-        # pipeline-local layer order (attach_router_replay clears on each call,
-        # so we inline the equivalent walk here for the multi-chunk case).
+        # Attach across all chunks in one registry so the global per-layer order
+        # matches pipeline-local layer order (clear once, then append per chunk).
         RouterReplay.clear_global_router_replay_instances()
-        if len(self._chunks) == 1:
-            self._num_routers = attach_router_replay(self._chunks[0])
-        else:
-            self._num_routers = 0
-            for chunk in self._chunks:
-                for module in chunk.modules():
-                    if hasattr(module, "router_replay"):
-                        module.router_replay = RouterReplay()
-                        self._num_routers += 1
+        self._num_routers = sum(
+            attach_router_replay(chunk, reset=False) for chunk in self._chunks
+        )
         if self._num_routers == 0:
             raise RuntimeError("router replay requested but the model has no MoE routers.")
         if self.action == _RECORD:

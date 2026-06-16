@@ -164,6 +164,7 @@ def unpack_routed_experts(model, batch: PackedBatch, recorded, *, contiguous: bo
     ``unpack_thd_forward_output``).
     """
     ps = _parallel_state(model)
+    num_layers, topk = int(recorded.size(1)), int(recorded.size(2))
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,
@@ -171,7 +172,13 @@ def unpack_routed_experts(model, batch: PackedBatch, recorded, *, contiguous: bo
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
         contiguous=contiguous,
     )
-    return unpack_thd_to_nested(recorded, meta, contiguous=contiguous)
+    # Flatten (layers, topk) into one feature dim so unpack_thd_to_nested's
+    # singleton-squeeze heuristic can't drop a 1-layer model's layer axis, then
+    # restore [seq, layers, topk] per sequence.
+    flat = recorded.reshape(recorded.size(0), num_layers * topk)
+    nested = unpack_thd_to_nested(flat, meta, contiguous=contiguous)
+    rows = [row.reshape(row.size(0), num_layers, topk) for row in nested.unbind(0)]
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
 def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs: bool = False) -> None:
