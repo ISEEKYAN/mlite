@@ -1,11 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Shared MoE utilities: _AllToAll and MoEAuxLossAutoScaler.
 
-Extracted from models/*/moe.py (Level 0 Option C — pure extraction, no behavior change).
-All three models (qwen3_moe, qwen3_5, deepseek_v3) had identical _AllToAll
-implementations and functionally identical MoEAuxLossAutoScaler implementations.
-The qwen3_moe version is used as the canonical form (adds docstring and named
-intermediate variable for clarity).
+Extracted from model-local MoE helpers as a pure shared primitive with no
+behavior change. The primitive layer intentionally avoids model-family
+knowledge so model implementations can compose it without back edges.
 
 Note: this is megatron.lite's own MoEAuxLossAutoScaler. The native MLite
 runtime calls `set_loss_scale` on this class to apply the

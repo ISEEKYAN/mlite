@@ -1,9 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Linear + vocab-parallel cross entropy helpers.
 
-The fast path delegates to VERL's Triton-backed fused kernel when available.
-The fallback keeps the same contract and is used by unit/smoke tests that do
-not have the fused extension on ``PYTHONPATH``.
+This primitive is intentionally self-contained: application connectors may use
+it, but it must not import connector packages or kernels from those packages.
 """
 
 from __future__ import annotations
@@ -49,16 +48,7 @@ def linear_cross_entropy(
     temperature: float = 1.0,
     tp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return token log-probs and entropy without changing VERL's fused API."""
-    try:
-        from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _verl_lce
-    except Exception:
-        _verl_lce = None
-
-    if _verl_lce is not None and hidden.is_cuda:
-        log_probs, entropy = _verl_lce(hidden, weight, labels, float(temperature), "none", tp_group)
-        return _reshape_like_labels(log_probs, labels), _reshape_like_labels(entropy, labels)
-
+    """Return token log-probs and entropy from local primitive ops."""
     logits = torch.matmul(hidden, weight.t())
     if temperature != 1.0:
         logits = logits / float(temperature)

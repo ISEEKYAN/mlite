@@ -70,22 +70,12 @@ def _make_data_iter(handle: ModelHandle, cfg: PretrainSessionConfig):
     data_seed = cfg.seed if cfg.same_data_across_dp else cfg.seed + handle.dp_rank
     vocab_size = _resolve_vocab_size(handle)
 
-    if cfg.use_thd:
-        from megatron.lite.primitive.data import infinite_batches_thd
+    # Single source of truth: drive every backend from one raw PackedBatch.
+    # Padding, CP layout, and THD metadata are backend/model concerns, not bench
+    # data fields.
+    from megatron.lite.primitive.data import infinite_packed_batches
 
-        ps = handle._parallel_state
-        return infinite_batches_thd(
-            vocab_size,
-            cfg.seq_len,
-            cp_size=getattr(ps, "cp_size", 1),
-            cp_rank=getattr(ps, "cp_rank", 0),
-            device=cfg.device,
-            seed=data_seed,
-        )
-
-    from megatron.lite.primitive.data import infinite_batches
-
-    return infinite_batches(vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed)
+    return infinite_packed_batches(vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed)
 
 
 def _calc_tflops_per_gpu(

@@ -193,4 +193,33 @@ def infinite_batches_thd(
             }
 
 
-__all__ = ["fixed_batches", "infinite_batches", "infinite_batches_thd"]
+def infinite_packed_batches(
+    vocab_size: int, seq_len: int, batch_size: int = 1, device: str = "cuda", seed: int = 42
+):
+    """Infinite raw ``PackedBatch`` generator — the canonical bench data contract.
+
+    Yields model-agnostic, unpadded packed batches (1-D ``input_ids``/``labels``
+    plus true per-sequence ``seq_lens``). Both bench backends consume the same raw
+    object; backend/model-specific THD metadata is derived only at the immediate
+    forward boundary. Keeping a single source of truth makes the mlite-vs-bridge
+    precision comparison fair without baking padding or CP layout into the data.
+    """
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int64, device=device)
+    total = batch_size * seq_len
+    while True:
+        yield PackedBatch(
+            input_ids=torch.randint(0, vocab_size, (total,), device=device, generator=g),
+            labels=torch.randint(0, vocab_size, (total,), device=device, generator=g),
+            seq_lens=seq_lens.clone(),
+        )
+
+
+__all__ = [
+    "fixed_batches",
+    "infinite_batches",
+    "infinite_batches_thd",
+    "infinite_packed_batches",
+]
