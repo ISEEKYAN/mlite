@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -19,6 +20,158 @@ from megatron.lite.primitive.utils.moe import (
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel import ParallelState
+
+
+class RouterReplayAction(Enum):
+    """Action for a router-replay step (mirrors the verl/mcore contract)."""
+
+    RECORD = "record"  # capture the topk expert indices for later replay
+    REPLAY_FORWARD = "replay_forward"  # force the recorded indices in the forward pass
+    REPLAY_BACKWARD = "replay_backward"  # force them again during backward recompute
+
+
+class RouterReplay:
+    """Native (no-mcore) record/replay of MoE routing decisions.
+
+    One instance per MoE router; instances register themselves in
+    ``global_router_replay_instances`` in construction order so the runtime can
+    address per-layer routing tensors positionally. API mirrors the verl
+    ``router_replay_patch.RouterReplay`` so the mlite verl engine and the
+    model-agnostic runtime drive every model through this single code path.
+
+    Replay only overrides the expert *indices*; the gating *scores* are gathered
+    fresh from the current ``probs_dense`` so gradients still flow through the
+    gate while the routing selection is held fixed.
+    """
+
+    global_router_replay_instances: list["RouterReplay"] = []
+
+    # ── global controls (one call fans out to every layer) ──
+    @staticmethod
+    def set_replay_data(all_layers_topk_indices: list[torch.Tensor]) -> None:
+        instances = RouterReplay.global_router_replay_instances
+        if len(all_layers_topk_indices) != len(instances):
+            raise ValueError(
+                f"router replay expects {len(instances)} per-layer tensors, "
+                f"got {len(all_layers_topk_indices)}."
+            )
+        for inst, idx in zip(instances, all_layers_topk_indices, strict=True):
+            inst.set_target_indices(idx)
+
+    @staticmethod
+    def get_recorded_data() -> list[torch.Tensor | None]:
+        return [inst.get_recorded_indices() for inst in RouterReplay.global_router_replay_instances]
+
+    @staticmethod
+    def clear_global_indices() -> None:
+        for inst in RouterReplay.global_router_replay_instances:
+            inst.clear_indices()
+
+    @staticmethod
+    def set_global_router_replay_action(action: RouterReplayAction) -> None:
+        for inst in RouterReplay.global_router_replay_instances:
+            inst.set_router_replay_action(action)
+
+    @staticmethod
+    def clear_global_router_replay_action() -> None:
+        for inst in RouterReplay.global_router_replay_instances:
+            inst.clear_router_replay_action()
+
+    @staticmethod
+    def clear_global_router_replay_instances() -> None:
+        RouterReplay.global_router_replay_instances.clear()
+
+    # ── per-instance state ──
+    def __init__(self) -> None:
+        self.target_topk_idx: torch.Tensor | None = None
+        self.recorded_topk_idx: torch.Tensor | None = None
+        self.router_replay_action: RouterReplayAction | None = None
+        self.replay_backward_list: list[torch.Tensor] = []
+        RouterReplay.global_router_replay_instances.append(self)
+
+    def set_target_indices(self, topk_indices: torch.Tensor) -> None:
+        self.target_topk_idx = topk_indices
+        # Each forward (incl. the backward recompute) pops one entry, in order.
+        self.replay_backward_list.append(topk_indices)
+
+    def get_recorded_indices(self) -> torch.Tensor | None:
+        return self.recorded_topk_idx
+
+    def record_indices(self, topk_indices: torch.Tensor) -> None:
+        self.recorded_topk_idx = topk_indices
+
+    def clear_indices(self) -> None:
+        self.recorded_topk_idx = None
+        self.target_topk_idx = None
+        self.replay_backward_list = []
+
+    def set_router_replay_action(self, action: RouterReplayAction) -> None:
+        self.router_replay_action = action
+
+    def clear_router_replay_action(self) -> None:
+        self.router_replay_action = None
+
+    def apply(
+        self,
+        probs_dense: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shared replay hook every router calls after computing its own topk.
+
+        ``probs_dense`` is the dense gating score tensor ``[tokens, num_experts]``;
+        ``topk_scores``/``topk_indices`` are this router's freshly-computed
+        ``[tokens, topk]`` selection. Returns the (possibly overridden) pair.
+        """
+        action = self.router_replay_action
+        if action == RouterReplayAction.RECORD:
+            self.record_indices(topk_indices)
+            return topk_scores, topk_indices
+        if action == RouterReplayAction.REPLAY_FORWARD:
+            target = self._take_target(self.target_topk_idx).to(probs_dense.device)
+            return probs_dense.gather(-1, target).to(topk_scores.dtype), target
+        if action == RouterReplayAction.REPLAY_BACKWARD:
+            if not self.replay_backward_list:
+                raise RuntimeError("router replay backward list exhausted; recompute/forward mismatch.")
+            target = self.replay_backward_list.pop(0).to(probs_dense.device)
+            return probs_dense.gather(-1, target).to(topk_scores.dtype), target
+        return topk_scores, topk_indices
+
+    @staticmethod
+    def _take_target(target: torch.Tensor | None) -> torch.Tensor:
+        if target is None:
+            raise RuntimeError("router replay is in replay mode but no target indices were set.")
+        return target
+
+
+def attach_router_replay(model: nn.Module) -> int:
+    """Enable router replay on every MoE router in ``model`` (one shared path).
+
+    Walks the module tree and gives each replay-capable router (any module that
+    exposes a ``router_replay`` slot — all mlite routers do) a fresh
+    :class:`RouterReplay`, registered in module-traversal (== layer) order. This
+    lets the model-agnostic runtime turn replay on for all five models without
+    threading a constructor flag through any model. Returns the router count.
+
+    Each rank attaches only its *local* routers (its pipeline stage's layers),
+    so the per-layer registry is naturally local; the runtime gathers/scatters
+    routing tensors across pipeline ranks.
+    """
+    RouterReplay.clear_global_router_replay_instances()
+    count = 0
+    for module in model.modules():
+        if hasattr(module, "router_replay"):
+            module.router_replay = RouterReplay()
+            count += 1
+    return count
+
+
+def detach_router_replay(model: nn.Module) -> None:
+    """Disable router replay and clear the global registry (inverse of attach)."""
+    for module in model.modules():
+        if hasattr(module, "router_replay"):
+            module.router_replay = None
+    RouterReplay.clear_global_router_replay_instances()
 
 
 def _ordered_topk_from_routing_map(
@@ -48,6 +201,7 @@ class TopKRouter(nn.Module):
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
         router_dtype: torch.dtype | None = None,
+        enable_routing_replay: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -63,6 +217,7 @@ class TopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.router_replay = RouterReplay() if enable_routing_replay else None
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
@@ -95,6 +250,10 @@ class TopKRouter(nn.Module):
             )
             topk_scores, topk_indices = _ordered_topk_from_routing_map(
                 probs_dense, routing_map, self.topk
+            )
+        if self.router_replay is not None:
+            topk_scores, topk_indices = self.router_replay.apply(
+                probs_dense, topk_scores, topk_indices
             )
         if self.router_dtype is None:
             topk_scores = topk_scores.to(x.dtype)
@@ -134,6 +293,7 @@ class SigmoidTopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
+        enable_routing_replay: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -150,6 +310,7 @@ class SigmoidTopKRouter(nn.Module):
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
+        self.router_replay = RouterReplay() if enable_routing_replay else None
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(
@@ -175,6 +336,10 @@ class SigmoidTopKRouter(nn.Module):
         topk_scores, topk_indices = _ordered_topk_from_routing_map(
             probs_dense, routing_map, self.topk
         )
+        if self.router_replay is not None:
+            topk_scores, topk_indices = self.router_replay.apply(
+                probs_dense, topk_scores, topk_indices
+            )
         topk_scores = topk_scores.to(logits.dtype)
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():
@@ -200,4 +365,11 @@ class SigmoidTopKRouter(nn.Module):
         return topk_scores, topk_indices
 
 
-__all__ = ["SigmoidTopKRouter", "TopKRouter"]
+__all__ = [
+    "RouterReplay",
+    "RouterReplayAction",
+    "SigmoidTopKRouter",
+    "TopKRouter",
+    "attach_router_replay",
+    "detach_router_replay",
+]
