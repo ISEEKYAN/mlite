@@ -23,23 +23,33 @@ DS4 native naming differs from Kimi in two structural ways the spec accounts for
     identity for DS4 (global keys never collide with the positional range on
     non-zero PP ranks), and the spec maps the global names 1:1 to HF names.
 
-DS4-specific weights handled by the spec (see ``native_to_hf``):
+Every HF target name is ``model.``-rooted (or ``lm_head.weight``), matching the
+canonical HF DeepSeek layout that Kimi/GLM-5 export to -- top-level
+``embed_tokens.embedding.weight`` -> ``model.embed_tokens.weight``,
+``norm.weight`` -> ``model.norm.weight``, ``lm_head.col.linear.weight`` ->
+``lm_head.weight``.  DS4-specific weights handled by the spec
+(see ``native_to_hf``):
 
   * CSA attention (``self_attn.self_attn.*``): MLA-style ``wq_a`` / ``q_norm`` /
     ``wq_b`` / ``wkv`` / ``kv_norm`` / ``wo_a`` / ``wo_b`` plus ``sinks`` (HF
-    ``attn_sink``) and the ``compressor.*`` / ``indexer.*`` submodules, all
-    passed through 1:1 to ``layers.<i>.attn.*`` -- the exact names the previous
-    bespoke export produced.
+    ``attn_sink``) and the ``compressor.*`` / ``indexer.*`` submodules, mapped to
+    ``model.layers.<i>.self_attn.*`` (incl. ``.self_attn.compressor.*`` /
+    ``.self_attn.indexer.*``).
   * mHC: per-layer ``attn_hc`` / ``ffn_hc`` ``HyperConnection`` (``fn`` /
-    ``base`` / ``scale``) -> ``hc_attn_*`` / ``hc_ffn_*``, and the model-wide /
-    per-MTP ``hc_head`` ``MultiHeadHyperConnectionHead`` (``hc_fn`` / ``hc_base``
-    / ``hc_scale``) -> ``hc_head_*``.
-  * MTP: ``e_proj`` / ``h_proj`` / ``enorm`` / ``hnorm`` / ``norm`` carried 1:1
-    under ``mtp.<i>.*``.
-  * MoE: ``mlp.experts.fc{1,2}.weight<id>`` -> ``ffn.experts.<id>.w{1,3,2}``
-    (fc1 splits gate/up into w1/w3), shared expert ``mlp.shared_experts.*`` ->
-    ``ffn.shared_experts.w{1,3,2}``, dense ``mlp.gate_up`` / ``mlp.down`` ->
-    ``ffn.{gate_up,down}.*``, router ``mlp.gate.*`` -> ``ffn.gate.*``.
+    ``base`` / ``scale``) -> ``model.layers.<i>.self_attn.hc_*`` /
+    ``...mlp.hc_*``, and the model-wide / per-MTP ``hc_head``
+    ``MultiHeadHyperConnectionHead`` -> ``model.hc_head.*`` (these have no
+    upstream HF analogue; kept ``model.``-rooted for a self-consistent, complete
+    export; mHC HF-name fidelity vs Megatron's latest is a TODO, not yet
+    cross-checked against an upstream DeepSeek-V4 checkpoint).
+  * MTP: HF folds MTP layers into the decoder namespace at continued global
+    indices (``model.layers.<num_hidden_layers + i>.*``); ``e_proj`` /
+    ``h_proj`` / ``enorm`` / ``hnorm`` / ``norm`` carried 1:1 there.
+  * MoE: ``mlp.experts.fc{1,2}.weight<id>`` ->
+    ``model.layers.<i>.mlp.experts.<id>.{gate_proj,up_proj,down_proj}.weight``
+    (fc1 splits gate/up), shared expert -> ``...mlp.shared_experts.*``, router
+    ``mlp.gate.*`` -> ``model.layers.<i>.mlp.gate.*`` (``expert_bias`` ->
+    ``e_score_correction_bias``).
 
 CSA is NOT tensor-parallel-capable: DS4 runs TP=ETP=1 (the protocol gate raises
 for TP>1), exactly like GLM-5.  The spec's ``tp_spec`` therefore declares only
@@ -107,44 +117,49 @@ _BLOCK_KEY_RE = re.compile(r"^model\.(layers|mtp)\.(\d+)\.(.+)$")
 _GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.fc([12])\.weight(\d+)$")
 _PROJ_TO_HF = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
-# Native top-level param names: the embedding is a VocabParallelEmbedding
-# (``embed_tokens.embedding.weight``) and the head a VocabParallelOutput
-# (``lm_head.col.linear.weight``).  The HF target names are unchanged.
+# Native top-level param names -> HF target names.  The embedding is a
+# VocabParallelEmbedding (``embed_tokens.embedding.weight``) and the head a
+# VocabParallelOutput (``lm_head.col.linear.weight``); both collapse to the
+# canonical HF DeepSeek names.  mHC head params have no upstream HF analogue,
+# so they keep a ``model.hc_head.*`` prefix (still ``model.``-rooted so the HF
+# export stays self-consistent and complete).
 _TOP_LEVEL = {
-    "model.embed_tokens.embedding.weight": "embed.weight",
-    "model.norm.weight": "norm.weight",
-    "model.hc_head.hc_fn": "hc_head_fn",
-    "model.hc_head.hc_base": "hc_head_base",
-    "model.hc_head.hc_scale": "hc_head_scale",
-    "lm_head.col.linear.weight": "head.weight",
+    "model.embed_tokens.embedding.weight": "model.embed_tokens.weight",
+    "model.norm.weight": "model.norm.weight",
+    "model.hc_head.hc_fn": "model.hc_head.hc_fn",
+    "model.hc_head.hc_base": "model.hc_head.hc_base",
+    "model.hc_head.hc_scale": "model.hc_head.hc_scale",
+    "lm_head.col.linear.weight": "lm_head.weight",
 }
 
 
 def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
     if attr == "input_layernorm.weight":
-        return "attn_norm.weight"
+        return "input_layernorm.weight"
     if attr == "post_attention_layernorm.weight":
-        return "ffn_norm.weight"
+        return "post_attention_layernorm.weight"
     if attr.startswith("self_attn."):
         suffix = attr.removeprefix("self_attn.")
-        return "attn.attn_sink" if suffix == "sinks" else f"attn.{suffix}"
+        return "self_attn.attn_sink" if suffix == "sinks" else f"self_attn.{suffix}"
     if attr.startswith("mlp.gate."):
         suffix = attr.removeprefix("mlp.gate.")
-        return "ffn.gate." + {
+        return "mlp.gate." + {
             "gate.weight": "weight",
             "weight": "weight",
-            "expert_bias": "bias",
-            "e_score_correction_bias": "bias",
+            "expert_bias": "e_score_correction_bias",
+            "e_score_correction_bias": "e_score_correction_bias",
             "tid2eid": "tid2eid",
         }.get(suffix, suffix)
     if attr.startswith("mlp.shared_experts."):
         proj = attr.removeprefix("mlp.shared_experts.").removesuffix(".weight")
         if proj == "gate_up":
-            return "ffn.shared_experts.w1.weight", "ffn.shared_experts.w3.weight"
+            return "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight"
         if proj == "down":
-            return "ffn.shared_experts.w2.weight"
-        return f"ffn.shared_experts.{_PROJ_TO_HF.get(proj, proj)}.weight"
-    for prefix, target in (("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn"), ("hc_head", "hc_head")):
+            return "mlp.shared_experts.down_proj.weight"
+        return f"mlp.shared_experts.{_PROJ_TO_HF.get(proj, proj)}.weight"
+    # mHC params have no upstream HF analogue; keep them under self_attn / mlp /
+    # hc_head sub-namespaces so every key stays ``model.layers.{i}.*``-rooted.
+    for prefix, target in (("attn_hc", "self_attn.hc"), ("ffn_hc", "mlp.hc"), ("hc_head", "hc_head")):
         if attr.startswith(f"{prefix}."):
             return f"{target}_{attr.rsplit('.', 1)[-1].removeprefix('hc_')}"
     if block == "mtp" and attr in {
@@ -178,15 +193,20 @@ def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     if match is None:
         return []
     block, index, attr = match.groups()
-    prefix = f"layers.{index}" if block == "layers" else f"mtp.{index}"
+    # HF places MTP layers right after the decoder stack, so they share the
+    # ``model.layers.{i}`` namespace with a continued global index.
+    if block == "layers":
+        prefix = f"model.layers.{index}"
+    else:  # mtp
+        prefix = f"model.layers.{config.num_hidden_layers + int(index)}"
     # CSA lives under ``self_attn.self_attn.*`` (the SBHD wrapper adds one extra
     # ``self_attn`` level).  Collapse it so the HF attention names are unchanged.
     if attr.startswith("self_attn.self_attn."):
         attr = "self_attn." + attr.removeprefix("self_attn.self_attn.")
     if attr.startswith("self_attn.compressor."):
-        return [f"{prefix}.attn.compressor.{attr.removeprefix('self_attn.compressor.')}"]
+        return [f"{prefix}.self_attn.compressor.{attr.removeprefix('self_attn.compressor.')}"]
     if attr.startswith("self_attn.indexer."):
-        return [f"{prefix}.attn.indexer.{attr.removeprefix('self_attn.indexer.')}"]
+        return [f"{prefix}.self_attn.indexer.{attr.removeprefix('self_attn.indexer.')}"]
     mapped = _map_block_attr(attr, block)
     if mapped is not None:
         if isinstance(mapped, tuple):
@@ -196,10 +216,10 @@ def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     if expert is None:
         return []
     fc, expert_id = expert.groups()
-    expert_prefix = f"{prefix}.ffn.experts.{int(expert_id)}"
+    expert_prefix = f"{prefix}.mlp.experts.{int(expert_id)}"
     if fc == "1":
-        return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
-    return [f"{expert_prefix}.w2.weight"]
+        return [f"{expert_prefix}.gate_proj.weight", f"{expert_prefix}.up_proj.weight"]
+    return [f"{expert_prefix}.down_proj.weight"]
 
 
 # ======================================================================
