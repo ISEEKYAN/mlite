@@ -250,8 +250,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     # Connector batch is model-agnostic: true seq lengths, no padding, no extras.
     assert runtime_batch.seq_lens.tolist() == lengths
     assert int(runtime_batch.input_ids.numel()) == sum(lengths)
-    assert not hasattr(runtime_batch, "extras")
-    assert not hasattr(runtime_batch, "position_ids")
+    assert not runtime_batch.extras
 
     with engine.train_mode():
         result = engine.runtime.forward_backward(

@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_optimizer_config
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
@@ -497,30 +496,83 @@ def _as_data_iter(data: Any):
 
 
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
-def _bridge_forward_kwargs_from_packed_batch(batch: PackedBatch) -> dict[str, Any]:
-    """Render transient Megatron-Core THD kwargs for BridgeRuntime.forward_step only."""
-    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+def _nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
+    """Split a 1-D packed (true, unpadded) tensor into a jagged nested tensor."""
+    if tensor is None:
+        return None
+    flat = tensor.reshape(-1)
+    pieces = []
+    offset = 0
+    for length_t in seq_lens.tolist():
+        length = int(length_t)
+        pieces.append(flat.narrow(0, offset, length))
+        offset += length
+    if offset != flat.numel():
+        raise ValueError(
+            f"PackedBatch sizes sum to {offset}, tensor has {flat.numel()} tokens."
+        )
+    return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
 
-    position_ids = torch.cat(
-        [torch.arange(s, device=batch.seq_lens.device) for s in batch.seq_lens.tolist()]
-    ).reshape(1, -1)
-    cu_seqlens = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.int32, device=batch.seq_lens.device),
-            batch.seq_lens.cumsum(0).to(torch.int32),
-        ]
+
+def _bridge_forward_kwargs_from_packed_batch(
+    batch: PackedBatch,
+    *,
+    tp_size: int = 1,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+    cp_group: Any = None,
+) -> dict[str, Any]:
+    """Render transient Megatron-Core THD kwargs for BridgeRuntime.forward_step only.
+
+    Reuses the same canonical packing the native lite protocols use
+    (:func:`pack_nested_thd` + :func:`prepare_packed_thd_for_context_parallel`):
+    each sequence is padded to the TP/CP zigzag alignment, ``labels`` are rolled
+    one position left, and for ``cp_size > 1`` the token rows / labels / loss
+    mask / position ids are zigzag-split to this CP rank while ``packed_seq_params``
+    keeps full ``cu_seqlens`` plus CP metadata. Identical layout on both backends
+    keeps the mlite-vs-bridge comparison fair and CP-correct.
+    """
+    from megatron.lite.primitive.parallel.thd import (
+        pack_nested_thd,
+        prepare_packed_thd_for_context_parallel,
     )
-    max_seqlen = int(batch.seq_lens.max().item()) if batch.seq_lens.numel() else 0
+
+    seq_lens = batch.seq_lens
+    has_loss_mask = batch.loss_mask is not None
+    packed = pack_nested_thd(
+        _nested_from_packed(batch.input_ids, seq_lens),
+        tp_size=tp_size,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        cp_group=cp_group if cp_size > 1 else None,
+        split_cp=False,
+        labels=_nested_from_packed(batch.labels, seq_lens),
+        roll_labels=batch.labels is not None,
+        loss_mask=_nested_from_packed(batch.loss_mask, seq_lens) if has_loss_mask else None,
+        roll_loss_mask=has_loss_mask,
+    )
     sample: dict[str, Any] = {
-        "input_ids": batch.input_ids.reshape(1, -1),
-        "labels": batch.labels.reshape(1, -1),
-        "position_ids": position_ids,
-        "packed_seq_params": PackedSeqParams.from_cu_seqlens(
-            cu_seqlens, max_seqlen=max_seqlen
-        ),
+        "input_ids": packed.input_ids,
+        "labels": packed.labels,
+        "position_ids": packed.position_ids,
+        "packed_seq_params": packed.packed_seq_params,
     }
-    if batch.loss_mask is not None:
-        sample["loss_mask"] = batch.loss_mask.reshape(1, -1)
+    if packed.loss_mask is not None:
+        sample["loss_mask"] = packed.loss_mask
+
+    if cp_size > 1:
+        tensor_keys = ("input_ids", "labels", "loss_mask", "position_ids")
+        psp, tensors = prepare_packed_thd_for_context_parallel(
+            sample["packed_seq_params"],
+            tuple(sample.get(key) for key in tensor_keys),
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            cp_group=cp_group,
+        )
+        sample["packed_seq_params"] = psp
+        for key, tensor in zip(tensor_keys, tensors, strict=True):
+            if tensor is not None or key in sample:
+                sample[key] = tensor
     return sample
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
 
@@ -633,12 +685,21 @@ class BridgeRuntime(RuntimeBase):
         last_loss: list[float | None] = [None]
         last_output: list[torch.Tensor | None] = [None]
 
+        # CP geometry for the transient PackedBatch -> THD kwargs rendering below.
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_kwargs = {
+            "tp_size": mpu.get_tensor_model_parallel_world_size(),
+            "cp_size": cp_size,
+            "cp_rank": mpu.get_context_parallel_rank(),
+            "cp_group": mpu.get_context_parallel_group() if cp_size > 1 else None,
+        }
+
         def _fwd_step(data_iterator, model):
             # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
             sample = next(data_iterator)
             owns_transient_metadata = False
             if isinstance(sample, PackedBatch):
-                sample = _bridge_forward_kwargs_from_packed_batch(sample)
+                sample = _bridge_forward_kwargs_from_packed_batch(sample, **cp_kwargs)
                 owns_transient_metadata = True
             elif isinstance(sample, Batch):
                 sample = {

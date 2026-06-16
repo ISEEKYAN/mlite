@@ -22,11 +22,12 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
+from megatron.lite.primitive.deterministic import set_deterministic
+from megatron.lite.runtime import create_runtime
+
 from examples.bench.bench import BenchCliConfig, build_runtime_config, build_session_config
 from examples.bench.results import compare_correctness_artifacts, load_result_artifact
 from examples.bench.session import _make_data_iter
-from megatron.lite.primitive.deterministic import set_deterministic
-from megatron.lite.runtime import create_runtime
 
 
 def _distributed_rank() -> int:
