@@ -252,6 +252,28 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
 
                 bridge._weight_to_mcore_format = patched
 
+            # Megatron-Bridge (megatron.bridge) loads via AutoMapping; slice router
+            # weight + expert_bias rows to the truncated expert count so keep-experts
+            # loads from a full HF checkpoint (mirrors Qwen35RouterMapping / mlite loader).
+            try:
+                from megatron.bridge.models.conversion.param_mapping import AutoMapping
+            except ImportError:
+                AutoMapping = None
+            if AutoMapping is not None and not getattr(AutoMapping, "_bench_router_slice", False):
+                _orig_h2m = AutoMapping.hf_to_megatron
+
+                def _router_sliced_h2m(self, hf_weights, megatron_module, _orig=_orig_h2m):
+                    mp = getattr(self, "megatron_param", "") or ""
+                    if "mlp.router." in mp and hasattr(hf_weights, "shape") and hf_weights.ndim >= 1:
+                        cfg = getattr(megatron_module, "config", None)
+                        n = getattr(cfg, "num_moe_experts", None)
+                        if n is not None and hf_weights.shape[0] > n:
+                            hf_weights = hf_weights[:n].contiguous()
+                    return _orig(self, hf_weights, megatron_module)
+
+                AutoMapping.hf_to_megatron = _router_sliced_h2m
+                AutoMapping._bench_router_slice = True
+
         hooks.append(keep_experts_hook)
 
     if cfg.truncate_layers is not None:
