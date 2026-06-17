@@ -103,13 +103,11 @@ def _set_field(config_obj: Any, name: str, value: Any) -> Any:
 
 
 def _get_model_config_root(config_obj: Any) -> Any:
-    # Descend nested text_config (multimodal wrappers, e.g. kimi_k25 -> DeepseekV3Config)
-    # to the language-model sub-config that actually carries layer/expert metadata.
+    # Descend nested text_config to the deepest language-model sub-config
+    # (multimodal wrappers, e.g. kimi_k25 -> DeepseekV3Config under text_config).
     seen = set()
     while config_obj is not None and id(config_obj) not in seen:
         seen.add(id(config_obj))
-        if getattr(config_obj, "num_hidden_layers", None) is not None:
-            return config_obj
         nxt = getattr(config_obj, "text_config", None)
         if nxt is None or nxt is config_obj:
             break
@@ -124,9 +122,9 @@ def _get_bridge_config_root(bridge: Any) -> Any:
             continue
         cfg = getattr(obj, "config", obj)
         root = _get_model_config_root(cfg)
-        if getattr(root, "num_hidden_layers", None) is not None:
+        if root is not None:
             return root
-    raise ValueError("Bridge object does not expose an HF config with num_hidden_layers.")
+    raise ValueError("Bridge object does not expose hf_pretrained or hf_config.")
 
 
 def _refresh_bridge_config(bridge: Any) -> None:
@@ -153,10 +151,15 @@ def _moe_expert_count_field(config_obj: Any) -> str | None:
     kimi_k2, deepseek_v4) use ``n_routed_experts`` (where ``num_experts`` may be
     a read-only property). Prefer a real dataclass field so ``replace`` works.
     """
-    fields_ = getattr(config_obj, "__dataclass_fields__", None)
     candidates = ("num_experts", "n_routed_experts")
+    # Prefer a real dataclass field (so dataclasses.replace works on mlite configs).
+    fields_ = getattr(config_obj, "__dataclass_fields__", None)
     if fields_ is not None:
-        return next((name for name in candidates if name in fields_), None)
+        field = next((name for name in candidates if name in fields_), None)
+        if field is not None:
+            return field
+    # Fall back to attribute presence: HF configs (and transformers dataclass configs
+    # where the count is a dynamic attr, not a declared field) carry it via getattr.
     return next((name for name in candidates if getattr(config_obj, name, None) is not None), None)
 
 
