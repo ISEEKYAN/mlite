@@ -60,16 +60,23 @@ def _qwen3_5():
         hidden_size=16,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=4,
+        # head_dim must be large enough that a context-parallel attention backend
+        # (flash / cuDNN-fused) is available: those need head_dim a multiple of 8,
+        # and the unfused PyTorch fallback (the only backend that tolerates a tiny
+        # head_dim) does NOT support CP. head_dim=64 lets cp>1 actually run.
+        head_dim=64,
         vocab_size=64,
         num_experts=4,
         num_experts_per_tok=2,
         moe_intermediate_size=8,
         shared_expert_intermediate_size=8,
+        # GatedDeltaNet runs native FLA context-parallel ops at cp>1; its Triton
+        # kernels need head dims that are a sane power-of-two, so keep these at 64
+        # (the tiny head_dim=4 only ever worked on the cp1 single-rank path).
         linear_num_key_heads=2,
-        linear_key_head_dim=4,
+        linear_key_head_dim=64,
         linear_num_value_heads=2,
-        linear_value_head_dim=4,
+        linear_value_head_dim=64,
         linear_conv_kernel_dim=4,
         # Mix full + linear attention so the distckpt linear_attn TP-shard
         # path (the in_proj/conv1d/layer_norm sharding fixes) is covered.
@@ -564,13 +571,10 @@ def _offload_topology(model_name: str) -> ParallelConfig:
     if forced:
         tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
         return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
-    if model_name == "qwen3_5":
-        # qwen3.5's GatedDeltaNet linear attention does not support context
-        # parallelism, so it runs cp1 (tp2·pp2·dp2=8, ep2 within dp2) — its
-        # canonical config.  offload is CP-orthogonal, so cp1 fully exercises it.
-        return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=1)
     if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
+    # TP-capable MoE models (incl. qwen3.5, whose GatedDeltaNet linear attention
+    # has all-gather CP support) run the full tp2·ep2·pp2·cp2 proxy2 topology.
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
 
 
