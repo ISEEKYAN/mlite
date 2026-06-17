@@ -251,8 +251,15 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
                     f"truncate_layers must be in [1, {old_layers}], got {keep_layers}."
                 )
             hf_cfg.num_hidden_layers = keep_layers
-            if hasattr(hf_cfg, "layer_types"):
-                hf_cfg.layer_types = list(hf_cfg.layer_types[:keep_layers])
+            # Truncate any present per-layer pattern list (qwen3.5 layer_types,
+            # glm5 mlp_layer_types); they may be absent or None on deepseek-family.
+            for attr in ("layer_types", "mlp_layer_types"):
+                value = getattr(hf_cfg, attr, None)
+                if isinstance(value, (list, tuple)):
+                    setattr(hf_cfg, attr, list(value[:keep_layers]))
+            fkdr = getattr(hf_cfg, "first_k_dense_replace", None)
+            if isinstance(fkdr, int) and fkdr > keep_layers:
+                hf_cfg.first_k_dense_replace = keep_layers
             _refresh_bridge_config(bridge)
 
         hooks.append(truncate_layers_hook)
