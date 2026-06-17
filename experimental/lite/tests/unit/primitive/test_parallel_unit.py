@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from megatron.lite.primitive.parallel import (
     ParallelState,
     build_pipeline_chunk_layout,
@@ -44,6 +43,29 @@ def test_cp_position_ids_follow_zigzag_order():
     )
 
 
+# The pipeline layout wires to Megatron-core's layer-layout machinery, so these
+# tests need megatron.core importable (present in the mlite GPU/smoke containers).
+_mcore_layout = pytest.importorskip("megatron.core.transformer.transformer_block")
+
+
+def _ranks(pp_size: int) -> list[ParallelState]:
+    return [
+        ParallelState(
+            pp_size=pp_size,
+            pp_rank=r,
+            pp_is_first=(r == 0),
+            pp_is_last=(r == pp_size - 1),
+        )
+        for r in range(pp_size)
+    ]
+
+
+def _layout_indices(num_layers: int, pp_size: int, **kw) -> list[list[int]]:
+    return [
+        build_pipeline_chunk_layout(num_layers, ps, **kw).layer_indices for ps in _ranks(pp_size)
+    ]
+
+
 def test_pp_layout_marks_stage_boundaries_and_vpp_chunks():
     rank0 = ParallelState(pp_size=2, pp_rank=0, pp_is_first=True, pp_is_last=False)
     rank1 = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
@@ -55,22 +77,50 @@ def test_pp_layout_marks_stage_boundaries_and_vpp_chunks():
     assert build_pipeline_chunk_layout(8, rank1).has_embed is False
     assert build_pipeline_chunk_layout(8, rank1).has_head is True
 
-    vpp_rank0_chunk1 = build_pipeline_chunk_layout(8, rank0, vpp=2, vpp_chunk_id=1)
-    vpp_rank1_chunk1 = build_pipeline_chunk_layout(8, rank1, vpp=2, vpp_chunk_id=1)
-    assert vpp_rank0_chunk1.layer_indices == [4, 5]
-    assert vpp_rank0_chunk1.has_head is False
-    assert vpp_rank1_chunk1.layer_indices == [6, 7]
-    assert vpp_rank1_chunk1.has_head is True
+def test_pp_layout_vpp_is_not_supported_yet():
+    # VPP / interleaving is deferred (pp-only); requesting it raises rather than
+    # silently mis-splitting.
+    rank0 = ParallelState(pp_size=2, pp_rank=0, pp_is_first=True, pp_is_last=False)
+    with pytest.raises(NotImplementedError):
+        build_pipeline_chunk_layout(8, rank0, vpp=2)
+    with pytest.raises(NotImplementedError):
+        build_pipeline_chunk_layout(8, rank0, vpp=2, vpp_chunk_id=1)
 
 
-def test_pp_layout_rejects_non_divisible_vpp_layer_counts():
-    ps = ParallelState(pp_size=2, pp_rank=0, pp_is_first=True, pp_is_last=False)
+def test_pp_layout_auto_balances_non_divisible_counts_without_error():
+    # 6 layers, pp=4 — not divisible. PipelineParallelLayerLayout balances the full
+    # [E, t*6, L] unit sequence (account_for_embedding/loss): the embedding-holding
+    # first stage and the loss-holding last stage each give up one decoder, so the
+    # split is [1, 2, 2, 1] (not [2, 2, 1, 1], which would overload the ends). It
+    # never raises "not divisible".
+    indices = _layout_indices(6, 4)
+    assert indices == [[0], [1, 2], [3, 4], [5]]
+    flat = [i for stage in indices for i in stage]
+    assert flat == list(range(6))  # contiguous, ordered, complete
+    # vpp=1 (the model default) takes the same non-interleaved path.
+    assert _layout_indices(6, 4, vpp=1) == indices
+    # An MTP head also occupies a slot (on the last stage), so it shifts the split:
+    # the loss+MTP stage gives up its remaining decoder -> [2, 2, 2, 0].
+    assert _layout_indices(6, 4, num_mtp_layers=1) == [[0, 1], [2, 3], [4, 5], []]
 
-    with pytest.raises(ValueError, match="10 is not divisible by 6"):
-        build_pipeline_chunk_layout(10, ps, vpp=3)
 
-    with pytest.raises(ValueError, match="10 is not divisible by 6"):
-        build_pipeline_chunk_layout(10, ps, vpp=3, vpp_chunk_id=0)
+def test_pp_layout_accounts_for_head_tail_even_when_divisible():
+    # Even with a decoder count divisible by pp, the embedding/loss still occupy
+    # head/tail slots, so the balanced split is NOT plain [2,2,2,2]: the 10 units
+    # [E, t*8, L] over pp4 give [3,3,2,2] cells -> decoders [2,3,2,1].
+    assert _layout_indices(8, 4) == [[0, 1], [2, 3, 4], [5, 6], [7]]
+    # MTP (1 layer, the real case) adds a slot on the last stage: 11 units
+    # [E, t*8, m, L] over pp4 give [3,3,3,2] cells -> decoders [2,3,3,0].
+    assert _layout_indices(8, 4, num_mtp_layers=1) == [[0, 1], [2, 3, 4], [5, 6, 7], []]
+    # pp2 stays symmetric: [E, t*8, L] over pp2 -> [5,5] cells -> decoders [4,4].
+    assert _layout_indices(8, 2) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_pp_layout_single_stage_owns_all_layers():
+    ps = ParallelState(pp_size=1, pp_rank=0, pp_is_first=True, pp_is_last=True)
+    layout = build_pipeline_chunk_layout(5, ps)
+    assert layout.layer_indices == [0, 1, 2, 3, 4]
+    assert layout.has_embed and layout.has_head
 
 
 def test_virtual_pipeline_rank_is_tracked_on_lite_parallel_state():
