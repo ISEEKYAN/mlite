@@ -430,7 +430,26 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
     assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(mismatches)
 
 
-def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None:
+def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
+    """Whether an exported key matches the model's real HF release naming.
+
+    Most models use the ``model.``-rooted HF convention. DeepSeek-V4-Flash ships
+    a bare layout (``embed.weight`` / ``head.weight`` / ``norm.weight`` /
+    ``layers.N.*`` / ``mtp.N.*`` / ``hc_head_*``), so allow that for deepseek_v4.
+    """
+    if model_name == "deepseek_v4":
+        return key.startswith(("layers.", "mtp.")) or key in (
+            "embed.weight",
+            "head.weight",
+            "norm.weight",
+            "hc_head_base",
+            "hc_head_fn",
+            "hc_head_scale",
+        )
+    return key.startswith("model.") or key in ("lm_head.weight",)
+
+
+def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str) -> None:
     """Export HF weights (bf16) and assert the reloaded shards are valid.
 
     Prefer the model's ``save_hf_weights`` wrapper; some models only expose the
@@ -481,7 +500,7 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
                         f"{key} exported as unexpected non-float dtype {tensor.dtype}"
                     )
                 assert torch.isfinite(tensor.float()).all(), f"{key} has non-finite values"
-                assert key.startswith("model.") or key in ("lm_head.weight",), (
+                assert _is_valid_hf_export_key(key, model_name), (
                     f"unexpected non-HF export key: {key}"
                 )
                 keys.add(key)
@@ -490,7 +509,14 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str) -> None
     # weights (all pipeline stages gathered), not just the first stage's — guards
     # against a pp-blind export silently dropping later stages' layers.
     num_layers = int(getattr(cfg, "num_hidden_layers"))
-    missing = [i for i in range(num_layers) if not any(f".layers.{i}." in k for k in keys)]
+
+    def _has_layer(i: int) -> bool:
+        # Match both the ``model.``-rooted convention (``model.layers.{i}.``) and
+        # the bare DeepSeek-V4-Flash layout (``layers.{i}.``), which has no prefix.
+        prefix = f"layers.{i}."
+        return any(k.startswith(prefix) or f".{prefix}" in k for k in keys)
+
+    missing = [i for i in range(num_layers) if not _has_layer(i)]
     assert not missing, (
         f"export missing decoder layers {missing} (PP gather incomplete); "
         f"sample keys: {sorted(keys)[:6]}"
@@ -542,7 +568,7 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
     _train_step(handle, "dist_opt", cfg)
 
     export_dir = _shared_tmp_path(tmp_path, "hf_export")
-    _export_and_reload(handle, cfg, protocol, export_dir)
+    _export_and_reload(handle, cfg, protocol, export_dir, model_name)
 
 
 # ──────────────────────────────────────────────────────────────────────────
