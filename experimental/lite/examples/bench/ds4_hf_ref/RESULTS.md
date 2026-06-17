@@ -35,26 +35,49 @@ layers** (compress_ratio 0 → no DSA compressor/indexer), full 256 hash-MoE exp
   cosine/self-CE). Looser than the sibling refs (kimi 5.6e-6, glm5 2-3e-4) because HF is a
   fully independent eager reimplementation, as expected for a secondary reference.
 
+## Bridge primary-ref (Megatron-family) — RESOLVED
+ds4 now has a **Megatron-family primary reference** (megatron.bridge on latest mcore
+`origin/dev` 9af7c7937, which carries both `dsv4_hybrid` and the bridge infra
+`common_utils`/`safe_get_world_size`). Both sides load the **same real DeepSeek-V4-Flash**
+(truncate-2 sliding, full 256 hash-MoE experts, MTP off); bench `bridge` backend on EP4
+(solves full-256 single-card OOM), mlite on EP1.
+
+| | loss (mean per-token CE) |
+|---|---|
+| **mlite** (fused-DSA-sliding + hash-MoE + mHC) | **20.0515** |
+| **bridge** (mcore dsv4_hybrid dense, rope-fusion off) | **20.3354** |
+| **abs diff / rel** | **0.284 / 1.42%** |
+
+bridge eval per-token-loss mean = 20.343 (finite, no nan). This is the standard matched-pair
+loss metric (same as qwen3.5/kimi/glm5). 1.4% rel is the **cross-impl floor for the hardest
+model** (mlite fused-DSA-sliding + mHC vs mcore dsv4_hybrid dense + non-fused rope) — looser
+than glm5 (2-3e-4) because ds4's two kernel stacks diverge much more; same order as the HF
+secondary's 0.7% CE.
+
+### Two corrections to the prior "open bug" diagnosis (both DISPROVEN by direct evidence)
+1. **tid2eid was NOT the blocker.** The bridge loads `layers.{0,1}.ffn.gate.tid2eid` into
+   `decoder.layers.{0,1}.mlp.router.tid2eid` **bitwise-correctly** during weight load.
+   Directly injecting the release buffers post-build (`bridge_inject_tid2eid.py`) changed
+   **0 of 129280×6 entries** on every kept layer — a pure no-op. The init-time "placeholder
+   round-robin" warning fires at construction and is overwritten by the load. (The buffer is
+   `[vocab=129280, top_k=6]` int32, values 0–255.)
+2. **There was never a structural logits error.** With `labels` passed, mcore `GPTModel`
+   returns the **per-token CE loss `[b,s]`**, not logits — the bench stores it under
+   `vocab_parallel_logits`. So the prior "eval logits mean 19.3 all-positive (11–34)" was a
+   per-token *loss* tensor (always positive, ≈ mlite's loss 20.05), misread against mlite's
+   actual full-vocab logits ("−0.44 centered", a different artifact). Apples-to-oranges.
+
+**Actual root cause of the nan:** the experimental MLA `apply_rope_fusion` (training-only,
+flagged "experimental and may change" in the log) produces a nan token in the train forward.
+Setting `--override-transformer-json '{"apply_rope_fusion": false}'` (the correct non-fused
+reference path) → clean finite loss 20.3354. Reproduce: `code/ds4_vs_hf/run_bridge_inject.sbatch`
+(job 12891285). The injection wrapper is kept as a guard that re-verifies tid2eid stays a no-op.
+
 ## Precision overview — 4/4 done (vs independent reference)
 - qwen3.5 vs mbridge(GDN): loss rel 7-9e-5
 - kimi vs megatron.bridge(MLA dense 5.6e-6 + MoE keep-8 5.8e-6)
 - glm5 vs megatron.bridge(DSA): loss rel 2-3e-4
-- **ds4 vs HF-transformers(independent): cosine 0.998 / self-CE 0.7% / run-to-run bitwise**
-
-## Bridge primary-ref status (bonus follow-up — NOT blocking M1)
-With **latest mcore `origin/dev` (9af7c7937)** the prior env divergence is RESOLVED:
-`dsv4_hybrid` + bridge infra (`common_utils`/`safe_get_world_size`) now coexist. combined
-overlay + latest mcore imports green; bridge builds + loads ds4 (EP4 solves the full-256
-single-card OOM). nvrx.py needs a graceful patch (container ships nvidia-resiliency-ext
-0.5.0 < 0.6.0; env-only patch in the mcore-dev-latest worktree).
-
-**Open bug (for a fresh doer):** the bench `bridge` dense-forward is structurally wrong for
-ds4 — eval logits **mean 19.3, all-positive (11–34)** vs mlite's centered **−0.44**; train
-loss **nan** (job 12890301). ds4 (hash-MoE tid2eid + dsv4_hybrid attn + `hc_head` final
-collapse) is unproven on the bench bridge path (prior doer only validated kimi/glm5, no hash
-layers). Candidate causes: bench dense-forward not handling ds4's `hc_head` stream collapse;
-`tid2eid` load (bridge maps it at `mlp.router.tid2eid` but init warns round-robin placeholder);
-dsv4_hybrid output layout. Distinct from mlite correctness.
+- **ds4: primary = megatron.bridge loss rel 1.42% (20.34 vs 20.05); secondary = HF-transformers cosine 0.998 / self-CE 0.7% / run-to-run bitwise**
 
 ## Files / artifacts
 Harness scripts here (also live + run under `code/ds4_vs_hf/`, where the `.pt`/`.json`
