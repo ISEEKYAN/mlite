@@ -317,10 +317,18 @@ class DeepseekV4Model(nn.Module):
         if layout.has_embed:
             self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
+        # Key by LOCAL pipeline-stage position (0..len-1), not the global layer id,
+        # so parameter names ("layers.{local}.…") follow the same convention as the
+        # other lite models (glm5 / kimi_k2 use nn.ModuleList → local names). The
+        # shared HF weight map (build via enumerate(layer_indices)) is keyed by local
+        # position; keying this dict by the global id instead double-maps under an
+        # uneven PP split (a stage owning [1,2] would remap layers.1→layers.2 and
+        # drop layer 1 on export/load). The global id is still passed to the layer
+        # for its dense-vs-MoE / per-layer logic.
         self.layers = nn.ModuleDict(
             {
-                str(idx): DeepseekV4Layer(config, ps, idx, use_deepep=use_deepep)
-                for idx in self.layer_indices
+                str(local): DeepseekV4Layer(config, ps, global_idx, use_deepep=use_deepep)
+                for local, global_idx in enumerate(self.layer_indices)
             }
         )
 
