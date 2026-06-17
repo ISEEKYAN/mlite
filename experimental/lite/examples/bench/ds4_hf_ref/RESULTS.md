@@ -48,11 +48,37 @@ ds4 now has a **Megatron-family primary reference** (megatron.bridge on latest m
 | **bridge** (mcore dsv4_hybrid dense, rope-fusion off) | **20.3354** |
 | **abs diff / rel** | **0.284 / 1.42%** |
 
-bridge eval per-token-loss mean = 20.343 (finite, no nan). This is the standard matched-pair
-loss metric (same as qwen3.5/kimi/glm5). 1.4% rel is the **cross-impl floor for the hardest
-model** (mlite fused-DSA-sliding + mHC vs mcore dsv4_hybrid dense + non-fused rope) — looser
-than glm5 (2-3e-4) because ds4's two kernel stacks diverge much more; same order as the HF
-secondary's 0.7% CE.
+bridge eval per-token-loss mean = 20.343 (finite, no nan), same metric as qwen3.5/kimi/glm5.
+
+**BUT the scalar loss is misleadingly close — the logits diverge.** A three-way logits
+triangulation on identical tokens (`bridge_forward.py` dumps full logits with `labels=None`;
+`compare3.py`) shows the bridge is the **outlier**, not mlite:
+
+| pair | cosine | mean_abs | argmax agree | note |
+|---|---|---|---|---|
+| **mlite vs HF** | **0.998** | 0.175 | 0.92 | two independent impls, **bit-identical weights** (mlite converter) |
+| mlite vs bridge (rope off) | 0.903 | 1.15 | 0.44 | bridge independently dequantizes |
+| bridge vs HF (rope off) | 0.908 | 1.12 | 0.50 | |
+| mlite vs bridge (rope **on**) | 0.790 | 1.49 | — | rope fusion ON is *worse* |
+| bridge vs HF (rope **on**) | 0.796 | 1.46 | — | |
+
+**"Same kernel" is refuted as the cause.** mlite (fused native) and HF (eager transformers —
+a completely different kernel) agree at **0.998**; if the gap were kernel/fusion, HF and bridge
+(both non-fused) would agree and mlite would be the outlier. Instead bridge diverges from
+*both* (~0.90). So forcing mlite+bridge onto the same kernel would not close it — the gap is
+**structural/numeric on the bridge side**, not a fused-vs-unfused effect.
+
+Likely causes (ds4-specific — kimi/glm5 used the *same* bench dense path and hit loss
+rel 5.6e-6 / 2-3e-4, so the plumbing is sound): mcore `dsv4_hybrid` attention internals
+(`head_dim=512` with only `qk_rope_head_dim=64` partial RoPE, attention sinks) and/or the mHC
+Sinkhorn hyper-connection differing from the reference; plus bridge dequantizes the FP8/FP4
+release **independently**, whereas mlite & HF share bit-identical weights via mlite's converter.
+`sliding_window=128 > seq_len=64`, so the sliding-window path is *not* the cause.
+
+**Net: for ds4 the trustworthy independent reference is HF (mlite-vs-HF 0.998, two independent
+implementations agreeing).** The Megatron-bridge path is not yet a faithful primary ref for ds4
+(logits cosine ~0.90); the "primary tighter than HF" expectation does not hold here. Closing
+the bridge gap is a deep mcore `dsv4_hybrid`/mHC fidelity debug (out of scope per "别死磕").
 
 ### Two corrections to the prior "open bug" diagnosis (both DISPROVEN by direct evidence)
 1. **tid2eid was NOT the blocker.** The bridge loads `layers.{0,1}.ffn.gate.tid2eid` into
@@ -77,7 +103,10 @@ reference path) → clean finite loss 20.3354. Reproduce: `code/ds4_vs_hf/run_br
 - qwen3.5 vs mbridge(GDN): loss rel 7-9e-5
 - kimi vs megatron.bridge(MLA dense 5.6e-6 + MoE keep-8 5.8e-6)
 - glm5 vs megatron.bridge(DSA): loss rel 2-3e-4
-- **ds4: primary = megatron.bridge loss rel 1.42% (20.34 vs 20.05); secondary = HF-transformers cosine 0.998 / self-CE 0.7% / run-to-run bitwise**
+- **ds4: trustworthy ref = HF-transformers cosine 0.998 / self-CE 0.7% / run-to-run bitwise**
+  (mlite & HF, two independent impls, agree). megatron.bridge: scalar loss close (rel 1.42%)
+  but logits diverge (cosine ~0.90) = bridge is the outlier vs both → not yet a faithful
+  primary ref for ds4 (mcore dsv4_hybrid/mHC fidelity gap; deep debug, deferred).
 
 ## Files / artifacts
 Harness scripts here (also live + run under `code/ds4_vs_hf/`, where the `.pt`/`.json`
