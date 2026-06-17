@@ -130,18 +130,26 @@ self-CE: mlite 17.47 / bridge 16.32 / hf 17.58.
 ### Backward — train step on the SAME tokens (loss + global grad L2)
 | backend | bwd loss | grad_global_norm |
 |---|---|---|
-| **mlite** | **19.764469** | **42.769765** |
-| **bridge** | **20.393072** | n/a (mcore DDP main_grad=0 under `--no-optimizer`) |
+| **mlite** | **19.764469** | **42.769762** |
+| **bridge** | **20.393072** | 0.0 — not obtainable (see below) |
 | **HF** | 20.246429 | 42.252110 |
 
 - **mlite-vs-bridge loss** (same bench rolled-label reduction, identical tokens): diff **0.629 /
-  rel 3.1%** — consistent with the fwd 0.90 divergence (bridge differs in bwd too).
+  rel 3.1%** — consistent with the fwd 0.90 divergence (bridge differs in bwd too). This is the
+  valid mlite-vs-bridge backward signal.
 - **mlite grad-norm 42.77 ≈ HF grad-norm 42.25** (within ~1.2%, two independent impls) — mlite &
-  HF agree at the **gradient** level too, not just forward.
-- bridge grad-norm is unmeasurable here: under `--no-optimizer` mcore DDP allocates `main_grad`
-  on all 84 params but `finalize_model_grads` leaves them zero (no grad-accumulation buffer
-  without the optimizer). HF loss uses textbook shifted-CE (not the bench rolled reduction), so
-  HF's *loss* is not directly comparable to the bench loss; its grad-norm is.
+  HF agree at the **gradient** level too, not just forward. (HF uses textbook shifted-CE, not the
+  bench rolled reduction, so HF's *loss* isn't directly comparable to the bench loss; its
+  grad-norm is.)
+- **bridge grad-norm not obtainable through this harness.** First tried under `--no-optimizer`
+  (mcore DDP `main_grad` allocated on all 84 params but zero). Then **built the full distributed
+  optimizer** (confirmed in the log: distributed Adam, clip_grad=1.0, reduce-scatter grad
+  reductions) and re-ran — autograd `run_backward` executes, but bridge param grads still finalize
+  to **exactly 0.0** (`grad_global_norm=0`, `optimizer_grad_norm=0`). So the optimizer was not the
+  blocker: the bench `bridge` **dense-forward backward does not connect the mcore label-loss to
+  parameter grads** for ds4 (the bridge path was validated by prior doers for forward/loss only,
+  never for grad extraction). Deeper debug deferred per "别死磕"; the bwd comparison rests on the
+  loss (3.1%) + the mlite↔HF grad agreement above.
 
 ### Conclusion
 Forcing ds4 fully dense **and** using the official `attention_backend=None` leaves the picture

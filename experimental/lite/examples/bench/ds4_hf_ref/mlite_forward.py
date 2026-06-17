@@ -85,15 +85,22 @@ def main():
 
     if args.backward:
         # bwd leg: train step on the SAME tokens (labels kept = next-token, set by the
-        # packed-batch generator); report loss + global grad L2 (backend-comparable).
+        # packed-batch generator); report loss + global grad L2 + the mcore optimizer
+        # grad-norm (global pre-clip L2, exactly comparable mlite-vs-bridge).
         from examples.bench.correctness import _grad_global_norm
         rt.zero_grad(handle)
         with rt.train_mode(handle):
             result = rt.forward_backward(handle, iter([batch]), loss_fn=None, num_microbatches=1)
+        ggn = _grad_global_norm(handle)  # before the step (which may consume grads)
+        grad_norm = None
+        try:
+            _ok, grad_norm, _nz = rt.optimizer_step(handle)
+        except Exception as exc:  # surface optimizer-build/step issues instead of hiding them
+            grad_norm = f"ERR:{exc!r}"
         if rank == 0:
             loss = float(result.metrics.get("loss", 0.0))
-            print(f"[{args.run_tag}] mlite BWD loss={loss:.6f} grad_global_norm={_grad_global_norm(handle):.6f}",
-                  flush=True)
+            print(f"[{args.run_tag}] mlite BWD loss={loss:.6f} grad_global_norm={ggn:.6f} "
+                  f"optimizer_grad_norm={grad_norm}", flush=True)
         print("DONE rank", rank, flush=True)
         return
 

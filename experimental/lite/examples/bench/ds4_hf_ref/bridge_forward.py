@@ -79,8 +79,11 @@ def main():
         seq_len=args.seq_len,
         seed=args.seed,
         device="cuda",
-        no_optimizer=True,
-        skip_optimizer_build=True,
+        # bwd leg needs the distributed optimizer built so mcore DDP accumulates grads
+        # into main_grad (no-optimizer leaves main_grad zero) and optimizer_step can
+        # return the global grad-norm. The forward-only dump keeps no-optimizer (faster).
+        no_optimizer=not args.backward,
+        skip_optimizer_build=not args.backward,
         truncate_layers=args.layers,
         keep_experts=args.keep_experts,
         disable_mtp=True,
@@ -111,29 +114,23 @@ def main():
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
 
     if args.backward:
-        # bwd leg: train step on the SAME tokens (labels kept); report loss + global grad L2.
+        # bwd leg: train step on the SAME tokens (labels kept); report loss + global grad
+        # L2 + the mcore optimizer grad-norm (with the optimizer built, main_grad is now
+        # populated; exactly comparable to mlite's optimizer_grad_norm).
+        from examples.bench.correctness import _grad_global_norm
         rt.zero_grad(handle)
         with rt.train_mode(handle):
             result = rt.forward_backward(handle, iter([batch]), loss_fn=None, num_microbatches=1)
+        ggn = _grad_global_norm(handle)  # before the step
+        grad_norm = None
+        try:
+            _ok, grad_norm, _nz = rt.optimizer_step(handle)
+        except Exception as exc:
+            grad_norm = f"ERR:{exc!r}"
         if rank == 0:
             loss = float(result.metrics.get("loss", 0.0))
-            # mcore DDP reduces grads into main_grad (param.grad stays None); count both.
-            model = getattr(handle, "_model", None)
-            n_param = n_grad = n_main = 0
-            sq = 0.0
-            for _n, p in model.named_parameters():
-                n_param += 1
-                g = p.grad
-                if g is not None:
-                    n_grad += 1
-                else:
-                    g = getattr(p, "main_grad", None)
-                    if g is not None:
-                        n_main += 1
-                if g is not None:
-                    sq += float(g.detach().float().pow(2).sum().item())
-            print(f"[bridge] BWD loss={loss:.6f} grad_global_norm={sq ** 0.5:.6f} "
-                  f"(params={n_param} with .grad={n_grad} with main_grad={n_main})", flush=True)
+            print(f"[bridge] BWD loss={loss:.6f} grad_global_norm={ggn:.6f} "
+                  f"optimizer_grad_norm={grad_norm}", flush=True)
         print("DONE rank", rank, flush=True)
         return
 
