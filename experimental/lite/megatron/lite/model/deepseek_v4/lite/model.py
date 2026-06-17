@@ -4,7 +4,7 @@
 A clone of the Kimi-K2 (deepseek_v3) lite model -- same approach as GLM-5 --
 inheriting Kimi's Megatron plumbing (SBHD ``[S, B, H]`` layout, VocabParallel
 embed/head, ``set_input_tensor``, ``build_pipeline_chunk_layout`` boundaries,
-MTP via ``layout.has_head``, dist-opt/distckpt via the protocol).  Three
+MTP via ``layout.has_mtp``, dist-opt/distckpt via the protocol).  Three
 model-wide DS4 deviations (documented inline at each site):
 
 1. Attention = CSA, not MLA.  The CSA primitive is batch-first ``[B, S, H]`` and
@@ -260,7 +260,7 @@ def _apply_attention_backend_override(backend: str | None) -> None:
 class DeepseekV4Model(nn.Module):
     """DS4 model.  Mirrors ``KimiK2Model``: ``build_pipeline_chunk_layout`` for
     embed/head/layer placement, ``set_input_tensor`` for the PP recv buffer, a
-    shared embed/head, MTP gated on ``layout.has_head``, SBHD scatter at embed,
+    shared embed/head, MTP gated on ``layout.has_mtp``, SBHD scatter at embed,
     and a single forward producing the loss / logits / MTP outputs.
 
     DS4 differences (all documented inline): the hidden is the 4-D SBHD mHC
@@ -299,7 +299,11 @@ class DeepseekV4Model(nn.Module):
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
 
         layout = build_pipeline_chunk_layout(
-            config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id
+            config.num_hidden_layers,
+            ps,
+            train_config.vpp,
+            vpp_chunk_id,
+            num_mtp_layers=config.num_nextn_predict_layers if mtp_enable else 0,
         )
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed
@@ -313,10 +317,18 @@ class DeepseekV4Model(nn.Module):
         if layout.has_embed:
             self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
+        # Key by LOCAL pipeline-stage position (0..len-1), not the global layer id,
+        # so parameter names ("layers.{local}.…") follow the same convention as the
+        # other lite models (glm5 / kimi_k2 use nn.ModuleList → local names). The
+        # shared HF weight map (build via enumerate(layer_indices)) is keyed by local
+        # position; keying this dict by the global id instead double-maps under an
+        # uneven PP split (a stage owning [1,2] would remap layers.1→layers.2 and
+        # drop layer 1 on export/load). The global id is still passed to the layer
+        # for its dense-vs-MoE / per-layer logic.
         self.layers = nn.ModuleDict(
             {
-                str(idx): DeepseekV4Layer(config, ps, idx, use_deepep=use_deepep)
-                for idx in self.layer_indices
+                str(local): DeepseekV4Layer(config, ps, global_idx, use_deepep=use_deepep)
+                for local, global_idx in enumerate(self.layer_indices)
             }
         )
 
@@ -332,7 +344,7 @@ class DeepseekV4Model(nn.Module):
 
         self.mtp_embed: VocabParallelEmbedding | None = None
         self.mtp: nn.ModuleList = nn.ModuleList()
-        if mtp_enable and config.num_nextn_predict_layers > 0 and self.lm_head is not None:
+        if mtp_enable and config.num_nextn_predict_layers > 0 and layout.has_mtp:
             mtp_embedding = self.embed_tokens
             if mtp_embedding is None:
                 mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)

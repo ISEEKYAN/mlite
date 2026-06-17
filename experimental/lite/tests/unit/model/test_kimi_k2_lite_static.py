@@ -175,18 +175,21 @@ def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
 
     assert build_pipeline_chunk_layout(4, rank0).layer_indices == [0, 1]
     assert build_pipeline_chunk_layout(4, rank1).layer_indices == [2, 3]
+    # MTP is built on the stage the layout designates (layout.has_mtp), not a
+    # hard-coded head rank.
     assert (
-        "if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None"
+        "if mtp_enable and config.num_nextn_predict_layers > 0 and layout.has_mtp"
         in model_text
     )
     assert "self.mtp_embed = mtp_embedding" in model_text
 
-    vpp_last = build_pipeline_chunk_layout(4, rank1, vpp=2, vpp_chunk_id=1)
-    assert vpp_last.layer_indices == [3]
-    assert vpp_last.has_head is True
+    # pp-only: VPP / interleaving raises rather than silently mis-splitting.
+    with pytest.raises(NotImplementedError):
+        build_pipeline_chunk_layout(4, rank1, vpp=2, vpp_chunk_id=1)
 
-    with pytest.raises(ValueError, match="not divisible"):
-        build_pipeline_chunk_layout(3, rank0, vpp=2, vpp_chunk_id=0)
+    # Non-divisible counts auto-balance (no "not divisible" error): 3/pp2 -> [2, 1].
+    assert build_pipeline_chunk_layout(3, rank0).layer_indices == [0, 1]
+    assert build_pipeline_chunk_layout(3, rank1).layer_indices == [2]
 
 
 def test_kimi_k2_checkpoint_exports_hf_names():

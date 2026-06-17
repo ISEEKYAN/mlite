@@ -686,7 +686,11 @@ class Glm5Model(nn.Module):
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
 
         layout = build_pipeline_chunk_layout(
-            config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id
+            config.num_hidden_layers,
+            ps,
+            train_config.vpp,
+            vpp_chunk_id,
+            num_mtp_layers=config.num_nextn_predict_layers if mtp_enable else 0,
         )
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed
@@ -728,7 +732,7 @@ class Glm5Model(nn.Module):
 
         self.mtp_embed: VocabParallelEmbedding | None = None
         self.mtp: Glm5MTPBlock | None = None
-        if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
+        if mtp_enable and config.num_nextn_predict_layers > 0 and layout.has_mtp:
             mtp_embedding = self.embed
             if mtp_embedding is None:
                 mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
