@@ -308,6 +308,10 @@ def load_hf_weights(
     ``_hf_names_for_state_key`` -- the SAME mapping the export spec uses, so the
     round-trip names stay consistent.  EP-local expert ids are converted to
     global before mapping.  CSA is TP=ETP=1, so there is no TP split here.
+
+    Under PP the ``self.layers`` ModuleDict is keyed by LOCAL pipeline position,
+    so -- like the exporter -- the local layer index is lifted to global before
+    mapping (identity at PP=1); else a non-first stage reads the wrong layer.
     """
     if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=ETP=1.")
@@ -315,12 +319,19 @@ def load_hf_weights(
     reader = SafeTensorReader(path)
     base_model = unwrap_model(model)
     state = base_model.state_dict()
+    # local pipeline position -> global layer index (identity at PP=1)
+    layer_map = (
+        {i: base_model.layer_indices[i] for i in range(len(base_model.layer_indices))}
+        if hasattr(base_model, "layer_indices")
+        else {}
+    )
     loaded = 0
     missing: list[str] = []
     for name, target in state.items():
         if _is_native_metadata_key(name):
             continue
-        hf_names = _hf_names_for_state_key(_to_global_expert_name(name, config, ps), config)
+        global_name = to_global_layer_name(name, layer_map)
+        hf_names = _hf_names_for_state_key(_to_global_expert_name(global_name, config, ps), config)
         if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
             missing.append(name)
             continue

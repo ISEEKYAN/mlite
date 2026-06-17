@@ -65,21 +65,20 @@ def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor)
         param.detach().copy_(local_tensor.to(device=param.device, dtype=param.dtype))
         return
 
+    # Copy straight into the param's local shard. Reconstructing via
+    # DTensor.from_local mis-sizes an unevenly-sharded param (it infers global =
+    # local * mesh, e.g. a (3,) param over 8 ranks -> 0 or 8), so copy local->local
+    # (master is init'd from this same local shard, so shapes match).
     local_param = to_local_tensor(param)
-    local_value = local_tensor.to(device=local_param.device, dtype=local_param.dtype)
-    from torch.distributed.tensor import DTensor
-
-    param.detach().copy_(DTensor.from_local(local_value, param.device_mesh, param.placements))
+    local_param.copy_(local_tensor.to(device=local_param.device, dtype=local_param.dtype))
 
 
 def all_reduce_grad_(grad: torch.Tensor, *, group: dist.ProcessGroup) -> None:
+    # ``to_local_tensor`` returns the DTensor's local shard storage, so the
+    # in-place all-reduce updates the grad directly -- no DTensor.from_local
+    # round-trip (which mis-sizes unevenly-sharded grads, e.g. (3,) over 8 ranks).
     local_grad = to_local_tensor(grad)
     dist.all_reduce(local_grad, op=dist.ReduceOp.SUM, group=group)
-    if local_grad is grad:
-        return
-    from torch.distributed.tensor import DTensor
-
-    grad.copy_(DTensor.from_local(local_grad, grad.device_mesh, grad.placements))
 
 
 class ChainedOptimizer:

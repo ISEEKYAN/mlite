@@ -590,6 +590,23 @@ class CompressedSparseAttention(nn.Module):
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
             )
         dsa_kernels = _load_dsa_kernels()
+        # The cuDNN SM90 indexer requires seqlen_q <= seqlen_k * ratio, but the
+        # compressor floors to seq_len // ratio blocks, so a seq_len that is not a
+        # multiple of ratio leaves the last query token(s) without a compressed key
+        # block. Right-pad to a multiple of ratio (the causal tail attends only real
+        # tokens and is sliced off the output) so seqlen_k * ratio == seqlen_q.
+        orig_seq_len = x.shape[1]
+        ratio = self.compress_ratio
+        pad = (-orig_seq_len) % ratio
+        if pad:
+            pos_tail = position_ids[:, -1:] + torch.arange(
+                1, pad + 1, device=position_ids.device, dtype=position_ids.dtype
+            )
+            position_ids = torch.cat([position_ids, pos_tail], dim=1)
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad))
+            q = torch.nn.functional.pad(q, (0, 0, 0, pad))
+            q_low = torch.nn.functional.pad(q_low, (0, 0, 0, pad))
+            kv = torch.nn.functional.pad(kv, (0, 0, 0, pad))
         batch, seq_len, _ = x.shape
         compressed = self.compressor(
             x,
@@ -692,4 +709,6 @@ class CompressedSparseAttention(nn.Module):
         context = (
             out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
         )
+        if pad:
+            context = context[:, :, :orig_seq_len, :].contiguous()
         return self._project_context(context, cos, sin)
