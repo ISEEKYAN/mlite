@@ -331,13 +331,21 @@ def test_router_replay_record_then_replay_aligns(
     # assertions are guarded on availability; routed_experts is PP-gathered to all
     # ranks, so its shape is checked everywhere.
 
-    # 0) Run-to-run noise floor: two identical no-replay forwards. Deterministic
-    #    models give 0; non-deterministic fused kernels (e.g. DSA attention) give
-    #    a small floor we accept replay reproduction against (red-line #4).
-    lp_a = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
-    lp_b = _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
-    has_lp = lp_a is not None
-    noise = (lp_a - lp_b).abs().max().item() if has_lp else 0.0
+    # 0) Run-to-run noise floor: several identical no-replay forwards, taking the
+    #    max pairwise diff. A single pair undersamples the intermittent atomic
+    #    non-determinism of the MoE all-to-all combine / DSA kernels; a robust
+    #    upper bound lets replay be accepted "same order as noise" (red-line #4).
+    #    Deterministic models give 0 → replay must then be bitwise.
+    plains = [
+        _flat(_forward(engine, runtime_batch, loss_context, None).model_output.log_probs)
+        for _ in range(4)
+    ]
+    has_lp = plains[0] is not None
+    noise = (
+        max((plains[i] - plains[0]).abs().max().item() for i in range(1, len(plains)))
+        if has_lp
+        else 0.0
+    )
 
     # 1) RECORD the routing during a log-prob pass.
     rec = _forward(engine, runtime_batch, loss_context, {"action": "record"})
