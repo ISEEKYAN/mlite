@@ -577,6 +577,27 @@ def _bridge_forward_kwargs_from_packed_batch(
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
 
 
+def _bridge_forward_kwargs_bshd(batch: PackedBatch) -> dict[str, Any]:
+    """Render dense [b=1, s] forward kwargs for a single packed sequence.
+
+    Used when ``use_thd`` is False so the Megatron-Core reference runs its dense
+    kernel (e.g. GatedDeltaNet, whose THD path is unsupported / non-deterministic
+    in the pinned core), giving a deterministic, layout-matched parity vs the
+    native lite dense forward on identical tokens. Carries no THD packing
+    metadata (no ``packed_seq_params`` / ``position_ids``) — single unpadded
+    sequence, so an all-ones attention mask reproduces the full causal sequence.
+    CP=1 only.
+    """
+    total = int(batch.seq_lens.sum().item())
+    return {
+        "input_ids": batch.input_ids.reshape(1, total).contiguous(),
+        "labels": (
+            batch.labels.reshape(1, total).contiguous() if batch.labels is not None else None
+        ),
+        "attention_mask": torch.ones((1, total), dtype=torch.long, device=batch.input_ids.device),
+    }
+
+
 class BridgeRuntime(RuntimeBase):
     """Megatron-Bridge training backend using Megatron-Core optimizer state."""
 
@@ -699,8 +720,11 @@ class BridgeRuntime(RuntimeBase):
             sample = next(data_iterator)
             owns_transient_metadata = False
             if isinstance(sample, PackedBatch):
-                sample = _bridge_forward_kwargs_from_packed_batch(sample, **cp_kwargs)
-                owns_transient_metadata = True
+                if self._cfg.use_thd:
+                    sample = _bridge_forward_kwargs_from_packed_batch(sample, **cp_kwargs)
+                    owns_transient_metadata = True
+                else:
+                    sample = _bridge_forward_kwargs_bshd(sample)
             elif isinstance(sample, Batch):
                 sample = {
                     "input_ids": sample["input_ids"],
