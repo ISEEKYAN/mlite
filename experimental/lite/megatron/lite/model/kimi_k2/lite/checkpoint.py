@@ -523,10 +523,16 @@ def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: Paral
         )
         if config.is_moe_layer(global_idx):
             out[f"{lp}.mlp_norm.weight"] = _get(reader, f"{hp}.post_attention_layernorm.weight")
-            out[f"{lp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")
+            # Slice router rows to config.num_experts so a bench-truncated expert
+            # count loads from a full HF checkpoint (no-op at full size). Mirrors qwen3.5.
+            out[f"{lp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")[
+                : config.num_experts
+            ]
             bias_name = f"{hp}.mlp.gate.e_score_correction_bias"
             if _has(reader, bias_name):
-                out[f"{lp}.moe.router.expert_bias"] = _get(reader, bias_name).float()
+                out[f"{lp}.moe.router.expert_bias"] = _get(reader, bias_name).float()[
+                    : config.num_experts
+                ]
             _load_shared_expert(
                 out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", reader=reader, ps=ps
             )
