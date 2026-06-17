@@ -1,5 +1,14 @@
 # ds4 dense-plan + official-bridge-config — handoff recipe (fresh doer)
 
+> **DONE (2026-06-17, commit aef29b0e9).** Executed in full — see the **DENSE experiment**
+> section of `RESULTS.md` for the 3-way ×(fwd+bwd) numbers. **Outcome: hypothesis REFUTED.**
+> Forcing dense (num_hash_layers=0 + dense_topall) + official `attention_backend=None` leaves
+> the picture unchanged (mlite-vs-HF 0.998, mlite-vs-bridge 0.901, bridge-vs-HF 0.906 == the
+> full hash-MoE 0.998/0.903/0.908). So the bridge divergence is NOT in the hash-MoE routing path
+> and NOT in attention_backend. bridge stays the structural outlier vs both; ds4 ref remains HF.
+> The recipe below is kept for provenance.
+
+
 Goal (bayan/coord 2026-06-17): force ds4 **dense** (remove hash-MoE/tid2eid routing) and
 re-run the **3-way** (mlite / megatron.bridge / HF) × **(fwd + bwd)** using the **official**
 Megatron-Bridge ds4 config, to see whether the bridge ds4 divergence lives in the MoE-routing
