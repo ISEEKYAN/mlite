@@ -103,17 +103,30 @@ def _set_field(config_obj: Any, name: str, value: Any) -> Any:
 
 
 def _get_model_config_root(config_obj: Any) -> Any:
-    return getattr(config_obj, "text_config", config_obj)
+    # Descend nested text_config (multimodal wrappers, e.g. kimi_k25 -> DeepseekV3Config)
+    # to the language-model sub-config that actually carries layer/expert metadata.
+    seen = set()
+    while config_obj is not None and id(config_obj) not in seen:
+        seen.add(id(config_obj))
+        if getattr(config_obj, "num_hidden_layers", None) is not None:
+            return config_obj
+        nxt = getattr(config_obj, "text_config", None)
+        if nxt is None or nxt is config_obj:
+            break
+        config_obj = nxt
+    return config_obj
 
 
 def _get_bridge_config_root(bridge: Any) -> Any:
-    hf_pretrained = getattr(bridge, "hf_pretrained", None)
-    if hf_pretrained is not None:
-        return _get_model_config_root(getattr(hf_pretrained, "config", hf_pretrained))
-    hf_config = getattr(bridge, "hf_config", None)
-    if hf_config is not None:
-        return _get_model_config_root(hf_config)
-    raise ValueError("Bridge object does not expose hf_pretrained or hf_config.")
+    for attr in ("hf_pretrained", "hf_config", "config"):
+        obj = getattr(bridge, attr, None)
+        if obj is None:
+            continue
+        cfg = getattr(obj, "config", obj)
+        root = _get_model_config_root(cfg)
+        if getattr(root, "num_hidden_layers", None) is not None:
+            return root
+    raise ValueError("Bridge object does not expose an HF config with num_hidden_layers.")
 
 
 def _refresh_bridge_config(bridge: Any) -> None:
