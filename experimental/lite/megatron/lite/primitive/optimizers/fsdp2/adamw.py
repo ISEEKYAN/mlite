@@ -500,10 +500,23 @@ def iter_torch_optimizers(optimizer: Any) -> Iterable[torch.optim.Optimizer]:
 
 
 def dtensor_from_local(
-    local_tensor: torch.Tensor, device_mesh: Any, placements: Any
+    local_tensor: torch.Tensor,
+    device_mesh: Any,
+    placements: Any,
+    *,
+    shape: Any = None,
+    stride: Any = None,
 ) -> torch.Tensor:
     from torch.distributed.tensor import DTensor
 
+    # ``DTensor.from_local`` infers the global shape as local_shard * mesh, which
+    # is WRONG for unevenly-sharded params (FSDP2 pads the last shard). Pass the
+    # original global shape/stride so the round-trip is exact for any dim not
+    # divisible by the mesh size.
+    if shape is not None:
+        return DTensor.from_local(
+            local_tensor, device_mesh, placements, shape=shape, stride=stride
+        )
     return DTensor.from_local(local_tensor, device_mesh, placements)
 
 
