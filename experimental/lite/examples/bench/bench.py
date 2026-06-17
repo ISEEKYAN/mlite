@@ -57,6 +57,12 @@ class BenchCliConfig:
     keep_experts: int | None = None
     truncate_layers: int | None = None
     disable_mtp: bool = False
+    # Dense-MoE experiment (ds4): num_hash_layers overrides the model's hash-routed
+    # layer count (0 = no hash routing, all MoE layers use the learned sigmoid-topk
+    # router); dense_topall sets num_experts_per_tok == routed-expert-count so every
+    # token activates all experts (no top-k selection divergence across backends).
+    num_hash_layers: int | None = None
+    dense_topall: bool = False
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 0.1
     optimizer_clip_grad: float = 1.0
@@ -213,6 +219,23 @@ def _make_mlite_model_config_hook(cfg: BenchCliConfig):
     if cfg.disable_mtp:
         hooks.append(_disable_mtp)
 
+    if cfg.num_hash_layers is not None or cfg.dense_topall:
+        # Runs last so it sees the post-keep_experts routed-expert count.
+        def dense_hook(model_cfg):
+            updates: dict[str, Any] = {}
+            if cfg.num_hash_layers is not None:
+                if not hasattr(model_cfg, "num_hash_layers"):
+                    raise ValueError("num_hash_layers requires a model config with that field.")
+                updates["num_hash_layers"] = cfg.num_hash_layers
+            if cfg.dense_topall:
+                field = _moe_expert_count_field(model_cfg)
+                if field is None:
+                    raise ValueError("dense_topall requires a model config with MoE expert metadata.")
+                updates["num_experts_per_tok"] = getattr(model_cfg, field)
+            return replace(model_cfg, **updates)
+
+        hooks.append(dense_hook)
+
     if not hooks:
         return None
 
@@ -314,6 +337,22 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
             _refresh_bridge_config(bridge)
 
         hooks.append(disable_mtp_hook)
+
+    if cfg.num_hash_layers is not None or cfg.dense_topall:
+        # Mutates the HF config before to_megatron_provider so the mcore provider
+        # derives moe_n_hash_layers / moe_router_topk from these values.
+        def dense_hook(bridge) -> None:
+            hf_cfg = _get_bridge_config_root(bridge)
+            if cfg.num_hash_layers is not None:
+                hf_cfg.num_hash_layers = cfg.num_hash_layers
+            if cfg.dense_topall:
+                field = _moe_expert_count_field(hf_cfg)
+                if field is None:
+                    raise ValueError("dense_topall requires an HF config with MoE expert metadata.")
+                hf_cfg.num_experts_per_tok = getattr(hf_cfg, field)
+            _refresh_bridge_config(bridge)
+
+        hooks.append(dense_hook)
 
     if not hooks:
         return None

@@ -34,6 +34,11 @@ def main():
     ap.add_argument("--out-logits", default="mlite_logits.pt")
     ap.add_argument("--out-input", default="input_ids.pt")
     ap.add_argument("--run-tag", default="run1")
+    ap.add_argument("--keep-experts", type=int, default=None)
+    ap.add_argument("--num-hash-layers", type=int, default=None,
+                    help="override hash-routed layer count (0 = dense / learned router)")
+    ap.add_argument("--dense-topall", action="store_true",
+                    help="num_experts_per_tok = routed-expert-count (all experts active)")
     args = ap.parse_args()
 
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
@@ -57,7 +62,10 @@ def main():
         no_optimizer=True,
         skip_optimizer_build=True,
         truncate_layers=args.layers,
+        keep_experts=args.keep_experts,
         disable_mtp=True,
+        num_hash_layers=args.num_hash_layers,
+        dense_topall=args.dense_topall,
         impl_cfg_json='{"optimizer": null, "mtp_enable": false, "mtp_enable_train": false}',
     )
 

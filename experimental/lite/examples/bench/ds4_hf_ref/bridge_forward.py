@@ -39,10 +39,29 @@ def main():
     ap.add_argument("--check-input", default="input_ids.pt", help="assert tokens match this saved input")
     ap.add_argument("--rope-fusion", default="off", choices=["off", "on"],
                     help="apply_rope_fusion: 'off' (non-fused MLA rope) or 'on' (fused, train-only experimental)")
+    ap.add_argument("--keep-experts", type=int, default=None)
+    ap.add_argument("--num-hash-layers", type=int, default=None,
+                    help="override hash-routed layer count (0 = dense / learned router)")
+    ap.add_argument("--dense-topall", action="store_true",
+                    help="num_experts_per_tok = routed-expert-count (all experts active)")
+    ap.add_argument("--attention-backend", default="flash",
+                    help="'flash' (bench default) or 'auto' (official ds4 recipe = None)")
     args = ap.parse_args()
 
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
     set_deterministic(args.seed)
+
+    import json
+    # attention_backend: 'flash' = bench default; 'auto'/'none' -> null = the official
+    # deepseek_v4 recipe (cfg.model.attention_backend = None, mcore auto-selects).
+    if args.attention_backend in ("auto", "none", "null"):
+        attn_backend = None
+    else:
+        attn_backend = args.attention_backend
+    override = {
+        "apply_rope_fusion": args.rope_fusion == "on",
+        "attention_backend": attn_backend,
+    }
 
     cfg = BenchCliConfig(
         backend="bridge",
@@ -61,9 +80,12 @@ def main():
         no_optimizer=True,
         skip_optimizer_build=True,
         truncate_layers=args.layers,
+        keep_experts=args.keep_experts,
         disable_mtp=True,
         same_data_across_dp=True,
-        override_transformer_json='{"apply_rope_fusion": %s}' % ("true" if args.rope_fusion == "on" else "false"),
+        num_hash_layers=args.num_hash_layers,
+        dense_topall=args.dense_topall,
+        override_transformer_json=json.dumps(override),
     )
 
     rt_cfg = build_runtime_config(cfg)

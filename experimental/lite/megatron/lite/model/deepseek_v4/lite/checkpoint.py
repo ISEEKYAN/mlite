@@ -339,7 +339,21 @@ def load_hf_weights(
         else:
             scale_name = _scale_name_for_hf_name(hf_names[0])
             scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
-            _copy_param(target, reader.get_tensor(hf_names[0]), scale=scale)
+            tensor = reader.get_tensor(hf_names[0])
+            # keep-experts: the release router gate/expert_bias carry all routed
+            # experts (n_routed_experts rows); a shrunk config keeps the first N rows
+            # (no-op at full size; mirrors the kimi loader and the bridge AutoMapping
+            # router-slice so all backends load the same first-N experts).
+            if (
+                (name.endswith(".mlp.gate.gate.weight") or name.endswith(".mlp.gate.expert_bias"))
+                and tensor.ndim >= 1
+                and tensor.shape[0] > target.shape[0]
+            ):
+                orig_rows = tensor.shape[0]
+                tensor = tensor[: target.shape[0]]
+                if scale is not None and scale.ndim >= 1 and scale.shape[0] == orig_rows:
+                    scale = scale[: target.shape[0]]
+            _copy_param(target, tensor, scale=scale)
         loaded += 1
 
     log_rank0(f"DeepSeek V4 native loaded {loaded} tensors from {path}")

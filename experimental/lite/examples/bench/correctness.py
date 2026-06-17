@@ -413,6 +413,8 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-experts", type=int, default=None)
     parser.add_argument("--truncate-layers", type=int, default=None)
     parser.add_argument("--disable-mtp", action="store_true")
+    parser.add_argument("--num-hash-layers", type=int, default=None)
+    parser.add_argument("--dense-topall", action="store_true")
     parser.add_argument("--optimizer-lr", type=float, default=1e-4)
     parser.add_argument("--optimizer-weight-decay", type=float, default=0.1)
     parser.add_argument("--optimizer-clip-grad", type=float, default=1.0)
