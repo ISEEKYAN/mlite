@@ -76,49 +76,58 @@ def PLACEMENT_FN(param_name: str) -> list:
 # names are bare DeepseekV4Model state_dict keys with GLOBAL layer indices.
 _BLOCK_KEY_RE = re.compile(r"^(layers|mtp)\.(\d+)\.(.+)$")
 _GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.fc([12])\.weight(\d+)$")
-_PROJ_TO_HF = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
-
-# Native top-level params -> HF target names.  mHC ``hc_head`` has no HF
-# analogue, so it keeps a ``model.``-rooted name to stay self-consistent.
+# Native top-level params -> real DeepSeek-V4-Flash release names (NOT DeepSeek-V3 HF
+# names; the V4 release uses bare `embed.weight` / `head.weight` / `norm.weight` and a
+# `layers.N.attn.* / ffn.* / hc_*` layout). This same mapping drives both the load path
+# and the export spec, so MLite round-trips against the real release / vLLM ds4 format.
 _TOP_LEVEL = {
-    "embed_tokens.embedding.weight": "model.embed_tokens.weight",
-    "norm.weight": "model.norm.weight",
-    "hc_head.hc_fn": "model.hc_head.hc_fn",
-    "hc_head.hc_base": "model.hc_head.hc_base",
-    "hc_head.hc_scale": "model.hc_head.hc_scale",
-    "lm_head.col.linear.weight": "lm_head.weight",
+    "embed_tokens.embedding.weight": "embed.weight",
+    "norm.weight": "norm.weight",
+    "hc_head.hc_fn": "hc_head_fn",
+    "hc_head.hc_base": "hc_head_base",
+    "hc_head.hc_scale": "hc_head_scale",
+    "lm_head.col.linear.weight": "head.weight",
 }
 
 
 def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
+    """Map a native per-block attr -> real V4-Flash suffix (relative to layers.N / mtp.N)."""
     if attr == "input_layernorm.weight":
-        return "input_layernorm.weight"
+        return "attn_norm.weight"
     if attr == "post_attention_layernorm.weight":
-        return "post_attention_layernorm.weight"
-    if attr.startswith("self_attn."):
-        suffix = attr.removeprefix("self_attn.")
-        return "self_attn.attn_sink" if suffix == "sinks" else f"self_attn.{suffix}"
+        return "ffn_norm.weight"
+    # CSA attention: native `self_attn.self_attn.*` (the SBHD wrapper adds one extra
+    # `self_attn` level) -> real `attn.*`. Covers compressor.* / indexer.* / wq_a / wkv / ...
+    sub = None
+    if attr.startswith("self_attn.self_attn."):
+        sub = attr.removeprefix("self_attn.self_attn.")
+    elif attr.startswith("self_attn."):
+        sub = attr.removeprefix("self_attn.")
+    if sub is not None:
+        return "attn.attn_sink" if sub == "sinks" else f"attn.{sub}"
     if attr.startswith("mlp.gate."):
         suffix = attr.removeprefix("mlp.gate.")
-        return "mlp.gate." + {
+        return "ffn.gate." + {
             "gate.weight": "weight",
             "weight": "weight",
-            "expert_bias": "e_score_correction_bias",
-            "e_score_correction_bias": "e_score_correction_bias",
+            "expert_bias": "bias",
+            "e_score_correction_bias": "bias",
             "tid2eid": "tid2eid",
         }.get(suffix, suffix)
     if attr.startswith("mlp.shared_experts."):
         proj = attr.removeprefix("mlp.shared_experts.").removesuffix(".weight")
         if proj == "gate_up":
-            return "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight"
+            return "ffn.shared_experts.w1.weight", "ffn.shared_experts.w3.weight"
         if proj == "down":
-            return "mlp.shared_experts.down_proj.weight"
-        return f"mlp.shared_experts.{_PROJ_TO_HF.get(proj, proj)}.weight"
-    # mHC params have no upstream HF analogue; keep them under self_attn / mlp /
-    # hc_head sub-namespaces so every key stays ``model.layers.{i}.*``-rooted.
-    for prefix, target in (("attn_hc", "self_attn.hc"), ("ffn_hc", "mlp.hc"), ("hc_head", "hc_head")):
+            return "ffn.shared_experts.w2.weight"
+        return f"ffn.shared_experts.{proj}.weight"
+    # mHC (hyper-connections): native attn_hc/ffn_hc.{base,fn,scale} -> hc_attn_*/hc_ffn_*;
+    # mtp carries its own hc_head.hc_* -> hc_head_*.
+    for prefix, target in (("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn")):
         if attr.startswith(f"{prefix}."):
-            return f"{target}_{attr.rsplit('.', 1)[-1].removeprefix('hc_')}"
+            return f"{target}_{attr.rsplit('.', 1)[-1]}"
+    if attr.startswith("hc_head."):
+        return f"hc_head_{attr.rsplit('.', 1)[-1].removeprefix('hc_')}"
     if block == "mtp" and attr in {
         "e_proj.weight",
         "h_proj.weight",
@@ -147,20 +156,9 @@ def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     if match is None:
         return []
     block, index, attr = match.groups()
-    # HF places MTP layers right after the decoder stack, so they share the
-    # ``model.layers.{i}`` namespace with a continued global index.
-    if block == "layers":
-        prefix = f"model.layers.{index}"
-    else:  # mtp
-        prefix = f"model.layers.{config.num_hidden_layers + int(index)}"
-    # CSA lives under ``self_attn.self_attn.*`` (the SBHD wrapper adds one extra
-    # ``self_attn`` level).  Collapse it so the HF attention names are unchanged.
-    if attr.startswith("self_attn.self_attn."):
-        attr = "self_attn." + attr.removeprefix("self_attn.self_attn.")
-    if attr.startswith("self_attn.compressor."):
-        return [f"{prefix}.self_attn.compressor.{attr.removeprefix('self_attn.compressor.')}"]
-    if attr.startswith("self_attn.indexer."):
-        return [f"{prefix}.self_attn.indexer.{attr.removeprefix('self_attn.indexer.')}"]
+    # Real V4-Flash keeps decoder layers under ``layers.{i}`` and the MTP block under its
+    # own ``mtp.{i}`` namespace (no ``model.`` prefix, no continued global index).
+    prefix = f"layers.{index}" if block == "layers" else f"mtp.{index}"
     mapped = _map_block_attr(attr, block)
     if mapped is not None:
         if isinstance(mapped, tuple):
@@ -170,10 +168,11 @@ def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     if expert is None:
         return []
     fc, expert_id = expert.groups()
-    expert_prefix = f"{prefix}.mlp.experts.{int(expert_id)}"
+    # native fused gate_up (fc1) -> real w1 (gate) + w3 (up); fc2 -> w2 (down).
+    expert_prefix = f"{prefix}.ffn.experts.{int(expert_id)}"
     if fc == "1":
-        return [f"{expert_prefix}.gate_proj.weight", f"{expert_prefix}.up_proj.weight"]
-    return [f"{expert_prefix}.down_proj.weight"]
+        return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
+    return [f"{expert_prefix}.w2.weight"]
 
 
 # ======================================================================
