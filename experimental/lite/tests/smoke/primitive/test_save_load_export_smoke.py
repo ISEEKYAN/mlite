@@ -509,7 +509,14 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
     # weights (all pipeline stages gathered), not just the first stage's — guards
     # against a pp-blind export silently dropping later stages' layers.
     num_layers = int(getattr(cfg, "num_hidden_layers"))
-    missing = [i for i in range(num_layers) if not any(f".layers.{i}." in k for k in keys)]
+
+    def _has_layer(i: int) -> bool:
+        # Match both the ``model.``-rooted convention (``model.layers.{i}.``) and
+        # the bare DeepSeek-V4-Flash layout (``layers.{i}.``), which has no prefix.
+        prefix = f"layers.{i}."
+        return any(k.startswith(prefix) or f".{prefix}" in k for k in keys)
+
+    missing = [i for i in range(num_layers) if not _has_layer(i)]
     assert not missing, (
         f"export missing decoder layers {missing} (PP gather incomplete); "
         f"sample keys: {sorted(keys)[:6]}"
