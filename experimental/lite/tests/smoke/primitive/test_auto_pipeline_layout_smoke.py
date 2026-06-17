@@ -30,12 +30,12 @@ gate themselves with importorskip.
 from __future__ import annotations
 
 import os
+import re
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
@@ -386,3 +386,61 @@ def test_non_divisible_layers_auto_balance_and_train(model_name):
     assert loss is not None and torch.isfinite(loss).all(), (
         f"{model_name}: non-finite loss {loss} on uneven PP layout"
     )
+
+
+_HF_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def _hf_decoder_layer_indices(names) -> set[int]:
+    """Decoder layer ids referenced by exported HF weight names (``...layers.N...``)."""
+    return {int(m.group(1)) for n in names if (m := _HF_LAYER_RE.search(n))}
+
+
+@pytest.mark.parametrize("model_name", list(MODELS))
+def test_non_divisible_layers_export_reconstructs_every_layer(model_name):
+    """The rollout weight-resync path must gather every global layer under an
+    uneven PP split.
+
+    RL rollout runs vLLM at pp=1 and reloads the *full* HF state; the only
+    pipeline-layout dependency on the rollout side is ``export_hf_weights``
+    re-assembling the uneven per-stage shards into a complete global state. The
+    training-side test above proves the split is disjoint + complete ([1,2,2,1]);
+    this proves the export PP-gather (keyed on global layer names) reconstructs
+    every decoder layer 0..N-1 exactly — a dropped/duplicated stage here would
+    silently corrupt the rollout policy weights.
+    """
+    if dist.get_world_size() != 8:
+        pytest.skip("auto pipeline-layout proxy smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+
+    handle, cfg = _build_handle(model_name, seed=4242)
+    ps = handle._parallel_state
+    assert ps.pp_size == _PP
+    protocol = handle._extras["protocol"]
+    chunks = handle._extras["model_chunks"]
+
+    # Export across the uneven PP split. export_hf_weights all-gathers over the
+    # PP group so every rank materializes the full HF state — exactly the stream
+    # RL weight-resync feeds to the (pp=1) rollout engine.
+    exported = list(protocol.export_hf_weights(chunks, cfg, ps))
+    names = [name for name, _ in exported]
+
+    present = _hf_decoder_layer_indices(names)
+    expected = set(range(cfg.num_hidden_layers))
+    assert expected.issubset(present), (
+        f"{model_name}: uneven-PP export dropped decoder layers "
+        f"{sorted(expected - present)} (have {sorted(present)}); PP gather lost a stage"
+    )
+    # No exported tensor may be a non-finite / placeholder shard.
+    for name, tensor in exported:
+        assert torch.isfinite(tensor.float()).all(), (
+            f"{model_name}: non-finite exported tensor {name} from uneven PP gather"
+        )
+
+    if dist.get_rank() == 0:
+        print(
+            "NON_SKIP_UNEVEN_PP_EXPORT_FULL_COVERAGE "
+            f"model={model_name} num_layers={cfg.num_hidden_layers} "
+            f"split={_EXPECTED_SPLIT} exported_decoder_layers={len(present & expected)}"
+        )
