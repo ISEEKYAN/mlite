@@ -497,7 +497,10 @@ def _as_data_iter(data: Any):
 
 # Megatron-Core models whose attention rejects packed/THD sequences and so must
 # be driven with a single dense (BSHD) sequence in the bridge forward step.
-_DENSE_FORWARD_MODELS = frozenset({"qwen3_5"})
+# qwen3_5: GatedDeltaNet linear attention rejects packed_seq_params.
+# glm5 / deepseek_v4: Megatron-Core's DeepSeek sparse-attention (DSA) core attention
+#   expects a 4-D BSHD query [sq,b,np,hn]; feeding THD yields a 3-D query and fails.
+_DENSE_FORWARD_MODELS = frozenset({"qwen3_5", "glm5", "deepseek_v4"})
 
 
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN
