@@ -46,6 +46,8 @@ def main():
                     help="num_experts_per_tok = routed-expert-count (all experts active)")
     ap.add_argument("--attention-backend", default="flash",
                     help="'flash' (bench default) or 'auto' (official ds4 recipe = None)")
+    ap.add_argument("--backward", action="store_true",
+                    help="run a train step (loss + global grad L2) instead of the logits dump")
     args = ap.parse_args()
 
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
@@ -93,13 +95,50 @@ def main():
     handle = rt.build_model()
     session_cfg = build_session_config(cfg)
 
+    # Confirm the dense config actually reached the built mcore model (else a
+    # silently-still-hash bridge would invalidate the comparison).
+    _m = getattr(handle, "_model", None)
+    _tc = getattr(getattr(_m, "module", _m), "config", None)
+    if _tc is not None:
+        print("[bridge] mcore config:",
+              {k: getattr(_tc, k, "?") for k in
+               ("moe_n_hash_layers", "moe_router_topk", "num_moe_experts", "attention_backend")},
+              flush=True)
+
     vocab = _resolve_vocab_size(handle)
     batch = next(_infinite_packed_batches(vocab, session_cfg.seq_len, device="cuda", seed=session_cfg.seed))
     input_ids = batch.input_ids.detach().clone()
+    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
+
+    if args.backward:
+        # bwd leg: train step on the SAME tokens (labels kept); report loss + global grad L2.
+        rt.zero_grad(handle)
+        with rt.train_mode(handle):
+            result = rt.forward_backward(handle, iter([batch]), loss_fn=None, num_microbatches=1)
+        if rank == 0:
+            loss = float(result.metrics.get("loss", 0.0))
+            # mcore DDP reduces grads into main_grad (param.grad stays None); count both.
+            model = getattr(handle, "_model", None)
+            n_param = n_grad = n_main = 0
+            sq = 0.0
+            for _n, p in model.named_parameters():
+                n_param += 1
+                g = p.grad
+                if g is not None:
+                    n_grad += 1
+                else:
+                    g = getattr(p, "main_grad", None)
+                    if g is not None:
+                        n_main += 1
+                if g is not None:
+                    sq += float(g.detach().float().pow(2).sum().item())
+            print(f"[bridge] BWD loss={loss:.6f} grad_global_norm={sq ** 0.5:.6f} "
+                  f"(params={n_param} with .grad={n_grad} with main_grad={n_main})", flush=True)
+        print("DONE rank", rank, flush=True)
+        return
+
     # labels=None -> mcore GPTModel returns logits (not per-token loss).
     batch = dataclasses.replace(batch, labels=None)
-
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
     with rt.eval_mode(handle):
         result = rt.forward_backward(handle, iter([batch]), loss_fn=None, num_microbatches=1, forward_only=True)
     logits = result.model_output.vocab_parallel_logits

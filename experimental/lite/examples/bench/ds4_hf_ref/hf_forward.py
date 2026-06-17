@@ -51,6 +51,14 @@ def main():
     ap.add_argument("--out", default="hf_logits.pt")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--keep-experts", type=int, default=None,
+                    help="shrink n_routed_experts to N (load + use the first N experts)")
+    ap.add_argument("--num-hash-layers", type=int, default=None,
+                    help="override hash-routed layer count (0 = dense / learned router)")
+    ap.add_argument("--dense-topall", action="store_true",
+                    help="num_experts_per_tok = n_routed_experts (all experts active)")
+    ap.add_argument("--backward", action="store_true",
+                    help="run a train step (next-token CE loss + global grad L2) instead of logits dump")
     args = ap.parse_args()
     PARAM_DTYPE = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
@@ -59,6 +67,7 @@ def main():
 
     hf_cfg_dict = json.load(open(f"{HF_DIR}/config.json"))
     K = args.layers
+    release_n_routed = int(hf_cfg_dict.get("n_routed_experts", 256))
     cfg = DeepseekV4Config(**{k: v for k, v in hf_cfg_dict.items()
                               if k not in ("architectures", "quantization_config", "torch_dtype",
                                            "transformers_version", "_name_or_path")})
@@ -67,8 +76,18 @@ def main():
     cfg.compress_ratios = list(hf_cfg_dict["compress_ratios"][:K])
     cfg.layer_types = None
     cfg.mlp_layer_types = None
-    cfg.__post_init__(compress_ratios=cfg.compress_ratios,
-                      num_hash_layers=hf_cfg_dict.get("num_hash_layers", 3))
+    # keep-experts: shrink to the first N routed experts (matches the mlite loader
+    # row-slice + the bridge AutoMapping router-slice so all backends use experts 0..N-1).
+    if args.keep_experts is not None:
+        cfg.n_routed_experts = args.keep_experts
+    num_hash_layers = (args.num_hash_layers if args.num_hash_layers is not None
+                       else hf_cfg_dict.get("num_hash_layers", 3))
+    cfg.__post_init__(compress_ratios=cfg.compress_ratios, num_hash_layers=num_hash_layers)
+    # dense_topall: every token activates all (kept) experts -> no top-k selection.
+    if args.dense_topall:
+        cfg.num_experts_per_tok = cfg.n_routed_experts
+    print("num_hash_layers:", num_hash_layers, "num_experts_per_tok:", cfg.num_experts_per_tok,
+          "n_routed_experts:", cfg.n_routed_experts, flush=True)
     print("layer_types:", cfg.layer_types, "mlp_layer_types:", cfg.mlp_layer_types, flush=True)
     assert all(t == "sliding_attention" for t in cfg.layer_types), \
         "this converter slice only covers sliding layers (K<=2); add CSA/HCA for K>2"
@@ -114,12 +133,18 @@ def main():
             new_sd[f"{hp}.self_attn.{hk}"] = read_dequant(get, has, f"{rp}.attn.{rk}", sd_meta[f"{hp}.self_attn.{hk}"].shape)
         for hk, rk in HC.items():
             new_sd[f"{hp}.{hk}"] = read_dequant(get, has, f"{rp}.{rk}", sd_meta[f"{hp}.{hk}"].shape)
-        # router
-        new_sd[f"{hp}.mlp.gate.weight"] = read_dequant(get, has, f"{rp}.ffn.gate.weight", sd_meta[f"{hp}.mlp.gate.weight"].shape)
-        if has(f"{rp}.ffn.gate.tid2eid"):
+        # router: release gate.weight/bias carry all routed experts (release_n_routed
+        # rows); keep the first n_experts (no-op at full size). Read at the full release
+        # shape so block-scale dequant aligns, then slice.
+        gw = read_dequant(get, has, f"{rp}.ffn.gate.weight", (release_n_routed, cfg.hidden_size))
+        new_sd[f"{hp}.mlp.gate.weight"] = gw[:n_experts]
+        # tid2eid only exists for hash layers and is only a model buffer when this layer
+        # is hash-routed; skip it when the HF model (e.g. num_hash_layers=0) has none.
+        if has(f"{rp}.ffn.gate.tid2eid") and f"{hp}.mlp.gate.tid2eid" in sd_meta:
             new_sd[f"{hp}.mlp.gate.tid2eid"] = get(f"{rp}.ffn.gate.tid2eid").long()
         if has(f"{rp}.ffn.gate.bias") and f"{hp}.mlp.gate.e_score_correction_bias" in sd_meta:
-            new_sd[f"{hp}.mlp.gate.e_score_correction_bias"] = read_dequant(get, has, f"{rp}.ffn.gate.bias", sd_meta[f"{hp}.mlp.gate.e_score_correction_bias"].shape)
+            gb = read_dequant(get, has, f"{rp}.ffn.gate.bias", (release_n_routed,))
+            new_sd[f"{hp}.mlp.gate.e_score_correction_bias"] = gb[:n_experts]
         # shared experts
         for hk, rk in (("gate_proj", "w1"), ("up_proj", "w3"), ("down_proj", "w2")):
             new_sd[f"{hp}.mlp.shared_experts.{hk}.weight"] = read_dequant(get, has, f"{rp}.ffn.shared_experts.{rk}.weight", sd_meta[f"{hp}.mlp.shared_experts.{hk}.weight"].shape)
@@ -156,6 +181,25 @@ def main():
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)  # [S] -> [1, S]
     print("input_ids", tuple(input_ids.shape), input_ids.dtype, flush=True)
+
+    if args.backward:
+        # bwd leg: standard next-token CE on the SAME tokens + global grad L2.
+        # (Note: HF uses the textbook shifted-CE reduction; the bench mlite/bridge loss
+        #  rolls labels with a padded last token, so HF loss may differ by ~1/seq.)
+        model.train()
+        out = model(input_ids=input_ids, use_cache=False)
+        lg = out.logits[:, :-1].reshape(-1, out.logits.shape[-1]).float()
+        tgt = input_ids[:, 1:].reshape(-1)
+        loss = torch.nn.functional.cross_entropy(lg, tgt)
+        loss.backward()
+        total = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                total += float(p.grad.detach().float().pow(2).sum().item())
+        print(f"HF BWD loss={float(loss):.6f} grad_global_norm={total ** 0.5:.6f}", flush=True)
+        print("DONE", flush=True)
+        return
+
     with torch.no_grad():
         out = model(input_ids=input_ids, use_cache=False)
     logits = out.logits.float().cpu()

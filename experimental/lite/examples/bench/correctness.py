@@ -281,6 +281,25 @@ def _grad_fingerprint(handle) -> dict[str, Any]:
     return result
 
 
+def _grad_global_norm(handle) -> float:
+    """Global L2 norm over all parameter grads.
+
+    A numeric, backend-comparable backward signal (the sha256 fingerprint hashes
+    bytes/names/shapes so it only matches identical layouts, not mlite-vs-bridge).
+    Works with --no-optimizer since grads exist after backward even without a step.
+    """
+    total = 0.0
+    for chunk in _model_chunks(handle):
+        for _name, param in chunk.named_parameters():
+            grad = param.grad
+            if grad is None:
+                grad = getattr(param, "main_grad", None)
+            if grad is None:
+                continue
+            total += float(grad.detach().float().pow(2).sum().item())
+    return total ** 0.5
+
+
 def _weight_fingerprint(rt, handle) -> dict[str, Any]:
     h = hashlib.sha256()
     count = 0
@@ -347,6 +366,7 @@ def run_backend(
                 _sync(session_cfg.device)
                 logits = _hash_tensor(result.model_output.vocab_parallel_logits)
                 grads = _grad_fingerprint(handle)
+                grad_global_norm = _grad_global_norm(handle)
 
                 if session_cfg.no_optimizer:
                     update_successful, grad_norm, num_zeros = True, 0.0, 0
@@ -361,6 +381,7 @@ def run_backend(
                     "loss": _scalar(result.metrics.get("loss", 0.0)),
                     "logits": logits,
                     "grad_fingerprint": grads,
+                    "grad_global_norm": _scalar(grad_global_norm),
                     "grad_norm": _scalar(grad_norm),
                     "update_successful": bool(update_successful),
                     "num_zeros": None if num_zeros is None else int(num_zeros),

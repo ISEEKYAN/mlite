@@ -39,6 +39,8 @@ def main():
                     help="override hash-routed layer count (0 = dense / learned router)")
     ap.add_argument("--dense-topall", action="store_true",
                     help="num_experts_per_tok = routed-expert-count (all experts active)")
+    ap.add_argument("--backward", action="store_true",
+                    help="run a train step (loss + global grad L2) instead of the logits dump")
     args = ap.parse_args()
 
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
@@ -79,10 +81,24 @@ def main():
     import dataclasses
     batch = next(_infinite_packed_batches(vocab, session_cfg.seq_len, device="cuda", seed=data_seed))
     input_ids = batch.input_ids.detach().clone()
+    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
+
+    if args.backward:
+        # bwd leg: train step on the SAME tokens (labels kept = next-token, set by the
+        # packed-batch generator); report loss + global grad L2 (backend-comparable).
+        from examples.bench.correctness import _grad_global_norm
+        rt.zero_grad(handle)
+        with rt.train_mode(handle):
+            result = rt.forward_backward(handle, iter([batch]), loss_fn=None, num_microbatches=1)
+        if rank == 0:
+            loss = float(result.metrics.get("loss", 0.0))
+            print(f"[{args.run_tag}] mlite BWD loss={loss:.6f} grad_global_norm={_grad_global_norm(handle):.6f}",
+                  flush=True)
+        print("DONE rank", rank, flush=True)
+        return
+
     # ds4 model returns logits only when labels is None (else it returns the loss).
     batch = dataclasses.replace(batch, labels=None)
-
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
     with rt.eval_mode(handle):
         result = rt.forward_backward(handle, iter([batch]), loss_fn=None, num_microbatches=1, forward_only=True)
     logits = result.model_output.vocab_parallel_logits

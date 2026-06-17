@@ -99,6 +99,65 @@ Setting `--override-transformer-json '{"apply_rope_fusion": false}'` (the correc
 reference path) → clean finite loss 20.3354. Reproduce: `code/ds4_vs_hf/run_bridge_inject.sbatch`
 (job 12891285). The injection wrapper is kept as a guard that re-verifies tid2eid stays a no-op.
 
+## DENSE experiment — does forcing ds4 dense close the bridge gap? (NO — routing refuted)
+
+bayan's hypothesis: the bridge ds4 logit divergence (cosine ~0.90) lives in the **hash-MoE
+routing path** (tid2eid), so forcing the model fully **dense** + using the **official** bridge
+config should make mlite-vs-bridge tight (both Megatron-family). **Tested and refuted.**
+
+**Dense config (identical on all 3 backends):** `num_hash_layers=0` (no tid2eid hash routing —
+every MoE layer uses the learned sigmoid-topk router) + `dense_topall` (`num_experts_per_tok ==
+n_routed_experts` → every token activates all experts, no top-k selection divergence) +
+`keep-experts 8` (single-card proxy) + `truncate-layers 2` (K=2 sliding, compress_ratio 0, no DSA
+indexer) + MTP off. seq 64, seed 42, deterministic, same tokens (`input_ids_dense.pt`, bridge
+confirms `input_ids match: True`). **Official bridge config:** `attention_backend=None` (mcore
+auto-select; the bench default forces `flash`) — confirmed applied on the built mcore model:
+`{moe_n_hash_layers: 0, moe_router_topk: 8, num_moe_experts: 8, attention_backend: None}`.
+mlite dense confirmed by the `expert_bias missing` load warning (expert_bias is only a loaded
+buffer on non-hash layers). New flags: `--num-hash-layers`, `--dense-topall` (bench
+`BenchCliConfig` + mlite model-config hook + bridge post-init hook + the 3 forward scripts);
+ds4 native loader gained kimi-style router row-slicing so `--keep-experts` loads experts 0..N-1.
+
+### Forward — 3-way logits (DENSE), identical tokens
+| pair | cosine | mean_abs | max_abs | argmax | vs FULL hash-MoE |
+|---|---|---|---|---|---|
+| **mlite vs HF** | **0.998069** | 0.175 | 2.58 | 0.984 | 0.998 (unchanged) |
+| **mlite vs bridge** | **0.901343** | 1.166 | 21.0 | 0.578 | 0.903 (unchanged) |
+| **bridge vs HF** | **0.905933** | 1.137 | 22.1 | 0.578 | 0.908 (unchanged) |
+
+self-CE: mlite 17.47 / bridge 16.32 / hf 17.58.
+
+### Backward — train step on the SAME tokens (loss + global grad L2)
+| backend | bwd loss | grad_global_norm |
+|---|---|---|
+| **mlite** | **19.764469** | **42.769765** |
+| **bridge** | **20.393072** | n/a (mcore DDP main_grad=0 under `--no-optimizer`) |
+| **HF** | 20.246429 | 42.252110 |
+
+- **mlite-vs-bridge loss** (same bench rolled-label reduction, identical tokens): diff **0.629 /
+  rel 3.1%** — consistent with the fwd 0.90 divergence (bridge differs in bwd too).
+- **mlite grad-norm 42.77 ≈ HF grad-norm 42.25** (within ~1.2%, two independent impls) — mlite &
+  HF agree at the **gradient** level too, not just forward.
+- bridge grad-norm is unmeasurable here: under `--no-optimizer` mcore DDP allocates `main_grad`
+  on all 84 params but `finalize_model_grads` leaves them zero (no grad-accumulation buffer
+  without the optimizer). HF loss uses textbook shifted-CE (not the bench rolled reduction), so
+  HF's *loss* is not directly comparable to the bench loss; its grad-norm is.
+
+### Conclusion
+Forcing ds4 fully dense **and** using the official `attention_backend=None` leaves the picture
+**exactly** where the full hash-MoE run had it: mlite-vs-HF 0.998, mlite-vs-bridge 0.901,
+bridge-vs-HF 0.906. So the bridge divergence is **not** in the hash-MoE/tid2eid routing path,
+and **not** in the attention_backend choice (None vs flash both ~0.90). bridge stays the outlier
+vs *both* mlite and HF (which agree at 0.998 sharing bit-identical weights via mlite's converter).
+The residual is **structural/numeric on the bridge side** — the K=2 layers are pure sliding
+attention, so the suspects are the mcore `dsv4_hybrid` MLA-ish attention internals (head_dim 512
+with only qk_rope 64 partial-RoPE, attention sinks, grouped o_proj) and/or the mHC Sinkhorn
+hyper-connection, plus bridge's **independent** FP4/FP8 dequant (mlite & HF share mlite's dequant;
+bridge dequantizes the release on its own). **ds4's trustworthy reference remains HF** (mlite-vs-HF
+0.998 fwd + grad-norms within ~1% + run-to-run bitwise). Dense does not turn bridge into a
+faithful Megatron-family primary ref for ds4. (Per "别死磕", the deep mcore dsv4_hybrid/mHC +
+dequant fidelity debug is not pursued here.)
+
 ## Precision overview — 4/4 done (vs independent reference)
 - qwen3.5 vs mbridge(GDN): loss rel 7-9e-5
 - kimi vs megatron.bridge(MLA dense 5.6e-6 + MoE keep-8 5.8e-6)
