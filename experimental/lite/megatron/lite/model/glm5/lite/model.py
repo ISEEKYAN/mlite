@@ -43,7 +43,6 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
-from megatron.lite.primitive.modules.router import RouterReplay
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -236,7 +235,6 @@ class Glm5SigmoidTopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
-        enable_routing_replay: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -254,7 +252,9 @@ class Glm5SigmoidTopKRouter(nn.Module):
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
-        self.router_replay = RouterReplay() if enable_routing_replay else None
+        # Router replay is enabled uniformly via attach_router_replay() — one path,
+        # one default for all models; no per-model replay knob.
+        self.router_replay = None
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(

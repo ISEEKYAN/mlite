@@ -39,6 +39,15 @@ def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _enable_replay(router, enable: bool):
+    # Single shared enablement path — same call the runtime uses for every model.
+    if enable:
+        from megatron.lite.primitive.modules.router import attach_router_replay
+
+        attach_router_replay(router)
+    return router
+
+
 def _topk_router(enable_routing_replay: bool):
     from megatron.lite.primitive.modules.router import TopKRouter
     from megatron.lite.primitive.parallel import ParallelState
@@ -46,12 +55,8 @@ def _topk_router(enable_routing_replay: bool):
     config = SimpleNamespace(
         hidden_size=8, num_experts=8, num_experts_per_tok=2, router_aux_loss_coef=0.1
     )
-    return TopKRouter(
-        config,
-        ParallelState(),
-        compute_aux_loss=False,
-        enable_routing_replay=enable_routing_replay,
-    ).to(_device())
+    router = TopKRouter(config, ParallelState(), compute_aux_loss=False).to(_device())
+    return _enable_replay(router, enable_routing_replay)
 
 
 def _sigmoid_router(enable_routing_replay: bool):
@@ -66,12 +71,8 @@ def _sigmoid_router(enable_routing_replay: bool):
         scoring_func="sigmoid",
         aux_loss_alpha=0.0,
     )
-    return SigmoidTopKRouter(
-        config,
-        ParallelState(),
-        compute_aux_loss=False,
-        enable_routing_replay=enable_routing_replay,
-    ).to(_device())
+    router = SigmoidTopKRouter(config, ParallelState(), compute_aux_loss=False).to(_device())
+    return _enable_replay(router, enable_routing_replay)
 
 
 ROUTER_FACTORIES = {"topk_softmax": _topk_router, "sigmoid_topk": _sigmoid_router}
