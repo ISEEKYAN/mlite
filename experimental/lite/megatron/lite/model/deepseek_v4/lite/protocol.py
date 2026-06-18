@@ -255,6 +255,22 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     return model(**_prepare_model_forward_kwargs(model, batch))
 
 
+def _make_aux_loss_hook():
+    # DeepSeek-V4: the only active auxiliary loss is multi-token prediction (MTP).
+    # The MoE router is aux-loss-free (bias-based load balancing) and the DSA
+    # indexer KL loss is disabled, so unlike Kimi/GLM-5 we only scale MTP.
+    # The runtime invokes this once per microbatch with scale=1/num_microbatches
+    # so the MTP backward gradient is consistent with the main loss (which is
+    # divided by num_microbatches before backward); without it MTP gradients are
+    # amplified num_microbatches-fold under gradient accumulation.
+    from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
+
+    def hook(scale: torch.Tensor) -> None:
+        MTPLossAutoScaler.set_loss_scale(scale)
+
+    return hook
+
+
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     # DeepSeek-V4 packs each sequence to the (zigzag) TE alignment but slices CP
     # contiguously for the fused DSA indexer, so reconstruct contiguously.
@@ -443,6 +459,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             "model_cfg": model_cfg,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
+            "pre_forward_hook": _make_aux_loss_hook(),
         },
     )
 
