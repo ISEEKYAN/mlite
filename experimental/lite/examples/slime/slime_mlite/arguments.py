@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["add_mlite_arguments", "mlite_parse_args", "validate_args"]
 
 # User-facing optimizer-backend names. ``dist_opt`` selects Megatron-Core's
-# distributed optimizer (DDP + distopt); ``fsdp2`` selects Megatron Lite's
+# distributed optimizer (DDP wrapper + distributed optimizer); ``fsdp2`` selects Megatron Lite's
 # FSDP2 wrapper. Megatron Lite's protocol layer still keys its internal
 # ``impl_cfg.optimizer`` enum on the legacy value ``"mc"`` for the distributed
 # optimizer; that rename is a separate cross-model cleanup, so we expose the
