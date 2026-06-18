@@ -10,9 +10,6 @@ import torch
 from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.pytorch.permutation import moe_permute as fused_permute
 from transformer_engine.pytorch.permutation import (
-    moe_permute_and_pad_with_probs as fused_permute_and_pad_with_probs,
-)
-from transformer_engine.pytorch.permutation import (
     moe_permute_with_probs as fused_permute_with_probs,
 )
 from transformer_engine.pytorch.permutation import moe_unpermute as fused_unpermute
@@ -21,6 +18,13 @@ from transformer_engine.pytorch.router import (
     fused_moe_aux_loss,
     fused_topk_with_score_function,
 )
+
+try:
+    from transformer_engine.pytorch.permutation import (
+        moe_permute_and_pad_with_probs as fused_permute_and_pad_with_probs,
+    )
+except ImportError:
+    fused_permute_and_pad_with_probs = None
 
 
 def _te_general_gemm(
@@ -106,6 +110,11 @@ def permute(
 
     if fused and probs is not None:
         if tokens_per_expert is not None and align_size > 0:
+            if fused_permute_and_pad_with_probs is None:
+                raise ImportError(
+                    "Transformer Engine does not provide moe_permute_and_pad_with_probs; "
+                    "unset MEGATRON_LITE_MOE_PERMUTE_FUSION or use a newer Transformer Engine."
+                )
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )

@@ -1,0 +1,8 @@
+Repository: https://github.com/radixark/miles
+Inspected fork: https://github.com/ISEEKYAN/miles
+Branch: main
+Commit: 55c8d8b22f82a5afa0db69b758e5df281c6f8f2d
+
+Required structure:
+- miles.ray.actor_group imports MegatronTrainRayActor inside actor allocation.
+- miles.ray.train_actor.TrainRayActor defines the common slime-family actor API.

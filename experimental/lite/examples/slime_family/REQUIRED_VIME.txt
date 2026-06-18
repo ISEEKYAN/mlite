@@ -1,0 +1,7 @@
+Repository: https://github.com/vllm-project/vime
+Branch: main
+Commit: 69cb849b05f5613ddeba793c24d45da5358500a8
+
+Required structure:
+- vime.ray.actor_group imports MegatronTrainRayActor inside actor allocation.
+- vime.ray.train_actor.TrainRayActor defines the common slime-family actor API.
