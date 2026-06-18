@@ -284,6 +284,26 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
         model_cfg.num_nextn_predict_layers = 0
 
 
+def _make_aux_loss_hook():
+    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main
+    loss scale (DP size / gradient accumulation), mirroring the sibling protocols
+    (kimi_k2 / glm5 / qwen3_5 / qwen3_moe).
+
+    DS4 only injects an MTP auxiliary loss: its MoE router is aux-loss-free
+    (``SigmoidTopKRouter(..., compute_aux_loss=False)``) and its CSA indexer runs
+    with ``sparse_loss=False``, so -- unlike GLM-5, which also scales the MoE-aux
+    and DSA-indexer losses -- only ``MTPLossAutoScaler`` needs scaling here.
+    Without this hook the injected MTP gradient keeps ``MTPLossAutoScaler``'s
+    class-default scale of 1.0 and is mis-weighted relative to the main loss.
+    """
+    from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
+
+    def hook(scale: torch.Tensor) -> None:
+        MTPLossAutoScaler.set_loss_scale(scale)
+
+    return hook
+
+
 def _optimizer_backend_name(optimizer: Any) -> str | None:
     if isinstance(optimizer, dict) or isinstance(optimizer, OptimizerConfig):
         return "dist_opt"
@@ -443,6 +463,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             "model_cfg": model_cfg,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
+            "pre_forward_hook": _make_aux_loss_hook(),
         },
     )
 
