@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from megatron.lite.primitive.parallel.cp import (
     contiguous_to_zigzag_chunks,
+    roll_contiguous_left_for_cp,
     split_packed_for_cp,
     zigzag_position_ids_for_cp,
     zigzag_reconstruct_from_cp_parts,
@@ -78,6 +79,7 @@ __all__ = [
     "prepare_packed_thd_for_context_parallel",
     "prepare_packed_thd_kwargs_for_context_parallel",
     "reconstruct_packed_from_cp_parts",
+    "roll_contiguous_left_for_cp",
     "roll_packed_thd_left",
     "scatter_to_sequence_parallel",
     "split_packed_to_cp_local",

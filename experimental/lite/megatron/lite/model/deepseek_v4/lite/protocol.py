@@ -285,21 +285,30 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
 
 
 def _make_aux_loss_hook():
-    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main
+    """Per-step hook that syncs the auxiliary-loss backward scales to the main
     loss scale (DP size / gradient accumulation), mirroring the sibling protocols
     (kimi_k2 / glm5 / qwen3_5 / qwen3_moe).
 
-    DS4 only injects an MTP auxiliary loss: its MoE router is aux-loss-free
-    (``SigmoidTopKRouter(..., compute_aux_loss=False)``) and its CSA indexer runs
-    with ``sparse_loss=False``, so -- unlike GLM-5, which also scales the MoE-aux
-    and DSA-indexer losses -- only ``MTPLossAutoScaler`` needs scaling here.
+    The MTP auxiliary loss is the only one DS4 currently injects: its MoE router
+    is aux-loss-free (``SigmoidTopKRouter(..., compute_aux_loss=False)``), so no
+    ``MoEAuxLossAutoScaler`` scaling is needed (and none is added). Its CSA
+    indexer currently runs the fused path with ``sparse_loss=False`` and discards
+    the indexer loss, so ``DSAIndexerLossAutoScaler`` is *not yet* exercised; we
+    still set its scale here -- defensively and to keep the DSA-family hook
+    uniform with GLM-5 (``glm5/lite/protocol.py``) -- so that if the indexer
+    sparse loss is enabled later it is correctly weighted under nmb>1 rather than
+    keeping the class-default scale of 1.0. ``set_loss_scale`` is a cheap no-op on
+    the unused scaler today.
+
     Without this hook the injected MTP gradient keeps ``MTPLossAutoScaler``'s
     class-default scale of 1.0 and is mis-weighted relative to the main loss.
     """
+    from megatron.lite.primitive.modules.attention.dsa import DSAIndexerLossAutoScaler
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
         MTPLossAutoScaler.set_loss_scale(scale)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale)
 
     return hook
 
