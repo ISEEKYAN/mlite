@@ -1,0 +1,10 @@
+# Reference slime commit for the Megatron Lite slime example.
+#
+# The example needs slime's train-backend seam (the train-backend registry,
+# --train-backend-module loading, and registry-based actor/argument dispatch).
+# Until that seam is upstreamed to THUDM/slime, use the ISEEKYAN/slime fork:
+#
+#   git clone https://github.com/ISEEKYAN/slime.git
+#   git checkout 77037513d079b7ebfd0f070879cfd4de566aaac0  # or newer fork main with the seam
+#
+# slime @ git+https://github.com/ISEEKYAN/slime.git
