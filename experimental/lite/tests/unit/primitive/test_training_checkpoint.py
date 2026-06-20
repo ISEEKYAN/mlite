@@ -96,6 +96,44 @@ class FakeWrapper(torch.nn.Module):
         return super().load_state_dict(*args, **kwargs)
 
 
+class FakeMesh:
+    def __init__(self, shape: tuple[int, ...], name: str):
+        self.shape = shape
+        self.name = name
+
+
+class FakeDTensorParam:
+    def __init__(
+        self,
+        local_tensor: torch.Tensor,
+        *,
+        device_mesh,
+        placements,
+        shape=None,
+        full_tensor=None,
+    ):
+        self._local_tensor = local_tensor
+        self.device_mesh = device_mesh
+        self.placements = placements
+        self._shape = tuple(shape) if shape is not None else tuple(local_tensor.shape)
+        self._full_tensor = full_tensor
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def to_local(self):
+        return self._local_tensor
+
+    def stride(self):
+        return self._local_tensor.stride()
+
+    def full_tensor(self):
+        if self._full_tensor is None:
+            raise AssertionError("full_tensor was not expected")
+        return self._full_tensor
+
+
 DISTOPT_METADATA = {
     "distrib_optim_sharding_type": "fully_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
@@ -203,6 +241,107 @@ def test_dist_opt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
     )
 
     assert replica_id == (0, 0, 0)
+
+
+def test_dcp_dtensor_like_param_uses_checkpoint_mesh_and_placements(monkeypatch) -> None:
+    wrong_param_mesh = FakeMesh((1,), "fsdp2-param-mesh")
+    checkpoint_mesh = FakeMesh((1, 1, 2, 1), "checkpoint-expert-mesh")
+    checkpoint_placements = [Replicate(), Replicate(), Shard(0), Shard(0)]
+    local_tensor = torch.arange(32 * 128, dtype=torch.float32).reshape(32, 128)
+    param = FakeDTensorParam(local_tensor, device_mesh=wrong_param_mesh, placements=[Shard(0)])
+    calls: list[dict] = []
+
+    def fake_from_local(tensor, mesh, placements, **kwargs):
+        calls.append({"tensor": tensor, "mesh": mesh, "placements": placements, "kwargs": kwargs})
+        return {"wrapped": tensor}
+
+    monkeypatch.setattr(dcp.DTensor, "from_local", fake_from_local)
+
+    wrapped = dcp._dcp_tensor_from_param(param, checkpoint_mesh, checkpoint_placements)
+
+    assert torch.equal(wrapped["wrapped"], local_tensor)
+    assert calls[0]["mesh"] is checkpoint_mesh
+    assert calls[0]["placements"] is checkpoint_placements
+    assert calls[0]["kwargs"]["shape"] == (64, 128)
+    assert calls[0]["kwargs"]["stride"] == (128, 1)
+
+
+def test_dcp_dtensor_like_empty_param_expands_multiple_sharded_dims(monkeypatch) -> None:
+    checkpoint_mesh = FakeMesh((1, 1, 2, 2), "checkpoint-expert-mesh")
+    checkpoint_placements = [Replicate(), Replicate(), Shard(0), Shard(1)]
+    local_tensor = torch.empty(32, 64)
+    param = FakeDTensorParam(
+        local_tensor,
+        device_mesh=FakeMesh((1,), "fsdp2-param-mesh"),
+        placements=[Shard(0)],
+    )
+    calls: list[dict] = []
+
+    def fake_from_local(tensor, mesh, placements, **kwargs):
+        calls.append({"tensor": tensor, "mesh": mesh, "placements": placements, "kwargs": kwargs})
+        return {"wrapped": tensor}
+
+    monkeypatch.setattr(dcp.DTensor, "from_local", fake_from_local)
+
+    dcp._empty_dcp_tensor_like_param(param, checkpoint_mesh, checkpoint_placements)
+
+    assert calls[0]["mesh"] is checkpoint_mesh
+    assert calls[0]["placements"] is checkpoint_placements
+    assert calls[0]["tensor"].shape == local_tensor.shape
+    assert calls[0]["kwargs"]["shape"] == (64, 128)
+    assert calls[0]["kwargs"]["stride"] == (128, 1)
+
+
+def test_dcp_dtensor_like_unsharded_checkpoint_keeps_param_mesh(monkeypatch) -> None:
+    checkpoint_mesh = FakeMesh((1, 1, 1, 1), "checkpoint-dense-mesh")
+    checkpoint_placements = [Replicate(), Replicate(), Replicate(), Shard(0)]
+    param_mesh = FakeMesh((2,), "fsdp2-param-mesh")
+    param_placements = [Shard(0)]
+    param = FakeDTensorParam(
+        torch.empty(0),
+        device_mesh=param_mesh,
+        placements=param_placements,
+        shape=(1,),
+    )
+    calls: list[dict] = []
+
+    def fake_from_local(tensor, mesh, placements, **kwargs):
+        calls.append({"tensor": tensor, "mesh": mesh, "placements": placements, "kwargs": kwargs})
+        return {"wrapped": tensor}
+
+    monkeypatch.setattr(dcp.DTensor, "from_local", fake_from_local)
+
+    dcp._empty_dcp_tensor_like_param(param, checkpoint_mesh, checkpoint_placements)
+
+    assert calls[0]["mesh"] is param_mesh
+    assert calls[0]["placements"] is param_placements
+    assert calls[0]["kwargs"]["shape"] == (1,)
+    assert calls[0]["kwargs"]["stride"] == (1,)
+
+
+def test_dcp_dtensor_like_unsharded_save_does_not_materialize_full_tensor(monkeypatch) -> None:
+    checkpoint_mesh = FakeMesh((1, 1, 1, 1), "checkpoint-dense-mesh")
+    checkpoint_placements = [Replicate(), Replicate(), Replicate(), Shard(0)]
+    param_mesh = FakeMesh((2,), "fsdp2-param-mesh")
+    param = FakeDTensorParam(
+        torch.empty(0),
+        device_mesh=param_mesh,
+        placements=[Shard(0)],
+        shape=(1,),
+    )
+    calls: list[dict] = []
+
+    def fake_from_local(tensor, mesh, placements, **kwargs):
+        calls.append({"tensor": tensor, "mesh": mesh, "placements": placements, "kwargs": kwargs})
+        return {"wrapped": tensor}
+
+    monkeypatch.setattr(dcp.DTensor, "from_local", fake_from_local)
+
+    dcp._dcp_tensor_from_param(param, checkpoint_mesh, checkpoint_placements)
+
+    assert calls[0]["mesh"] is param_mesh
+    assert calls[0]["tensor"].numel() == 0
+    assert calls[0]["kwargs"]["shape"] == (1,)
 
 
 def test_dist_opt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> None:

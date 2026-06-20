@@ -67,6 +67,8 @@ def PLACEMENT_FN(param_name: str) -> list:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "down" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(1)]
+    if param_name.startswith("hc_head.") or ".hc_head." in param_name:
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
     if "embed" in param_name or "head" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     return [Replicate(), Replicate(), Replicate(), Replicate()]
