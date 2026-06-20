@@ -23,6 +23,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import os
 from importlib import import_module
 from typing import Callable, Optional, Tuple
 
@@ -38,6 +39,7 @@ _flash_mla_sparse_fwd = None
 _DSA = None
 _indexer_fwd_sm90: Optional[Callable] = None
 _indexer_fwd_sm100: Optional[Callable] = None
+_torch_sparse_attn_fallback_call_count = 0
 
 
 def _ensure_flash_mla():
@@ -195,6 +197,35 @@ def _select_indexer_forward(device):
     return None
 
 
+def _disable_arch_indexer_forward() -> bool:
+    return os.environ.get("MLITE_DSA_DISABLE_ARCH_INDEXER", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _indexer_topk_backend() -> str:
+    return os.environ.get("MLITE_DSA_INDEXER_TOPK_BACKEND", "").strip().lower()
+
+
+def _use_torch_indexer_topk_backend() -> bool:
+    return _indexer_topk_backend() in {"torch", "pytorch", "naive"}
+
+
+def _sparse_attn_backend() -> str:
+    return os.environ.get("MLITE_DSA_SPARSE_ATTN_BACKEND", "").strip().lower()
+
+
+def _use_torch_sparse_attn_backend() -> bool:
+    return _sparse_attn_backend() in {"torch", "pytorch", "naive"}
+
+
+def torch_sparse_attn_fallback_call_count() -> int:
+    return _torch_sparse_attn_fallback_call_count
+
+
 def _dsa_indexer_forward_wrapper(
     q: Tensor,
     k: Tensor,
@@ -209,7 +240,7 @@ def _dsa_indexer_forward_wrapper(
     max_seqlen_k: Optional[int] = None,
 ):
     """Route indexer forward to architecture-specific CuTe-DSL backends."""
-    if q.is_cuda:
+    if q.is_cuda and not _disable_arch_indexer_forward():
         indexer_fwd = _select_indexer_forward(q.device)
         if indexer_fwd is not None:
             return {
@@ -307,7 +338,7 @@ def build_flat_topk_idxs(
 
     topk_length_flat = None
     if compact:
-        if global_idxs.is_cuda:
+        if global_idxs.is_cuda and not _use_torch_indexer_topk_backend():
             # Fast path: single warp-per-row CuTe DSL kernel from cuDNN's DSA
             # namespace. Replaces a stable argsort + gather + sum + permute
             # chain with one global-load + global-store per element.
@@ -315,15 +346,20 @@ def build_flat_topk_idxs(
             res = _DSA.compactify_wrapper(global_idxs)
             global_idxs, topk_length_flat = res["indices"], res["topk_length"]
         else:
-            # CPU fallback so the unit tests that exercise this helper without
-            # CUDA still work. Production callers always go through the CUDA
-            # path above.
-            valid_mask = global_idxs >= 0
-            sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
-            global_idxs = global_idxs.gather(-1, sorted_indices)
-            topk_length_flat = valid_mask.sum(dim=-1).int()
+            # CPU fallback, and explicit CUDA fallback for environments that
+            # set MLITE_DSA_INDEXER_TOPK_BACKEND=torch to bypass missing cudnn
+            # DSA helper namespaces in smoke tests.
+            global_idxs, topk_length_flat = _torch_compact_global_topk_idxs(global_idxs)
 
     return global_idxs, topk_length_flat
+
+
+def _torch_compact_global_topk_idxs(global_idxs: Tensor) -> Tuple[Tensor, Tensor]:
+    valid_mask = global_idxs >= 0
+    sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
+    compacted = global_idxs.gather(-1, sorted_indices)
+    topk_length = valid_mask.sum(dim=-1).int()
+    return compacted, topk_length
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +425,96 @@ class SparseAttnFunc(torch.autograd.Function):
         return dq, dkv, d_sink, None, None, None, None, None
 
 
+def _torch_dsa_sparse_attn_fwd(
+    q: Tensor,
+    kv: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[Tensor] = None,
+    topk_length: Optional[Tensor] = None,
+    indexer_topk: int = 0,
+    d_v: Optional[int] = None,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Reference sparse-attention forward used only for smoke/layout gates."""
+    if indexer_topk > 0:
+        raise NotImplementedError(
+            "MLITE_DSA_SPARSE_ATTN_BACKEND=torch supports forward-only sparse "
+            "attention with indexer_topk=0; fused indexer-loss training still "
+            "requires FlashMLA/cuDNN DSA."
+        )
+
+    total_sq, num_heads, head_dim = q.shape
+    total_skv, kv_dim = kv.shape
+    if kv_dim != head_dim:
+        raise ValueError(
+            "DSA torch sparse-attention fallback expects q and kv key dims to match, "
+            f"got q={tuple(q.shape)}, kv={tuple(kv.shape)}."
+        )
+    if topk_idxs.dim() != 2 or topk_idxs.shape[0] != total_sq:
+        raise ValueError(
+            "DSA torch sparse-attention fallback expects topk_idxs=(total_sq, topk), "
+            f"got q={tuple(q.shape)}, topk_idxs={tuple(topk_idxs.shape)}."
+        )
+    value_dim = 512 if d_v is None else int(d_v)
+    if value_dim < 1 or value_dim > kv_dim:
+        raise ValueError(
+            f"DSA torch sparse-attention fallback value dim must be in [1, {kv_dim}], "
+            f"got {value_dim}."
+        )
+    if total_skv <= 0:
+        raise ValueError("DSA torch sparse-attention fallback requires at least one KV row.")
+
+    topk = topk_idxs.shape[-1]
+    valid = (topk_idxs >= 0) & (topk_idxs < total_skv)
+    if topk_length is not None:
+        if topk_length.shape != (total_sq,):
+            raise ValueError(
+                "DSA torch sparse-attention fallback expects topk_length=(total_sq,), "
+                f"got {tuple(topk_length.shape)} for total_sq={total_sq}."
+            )
+        positions = torch.arange(topk, device=topk_idxs.device).view(1, topk)
+        valid = valid & (positions < topk_length.to(device=topk_idxs.device).long().view(-1, 1))
+
+    safe_idxs = topk_idxs.to(device=kv.device).clamp(min=0, max=total_skv - 1).long()
+    gathered = kv.index_select(0, safe_idxs.reshape(-1)).reshape(total_sq, topk, kv_dim)
+    gathered_keys = gathered
+    gathered_values = gathered[..., :value_dim]
+
+    logits = torch.einsum("nhd,nkd->nhk", q.float(), gathered_keys.float()) * float(
+        softmax_scale
+    )
+    logits = logits.masked_fill(~valid.to(device=logits.device).view(total_sq, 1, topk), -torch.inf)
+
+    sink_present = attn_sink is not None
+    if sink_present:
+        if attn_sink.shape != (num_heads,):
+            raise ValueError(
+                "DSA torch sparse-attention fallback expects attn_sink=(num_heads,), "
+                f"got {tuple(attn_sink.shape)} for num_heads={num_heads}."
+            )
+        sink_logits = attn_sink.to(device=logits.device, dtype=torch.float32).view(1, num_heads, 1)
+        logits_with_sink = torch.cat(
+            [sink_logits.expand(total_sq, num_heads, 1), logits], dim=-1
+        )
+    else:
+        logits_with_sink = logits
+
+    lse = torch.logsumexp(logits_with_sink, dim=-1)
+    row_has_finite = torch.isfinite(lse)
+    safe_logits = torch.where(
+        row_has_finite.unsqueeze(-1),
+        logits_with_sink,
+        torch.zeros_like(logits_with_sink),
+    )
+    probs = torch.softmax(safe_logits, dim=-1)
+    probs = torch.where(row_has_finite.unsqueeze(-1), probs, torch.zeros_like(probs))
+    value_probs = probs[..., 1:] if sink_present else probs
+
+    out = torch.einsum("nhk,nkv->nhv", value_probs, gathered_values.float()).to(q.dtype)
+    return out, lse, None
+
+
 def dsa_sparse_attn(
     query: Tensor,
     kv: Tensor,
@@ -424,9 +550,30 @@ def dsa_sparse_attn(
     q_flat = query.reshape(sq * b, np_, d)
     kv_flat = kv.reshape(skv * b, d)
 
-    out_flat, _lse, _lse_indexer = SparseAttnFunc.apply(
-        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk, value_dim
-    )
+    if _use_torch_sparse_attn_backend():
+        global _torch_sparse_attn_fallback_call_count
+        _torch_sparse_attn_fallback_call_count += 1
+        out_flat, _lse, _lse_indexer = _torch_dsa_sparse_attn_fwd(
+            q_flat,
+            kv_flat,
+            topk_idxs,
+            softmax_scale,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=indexer_topk,
+            d_v=value_dim,
+        )
+    else:
+        out_flat, _lse, _lse_indexer = SparseAttnFunc.apply(
+            q_flat,
+            kv_flat,
+            attn_sink,
+            topk_idxs,
+            topk_length,
+            softmax_scale,
+            indexer_topk,
+            value_dim,
+        )
 
     d_v = out_flat.shape[-1]
     return out_flat.reshape(sq, b, np_, d_v).reshape(sq, b, np_ * d_v)
@@ -464,6 +611,9 @@ def _indexer_topk_bshd(
           :attr:`cudnn.DSA.indexer_forward_wrapper` with ``-inf`` on
           causally-masked positions.
     """
+    if _indexer_topk_backend() in {"torch", "pytorch", "naive"}:
+        return _torch_indexer_topk_bshd(q_bshd, k_bsd, w_bsh, topk, ratio)
+
     _ensure_dsa_namespace()
 
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -495,6 +645,54 @@ def _indexer_topk_bshd(
 
     topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (b, sq)
     return topk_indices.int(), topk_length, scores
+
+
+def _torch_indexer_topk_bshd(
+    q_bshd: Tensor, k_bsd: Tensor, w_bsh: Tensor, topk: int, ratio: int = 4
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Reference torch indexer top-k path for correctness smokes.
+
+    This mirrors the Megatron-Core DSA naive fallback shape contract and is
+    selected only with ``MLITE_DSA_INDEXER_TOPK_BACKEND=torch``.
+    """
+    b, sq, idx_nh, idx_hd = q_bshd.shape
+    bk, sk, k_hd = k_bsd.shape
+    if bk != b or k_hd != idx_hd:
+        raise ValueError(
+            "DSA torch indexer fallback expected q=(B,S,H,D), k=(B,K,D), "
+            f"got q={tuple(q_bshd.shape)}, k={tuple(k_bsd.shape)}."
+        )
+    if w_bsh.shape != (b, sq, idx_nh):
+        raise ValueError(
+            "DSA torch indexer fallback expected weights=(B,S,H), "
+            f"got q={tuple(q_bshd.shape)}, weights={tuple(w_bsh.shape)}."
+        )
+    if ratio < 1:
+        raise ValueError(f"ratio must be >= 1, got {ratio}.")
+
+    logits = torch.einsum("bqhd,bkd->bqhk", q_bshd.float(), k_bsd.float())
+    scores = (torch.relu(logits) * w_bsh.float().unsqueeze(-1)).sum(dim=2)
+
+    q_idx = torch.arange(sq, device=q_bshd.device)
+    valid_per_q = ((q_idx + 1) // ratio).clamp(max=sk).to(torch.int64)
+    key_idx = torch.arange(sk, device=q_bshd.device).view(1, 1, sk)
+    valid = key_idx < valid_per_q.view(1, sq, 1)
+    scores = scores.masked_fill(~valid, float("-inf"))
+
+    topk_k = min(topk, sk)
+    if topk_k > 0:
+        topk_scores, topk_indices = torch.topk(scores, k=topk_k, dim=-1)
+        topk_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
+    else:
+        topk_indices = torch.empty(b, sq, 0, device=q_bshd.device, dtype=torch.long)
+
+    if topk_k < topk:
+        pad = torch.full((b, sq, topk - topk_k), -1, dtype=torch.long, device=q_bshd.device)
+        topk_indices = torch.cat([topk_indices, pad], dim=-1)
+
+    topk_indices = topk_indices.to(torch.int32)
+    topk_length = (topk_indices >= 0).sum(dim=-1).int()
+    return topk_indices, topk_length, scores
 
 
 def _sbhd_to_bshd_indexer_inputs(
@@ -1141,6 +1339,7 @@ __all__ = [
     "build_flat_topk_idxs",
     "local_to_global_flat",
     "dsa_sparse_attn",
+    "torch_sparse_attn_fallback_call_count",
     "indexer_topk",
     "fused_indexer_sparse_attn",
 ]
