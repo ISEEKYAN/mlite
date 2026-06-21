@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import random
 from collections.abc import Iterable
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -284,10 +285,11 @@ def _is_dtensor_like(tensor: Any) -> bool:
 def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
     local_tensor = _to_local_tensor(param).detach()
     if _is_dtensor_like(param):
+        placements = _merge_dtensor_param_shards_into_checkpoint_placements(param, mesh, placements)
         if not _checkpoint_has_real_shard(mesh, placements):
             return _dtensor_from_dtensor_like_param(param, local_tensor)
         global_shape = _global_shape_from_checkpoint_placements(
-            param, local_tensor, mesh, placements
+            param, local_tensor, mesh, placements, use_param_logical_shape=False
         )
         return _dtensor_from_checkpoint_local(local_tensor, mesh, placements, global_shape)
     return DTensor.from_local(local_tensor, mesh, placements)
@@ -299,10 +301,11 @@ def _empty_dcp_tensor_like_param(
     param_local_tensor = _to_local_tensor(param)
     local_tensor = torch.empty_like(param_local_tensor)
     if _is_dtensor_like(param):
+        placements = _merge_dtensor_param_shards_into_checkpoint_placements(param, mesh, placements)
         if not _checkpoint_has_real_shard(mesh, placements):
             return _dtensor_from_dtensor_like_param(param, local_tensor)
         global_shape = _global_shape_from_checkpoint_placements(
-            param, param_local_tensor, mesh, placements
+            param, param_local_tensor, mesh, placements, use_param_logical_shape=False
         )
         return _dtensor_from_checkpoint_local(local_tensor, mesh, placements, global_shape)
     return DTensor.from_local(local_tensor, mesh, placements)
@@ -334,14 +337,16 @@ def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Te
 
 
 def _global_shape_from_checkpoint_placements(
-    param: torch.Tensor, local_tensor: torch.Tensor, mesh: DeviceMesh, placements: list
+    param: torch.Tensor,
+    local_tensor: torch.Tensor,
+    mesh: DeviceMesh,
+    placements: list,
+    *,
+    use_param_logical_shape: bool = True,
 ) -> tuple[int, ...]:
     local_shape = tuple(int(dim) for dim in local_tensor.shape)
-    logical_shape = _logical_shape_from_param(param, local_shape)
-    if logical_shape is not None and logical_shape != local_shape:
-        return logical_shape
-
-    shape = list(local_shape)
+    logical_shape = _logical_shape_from_param(param, local_shape) if use_param_logical_shape else None
+    shape = list(logical_shape or local_shape)
     for mesh_axis, placement in enumerate(placements):
         shard_dim = _placement_shard_dim(placement)
         if shard_dim is None:
@@ -354,6 +359,139 @@ def _global_shape_from_checkpoint_placements(
             )
         shape[shard_dim] *= _mesh_dim_size(mesh, mesh_axis)
     return tuple(shape)
+
+
+def _merge_dtensor_param_shards_into_checkpoint_placements(
+    param: torch.Tensor,
+    mesh: DeviceMesh,
+    placements: list,
+) -> list:
+    """Preserve FSDP2 DTensor shards when adding model-parallel checkpoint shards.
+
+    FSDP2 expert parameters are already DTensors over the expert-DP axis.  The
+    model-specific checkpoint placements describe orthogonal EP/ETP/TP shards,
+    so a checkpoint mesh axis that corresponds to the param's FSDP mesh must not
+    remain Replicate().  Otherwise DCP treats different expert-DP shards as
+    replicas and may restore the wrong local tensor at world_size > EP.
+    """
+    if not _checkpoint_has_real_shard(mesh, placements):
+        return placements
+
+    param_placements = list(getattr(param, "placements", ()) or ())
+    if not param_placements:
+        return placements
+    checkpoint_axis = _checkpoint_axis_for_param_mesh(param, mesh, placements)
+    if checkpoint_axis is None:
+        return placements
+
+    merged = list(placements)
+    param_shards = [placement for placement in param_placements if _placement_shard_dim(placement) is not None]
+    if not param_shards:
+        return placements
+    if _placement_shard_dim(merged[checkpoint_axis]) is None:
+        # FSDP2 in MLite uses a 1D mesh today.  If this ever changes, keeping the
+        # first shard is still safer than silently pretending the axis replicates.
+        merged[checkpoint_axis] = param_shards[0]
+    return merged
+
+
+def _checkpoint_axis_for_param_mesh(
+    param: torch.Tensor,
+    mesh: DeviceMesh,
+    placements: list,
+) -> int | None:
+    param_mesh_values = _mesh_values_1d(getattr(param, "device_mesh", None))
+    if not param_mesh_values:
+        return None
+
+    checkpoint_values = _mesh_values_nd(mesh)
+    if checkpoint_values is not None:
+        for axis in range(len(placements)):
+            if _placement_shard_dim(placements[axis]) is not None:
+                continue
+            if _mesh_axis_has_line(checkpoint_values, axis, param_mesh_values):
+                return axis
+
+    param_mesh_shape = getattr(getattr(param, "device_mesh", None), "shape", None)
+    if callable(param_mesh_shape):
+        param_mesh_shape = param_mesh_shape()
+    if not param_mesh_shape:
+        return None
+    param_mesh_size = int(param_mesh_shape[0])
+    matches = [
+        axis
+        for axis in range(len(placements))
+        if _placement_shard_dim(placements[axis]) is None
+        and _mesh_dim_size(mesh, axis) == param_mesh_size
+        and param_mesh_size > 1
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _mesh_values_1d(mesh: Any) -> list[int] | None:
+    values = _mesh_values_nd(mesh)
+    if values is None:
+        return None
+    return _flatten_mesh_values(values)
+
+
+def _mesh_values_nd(mesh: Any) -> Any | None:
+    if mesh is None:
+        return None
+    mesh_tensor = getattr(mesh, "mesh", None)
+    if isinstance(mesh_tensor, torch.Tensor):
+        return mesh_tensor.detach().cpu().tolist()
+    values = getattr(mesh, "values", None)
+    if values is not None:
+        return values
+    return None
+
+
+def _mesh_axis_has_line(values: Any, axis: int, target: list[int]) -> bool:
+    for line in _mesh_axis_lines(values, axis):
+        if line == target:
+            return True
+    return False
+
+
+def _mesh_axis_lines(values: Any, axis: int) -> list[list[int]]:
+    shape = _nested_mesh_shape(values)
+    if axis < 0 or axis >= len(shape):
+        return []
+    other_axes = [idx for idx in range(len(shape)) if idx != axis]
+    lines: list[list[int]] = []
+    for other_indices in product(*(range(shape[idx]) for idx in other_axes)):
+        base: dict[int, int] = dict(zip(other_axes, other_indices, strict=True))
+        line = []
+        for axis_idx in range(shape[axis]):
+            full_index = [base.get(idx, axis_idx) for idx in range(len(shape))]
+            line.append(_nested_mesh_get(values, full_index))
+        lines.append(line)
+    return lines
+
+
+def _nested_mesh_shape(values: Any) -> list[int]:
+    if not isinstance(values, list):
+        return []
+    if not values:
+        return [0]
+    return [len(values), *_nested_mesh_shape(values[0])]
+
+
+def _nested_mesh_get(values: Any, index: list[int]) -> int:
+    current = values
+    for idx in index:
+        current = current[idx]
+    return int(current)
+
+
+def _flatten_mesh_values(values: Any) -> list[int]:
+    if isinstance(values, list):
+        out: list[int] = []
+        for item in values:
+            out.extend(_flatten_mesh_values(item))
+        return out
+    return [int(values)]
 
 
 def _logical_shape_from_param(
