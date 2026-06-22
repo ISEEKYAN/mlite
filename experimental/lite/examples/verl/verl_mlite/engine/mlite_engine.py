@@ -26,6 +26,13 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import load_verl_engine_api
 
+try:
+    # Recent VERL wraps per-step metric values in a Metric aggregator that
+    # reduce_metrics() knows how to fold; older VERL expects list-of-scalars.
+    from verl.utils.metric import Metric as _VerlMetric
+except Exception:  # pragma: no cover - older VERL without Metric
+    _VerlMetric = None
+
 from .config import MegatronLiteEngineConfig
 
 BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
@@ -680,7 +687,14 @@ class MegatronLiteEngine(BaseEngine):
         return {
             "model_output": {},
             "loss": [loss],
-            "metrics": {key: [value] for key, value in metrics.items()},
+            # Pass Metric aggregators through unchanged (reduce_metrics folds them);
+            # list-wrap plain scalars as the legacy contract expects.
+            "metrics": {
+                key: value
+                if (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                else [value]
+                for key, value in metrics.items()
+            },
         }
 
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
