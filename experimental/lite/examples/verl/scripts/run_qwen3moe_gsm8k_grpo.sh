@@ -235,7 +235,7 @@ fi
 # otherwise the ref worker falls back to the FSDP engine config and mlite's
 # get_data_parallel_size() raises AttributeError on the missing `tp` field. Left
 # off the default path so KL-free GRPO never composes the ref override.
-if [[ "${USE_KL_LOSS:-False}" == "True" || "${USE_KL_IN_REWARD:-False}" == "True" ]]; then
+if [[ "${USE_KL_LOSS:-False}" =~ ^(True|true|1)$ || "${USE_KL_IN_REWARD:-False}" =~ ^(True|true|1)$ ]]; then
   ACTOR+=("ref@actor_rollout_ref.ref=mlite_ref")
 fi
 
