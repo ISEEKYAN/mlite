@@ -123,7 +123,22 @@ def save_safetensors(
     tensors: dict[str, torch.Tensor], path: str, filename: str = "model.safetensors"
 ) -> None:
     os.makedirs(path, exist_ok=True)
-    _safe_save(tensors, os.path.join(path, filename))
+    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        local_tensor = getattr(tensor, "_local_tensor", None)
+        if isinstance(local_tensor, torch.Tensor):
+            return local_tensor
+        to_local = getattr(tensor, "to_local", None)
+        if callable(to_local):
+            local = to_local()
+            if isinstance(local, torch.Tensor):
+                return local
+        return tensor
+
+    materialized = {
+        name: _local_tensor(tensor).detach().to(device="cpu").contiguous().clone()
+        for name, tensor in tensors.items()
+    }
+    _safe_save(materialized, os.path.join(path, filename))
 
 
 def _resolve_export_dtype(export_dtype: str | torch.dtype | None) -> torch.dtype | None:

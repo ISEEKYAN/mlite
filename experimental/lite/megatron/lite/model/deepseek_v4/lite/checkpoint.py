@@ -89,6 +89,60 @@ _TOP_LEVEL = {
     "lm_head.col.linear.weight": "head.weight",
 }
 
+_LEGACY_TOP_LEVEL = {
+    "embed_tokens.embedding.weight": "model.embed_tokens.weight",
+    "norm.weight": "model.norm.weight",
+    "hc_head.hc_fn": "model.hc_head.hc_fn",
+    "hc_head.hc_base": "model.hc_head.hc_base",
+    "hc_head.hc_scale": "model.hc_head.hc_scale",
+    "lm_head.col.linear.weight": "head.weight",
+}
+
+_LEGACY_ATTENTION_SUBS = {
+    "wq_a": "q_a_proj",
+    "q_norm": "q_a_norm",
+    "wq_b": "q_b_proj",
+    "wkv": "kv_proj",
+    "kv_norm": "kv_norm",
+    "wo_a": "o_a_proj",
+    "wo_b": "o_b_proj",
+}
+
+_LEGACY_COMPRESSOR_SUBS = {
+    "wkv": "kv_proj",
+    "wgate": "gate_proj",
+    "ape": "position_bias",
+    "norm": "kv_norm",
+}
+
+
+def _replace_legacy_prefix(sub: str, mapping: dict[str, str]) -> str | None:
+    for source, target in mapping.items():
+        if sub == source:
+            return target
+        if sub.startswith(f"{source}."):
+            return f"{target}.{sub.removeprefix(source + '.')}"
+    return None
+
+
+def _legacy_attention_sub(sub: str) -> str:
+    if sub == "sinks":
+        return "sinks"
+    if sub.startswith("indexer.compressor."):
+        inner = sub.removeprefix("indexer.compressor.")
+        mapped = _replace_legacy_prefix(inner, _LEGACY_COMPRESSOR_SUBS)
+        return f"compressor.indexer.{mapped or inner}"
+    if sub.startswith("indexer."):
+        inner = sub.removeprefix("indexer.")
+        mapped = _replace_legacy_prefix(inner, {"wq_b": "q_b_proj"})
+        return f"compressor.indexer.{mapped or inner}"
+    if sub.startswith("compressor."):
+        inner = sub.removeprefix("compressor.")
+        mapped = _replace_legacy_prefix(inner, _LEGACY_COMPRESSOR_SUBS)
+        return f"compressor.{mapped or inner}"
+    mapped = _replace_legacy_prefix(sub, _LEGACY_ATTENTION_SUBS)
+    return mapped or sub
+
 
 def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
     """Map a native per-block attr -> real V4-Flash suffix (relative to layers.N / mtp.N)."""
@@ -139,6 +193,57 @@ def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
     return None
 
 
+def _legacy_map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
+    """Map native per-block attrs to the model-rooted toy/HF layout.
+
+    The canonical DS4 Flash export path uses bare ``layers.N.attn.*`` /
+    ``ffn.*`` names.  Some existing test checkpoints, including the current toy
+    checkpoint used by P1/P2, use an older model-rooted layout such as
+    ``model.layers.N.self_attn.*`` and ``model.layers.N.mlp.*``.  Keep export
+    canonical, but accept these names on load so existing checkpoints remain
+    useful as parity gates.
+    """
+    if attr == "input_layernorm.weight":
+        return "input_layernorm.weight"
+    if attr == "post_attention_layernorm.weight":
+        return "post_attention_layernorm.weight"
+    sub = None
+    if attr.startswith("self_attn.self_attn."):
+        sub = attr.removeprefix("self_attn.self_attn.")
+    elif attr.startswith("self_attn."):
+        sub = attr.removeprefix("self_attn.")
+    if sub is not None:
+        return f"self_attn.{_legacy_attention_sub(sub)}"
+    if attr.startswith("mlp.gate."):
+        suffix = attr.removeprefix("mlp.gate.")
+        return "mlp.gate." + {
+            "gate.weight": "weight",
+            "weight": "weight",
+            "expert_bias": "e_score_correction_bias",
+            "e_score_correction_bias": "e_score_correction_bias",
+            "tid2eid": "tid2eid",
+        }.get(suffix, suffix)
+    if attr.startswith("mlp.shared_experts."):
+        proj = attr.removeprefix("mlp.shared_experts.").removesuffix(".weight")
+        if proj == "gate_up":
+            return "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight"
+        if proj == "down":
+            return "mlp.shared_experts.down_proj.weight"
+        return f"mlp.shared_experts.{proj}.weight"
+    for prefix in ("attn_hc", "ffn_hc"):
+        if attr.startswith(f"{prefix}."):
+            return f"{prefix}.{attr.rsplit('.', 1)[-1]}"
+    if block == "mtp" and attr in {
+        "e_proj.weight",
+        "h_proj.weight",
+        "enorm.weight",
+        "hnorm.weight",
+        "norm.weight",
+    }:
+        return attr
+    return None
+
+
 def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: ParallelState) -> int:
     num_local = ensure_divisible(config.n_routed_experts, ps.ep_size)
     return ps.ep_rank * num_local + local_idx
@@ -173,6 +278,48 @@ def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     if fc == "1":
         return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
     return [f"{expert_prefix}.w2.weight"]
+
+
+def _legacy_hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
+    """Map a native key to accepted legacy/model-rooted load names."""
+    mapped = _LEGACY_TOP_LEVEL.get(name)
+    if mapped is not None:
+        return [mapped]
+    match = _BLOCK_KEY_RE.match(name)
+    if match is None:
+        return []
+    block, index, attr = match.groups()
+    prefix = f"model.layers.{index}" if block == "layers" else f"model.mtp.{index}"
+    mapped = _legacy_map_block_attr(attr, block)
+    if mapped is not None:
+        if isinstance(mapped, tuple):
+            return [f"{prefix}.{part}" for part in mapped]
+        return [f"{prefix}.{mapped}"]
+    expert = _GROUPED_EXPERT_RE.match(attr)
+    if expert is None:
+        return []
+    fc, expert_id = expert.groups()
+    expert_prefix = f"{prefix}.mlp.experts.{int(expert_id)}"
+    if fc == "1":
+        return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
+    return [f"{expert_prefix}.w2.weight"]
+
+
+def _hf_name_groups_for_state_key(name: str, config: DeepseekV4Config) -> list[list[str]]:
+    """Return alternative HF name groups for loading.
+
+    Each inner list is a required group: fused native tensors still need both
+    gate/up source tensors.  Groups are tried in order, with canonical V4 Flash
+    names first and legacy toy/model-rooted names second.
+    """
+    groups: list[list[str]] = []
+    canonical = _hf_names_for_state_key(name, config)
+    if canonical:
+        groups.append(canonical)
+    legacy = _legacy_hf_names_for_state_key(name, config)
+    if legacy and legacy not in groups:
+        groups.append(legacy)
+    return groups
 
 
 # ======================================================================
@@ -331,8 +478,14 @@ def load_hf_weights(
         if _is_native_metadata_key(name):
             continue
         global_name = to_global_layer_name(name, layer_map)
-        hf_names = _hf_names_for_state_key(_to_global_expert_name(global_name, config, ps), config)
-        if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
+        candidate_groups = _hf_name_groups_for_state_key(
+            _to_global_expert_name(global_name, config, ps), config
+        )
+        hf_names = next(
+            (group for group in candidate_groups if all(_has(reader, hf_name) for hf_name in group)),
+            [],
+        )
+        if not hf_names:
             missing.append(name)
             continue
         if len(hf_names) == 2:
