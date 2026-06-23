@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Rollout-data conversion for the slime-family MLite actor."""
+"""Rollout-data conversion for the miles MLite actor."""
 
 from __future__ import annotations
 
@@ -17,16 +17,16 @@ class RuntimeMicroBatch:
     runtime_batch: PackedBatch
     source_batch: dict[str, Any]
 
-    def as_runtime_item(self):
-        return (
-            self.runtime_batch,
-            LossContext(
-                temperature=float(self.source_batch.get("temperature", 1.0)),
-                calculate_entropy=bool(self.source_batch.get("calculate_entropy", False)),
-                return_log_probs=True,
-                source_batch=self.source_batch,
-            ),
+    def loss_context(self) -> LossContext:
+        return LossContext(
+            temperature=float(self.source_batch.get("temperature", 1.0)),
+            calculate_entropy=bool(self.source_batch.get("calculate_entropy", False)),
+            return_log_probs=True,
+            source_batch=self.source_batch,
         )
+
+    def as_runtime_item(self):
+        return self.runtime_batch
 
 
 def _as_tensor_list(values, *, dtype, device) -> list[torch.Tensor]:

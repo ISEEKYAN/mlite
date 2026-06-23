@@ -1,23 +1,26 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Monkeypatch slime-family Megatron train actors to use Megatron Lite.
+"""Monkeypatch the miles Megatron train actor to use Megatron Lite.
 
-The supported family members (slime, miles, vime) choose their train actor by a
-function-local import of ``<pkg>.backends.megatron_utils.actor.MegatronTrainRayActor``.
-Replacing that source symbol before actor-group construction lets examples use
-the existing ``--train-backend megatron`` slot without changing fork code or CLI
-choices.
+miles chooses its train actor by a function-local import of
+``miles.backends.megatron_utils.actor.MegatronTrainRayActor``. Replacing that
+source symbol before actor-group construction lets the example use the existing
+``--train-backend megatron`` slot without changing miles code or CLI choices.
 """
 
 from __future__ import annotations
 
 import importlib
 import logging
+import os
+import shutil
 import sys
 from argparse import Namespace
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import torch
+from miles.ray.train_actor import TrainRayActor as _MilesTrainRayActor
 
 from .arguments import optimizer_backend_to_impl, validate_mlite_args
 from .data import build_runtime_microbatches
@@ -26,17 +29,97 @@ from .weight_update import RawHFWeightUpdater
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PACKAGES = ("slime", "miles", "vime")
-MLiteTrainRayActor = None
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _barrier() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _iter_local_parameters(handle):
+    model_chunks = handle._extras.get("model_chunks", [handle._model])
+    for chunk_id, chunk in enumerate(model_chunks):
+        for name, param in chunk.named_parameters():
+            yield f"{chunk_id}:{name}", param
+
+
+def _install_set_input_tensor_proxy(handle) -> None:
+    for chunk in handle._extras.get("model_chunks", [handle._model]):
+        if hasattr(chunk, "set_input_tensor"):
+            continue
+        module = getattr(chunk, "module", None)
+        setter = getattr(module, "set_input_tensor", None)
+        if not callable(setter):
+            continue
+        try:
+            setattr(chunk, "set_input_tensor", setter)
+        except Exception:
+            object.__setattr__(chunk, "set_input_tensor", setter)
+
+
+def _capture_checkpoint_probe(handle):
+    fallback = None
+    for key, param in _iter_local_parameters(handle):
+        if fallback is None:
+            fallback = (key, param)
+        if "norm" in key and param.numel() <= 1_000_000:
+            return key, param.detach().float().cpu().clone()
+    if fallback is None:
+        return None, None
+    key, param = fallback
+    return key, param.detach().float().cpu().clone()
+
+
+def _find_local_parameter(handle, key: str):
+    for candidate_key, param in _iter_local_parameters(handle):
+        if candidate_key == key:
+            return param
+    return None
+
+
+def _clear_checkpoint_contents(path: str) -> None:
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    for child in root.iterdir():
+        if child.name == "ray_done":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _looks_like_mlite_checkpoint(path: str) -> bool:
+    root = Path(path)
+    if root.name.startswith("step_"):
+        return (root / "metadata.json").exists() or (root / "common.pt").exists()
+    if not root.is_dir():
+        return False
+    for child in root.iterdir():
+        if child.name.startswith("step_") and child.is_dir():
+            return True
+    return (root / "metadata.json").exists() or (root / "common.pt").exists()
 
 
 def _group(rank: int, size: int, group):
     return SimpleNamespace(rank=rank, size=size, group=group, gloo_group=None)
 
 
-def _install_family_parallel_state(pkg: str, ps) -> None:
+def _install_miles_parallel_state(ps) -> None:
     try:
-        parallel_mod = importlib.import_module(f"{pkg}.backends.training_utils.parallel")
+        parallel_mod = importlib.import_module("miles.backends.training_utils.parallel")
     except ImportError:
         return
     state = parallel_mod.ParallelState(
@@ -56,8 +139,6 @@ def _install_family_parallel_state(pkg: str, ps) -> None:
 
 
 class _MLiteTrainRayActorMixin:
-    _slime_family_pkg: str
-
     def _build_mlite_config(self, args: Namespace):
         from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
         from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
@@ -116,7 +197,7 @@ class _MLiteTrainRayActorMixin:
     ) -> int | None:
         super().init(args, role, with_ref, with_opd_teacher=with_opd_teacher)
         if role != "actor":
-            raise NotImplementedError("Megatron Lite slime-family backend supports actor training only.")
+            raise NotImplementedError("Megatron Lite miles backend supports actor training only.")
         if with_ref or with_opd_teacher:
             raise NotImplementedError("Reference/teacher model swapping is not implemented for the MLite patch.")
 
@@ -131,30 +212,51 @@ class _MLiteTrainRayActorMixin:
             RuntimeConfig(backend="mlite", hf_path=args.hf_checkpoint, backend_cfg=self._cfg)
         )
         self.handle = self.runtime.build_model()
+        _install_set_input_tensor_proxy(self.handle)
 
         ps = self.handle._parallel_state
-        _install_family_parallel_state(self._slime_family_pkg, ps)
+        _install_miles_parallel_state(ps)
         self.train_parallel_config = {
             "dp_size": ps.dp_size,
             "cp_size": ps.cp_size,
             "vpp_size": self._cfg.parallel.vpp or 1,
             "microbatch_group_size_per_vp_stage": 1,
         }
-        self.weight_updater = RawHFWeightUpdater(
-            args, self.runtime, self.handle, family_pkg=self._slime_family_pkg
-        )
+        self.weight_updater = RawHFWeightUpdater(args, self.runtime, self.handle)
 
         start_rollout_id = 0
         if getattr(args, "load", None):
-            loaded = self.runtime.load_checkpoint(self.handle, args.load)
-            start_rollout_id = int(loaded) + 1
+            if _looks_like_mlite_checkpoint(args.load):
+                loaded = self.runtime.load_checkpoint(
+                    self.handle,
+                    args.load,
+                    load_optimizer=_env_flag("MLITE_LOAD_OPTIMIZER_CHECKPOINT", False),
+                    load_rng=_env_flag("MLITE_LOAD_RNG_CHECKPOINT", False),
+                )
+                if _env_flag("MLITE_RESET_ROLLOUT_AFTER_LOAD", False):
+                    start_rollout_id = 0
+                else:
+                    start_rollout_id = int(loaded) + 1
+                if _rank() == 0:
+                    logger.info(
+                        "MLITE_MILES_GRPO_INITIAL_LOAD_DONE path=%s loaded_step=%s start_rollout_id=%s",
+                        args.load,
+                        loaded,
+                        start_rollout_id,
+                    )
+            else:
+                if _rank() == 0:
+                    logger.info(
+                        "MLITE_MILES_GRPO_INITIAL_LOAD_SKIPPED path=%s reason=not_mlite_checkpoint",
+                        args.load,
+                    )
 
         if getattr(args, "offload_train", False) or getattr(args, "mlite_param_offload", False):
             self.sleep()
         return start_rollout_id
 
     def _process_rollout_data(self, rollout_data_ref):
-        data_mod = importlib.import_module(f"{self._slime_family_pkg}.utils.data")
+        data_mod = importlib.import_module("miles.utils.data")
         ps = self.handle._parallel_state
         rollout_data = data_mod.process_rollout_data(self.args, rollout_data_ref, ps.dp_rank, ps.dp_size)
         rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long) for t in rollout_data["tokens"]]
@@ -169,7 +271,7 @@ class _MLiteTrainRayActorMixin:
         return rollout_data
 
     def _compute_advantages_and_returns(self, rollout_data) -> None:
-        loss_mod = importlib.import_module(f"{self._slime_family_pkg}.backends.training_utils.loss")
+        loss_mod = importlib.import_module("miles.backends.training_utils.loss")
         loss_mod.compute_advantages_and_returns(self.args, rollout_data)
 
     def _build_microbatches(self, rollout_data, *, calculate_entropy: bool = False):
@@ -182,7 +284,7 @@ class _MLiteTrainRayActorMixin:
             temperature=float(getattr(self.args, "rollout_temperature", 1.0) or 1.0),
         )
 
-    def _compute_log_probs(self, rollout_data) -> list[torch.Tensor]:
+    def _compute_log_probs(self, rollout_data) -> list[torch.Tensor] | None:
         microbatches = self._build_microbatches(
             rollout_data,
             calculate_entropy=bool(getattr(self.args, "use_rollout_entropy", False)),
@@ -194,10 +296,17 @@ class _MLiteTrainRayActorMixin:
             self.runtime.forward_backward(
                 self.handle,
                 (mb.as_runtime_item() for mb in microbatches),
-                loss_fn=make_runtime_loss_fn(self.args, self.handle, forward_store=store),
+                loss_fn=make_runtime_loss_fn(
+                    self.args,
+                    self.handle,
+                    forward_store=store,
+                    loss_context_iter=(mb.loss_context() for mb in microbatches),
+                ),
                 num_microbatches=len(microbatches),
                 forward_only=True,
             )
+        if not store and not self.runtime.is_mp_src_rank_with_outputs(self.handle):
+            return None
         return [item for micro in store for item in micro["log_probs"]]
 
     def train(self, rollout_id: int, rollout_data_ref) -> None:
@@ -212,9 +321,19 @@ class _MLiteTrainRayActorMixin:
         loss_type = getattr(self.args, "loss_type", "sft_loss")
         if loss_type == "policy_loss" and getattr(self.args, "compute_advantages_and_returns", True):
             if not getattr(self.args, "use_rollout_logprobs", False) or getattr(self.args, "get_mismatch_metrics", False):
-                rollout_data["log_probs"] = self._compute_log_probs(rollout_data)
+                log_probs = self._compute_log_probs(rollout_data)
+                if log_probs is not None:
+                    rollout_data["log_probs"] = log_probs
             elif "rollout_log_probs" not in rollout_data:
-                rollout_data["log_probs"] = self._compute_log_probs(rollout_data)
+                log_probs = self._compute_log_probs(rollout_data)
+                if log_probs is not None:
+                    rollout_data["log_probs"] = log_probs
+            elif _rank() == 0:
+                logger.info(
+                    "MLITE_MILES_GRPO_USING_ROLLOUT_LOGPROBS rollout=%s count=%s",
+                    rollout_id,
+                    len(rollout_data["rollout_log_probs"]),
+                )
             self._compute_advantages_and_returns(rollout_data)
 
         microbatches = self._build_microbatches(rollout_data)
@@ -227,7 +346,11 @@ class _MLiteTrainRayActorMixin:
             result = self.runtime.forward_backward(
                 self.handle,
                 (mb.as_runtime_item() for mb in microbatches),
-                loss_fn=make_runtime_loss_fn(self.args, self.handle),
+                loss_fn=make_runtime_loss_fn(
+                    self.args,
+                    self.handle,
+                    loss_context_iter=(mb.loss_context() for mb in microbatches),
+                ),
                 num_microbatches=len(microbatches),
                 forward_only=False,
             )
@@ -250,13 +373,64 @@ class _MLiteTrainRayActorMixin:
         save_dir = getattr(self.args, "save", None)
         if not save_dir:
             return
-        self.runtime.save_checkpoint(self.handle, save_dir, step=rollout_id)
+        save_optimizer = _env_flag("MLITE_SAVE_OPTIMIZER_CHECKPOINT", False)
+        save_rng = _env_flag("MLITE_SAVE_RNG_CHECKPOINT", False)
+        verify_load = _env_flag("MLITE_VERIFY_CHECKPOINT_LOAD", True)
+        delete_after_load = _env_flag("MLITE_DELETE_CHECKPOINT_AFTER_LOAD", True)
+
+        probe_key, before = _capture_checkpoint_probe(self.handle)
+        self.runtime.save_checkpoint(
+            self.handle,
+            save_dir,
+            step=rollout_id,
+            save_optimizer=save_optimizer,
+            save_rng=save_rng,
+        )
+
+        max_abs = None
+        loaded = None
+        if verify_load:
+            loaded = self.runtime.load_checkpoint(
+                self.handle,
+                save_dir,
+                load_optimizer=save_optimizer,
+                load_rng=save_rng,
+            )
+            if probe_key is not None and before is not None:
+                after_param = _find_local_parameter(self.handle, probe_key)
+                if after_param is None:
+                    raise RuntimeError(f"checkpoint load probe parameter missing after load: {probe_key}")
+                after = after_param.detach().float().cpu()
+                max_abs = float(torch.max(torch.abs(after - before)).item())
+                if max_abs != 0.0:
+                    raise RuntimeError(
+                        f"checkpoint load probe mismatch for {probe_key}: max_abs={max_abs}"
+                    )
+
+        if _rank() == 0:
+            logger.info(
+                "MLITE_MILES_GRPO_SAVE_LOAD_DONE rollout=%s path=%s loaded_step=%s "
+                "probe=%s max_abs=%s save_optimizer=%s save_rng=%s",
+                rollout_id,
+                save_dir,
+                loaded,
+                probe_key,
+                max_abs,
+                save_optimizer,
+                save_rng,
+            )
+
+        _barrier()
+        if delete_after_load and _rank() == 0:
+            _clear_checkpoint_contents(save_dir)
+            logger.info("MLITE_MILES_GRPO_CHECKPOINT_CLEANED path=%s", save_dir)
+        _barrier()
 
     def update_weights(self, info=None) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
         if info is None:
-            raise ValueError("update_weights requires rollout engine info from the slime-family rollout manager.")
+            raise ValueError("update_weights requires rollout engine info from the miles rollout manager.")
         if getattr(self.args, "offload_train", False) or getattr(self.args, "mlite_param_offload", False):
             self.wake_up()
 
@@ -295,31 +469,21 @@ class _MLiteTrainRayActorMixin:
         self.runtime.to(self.handle, "cuda")
 
     def connect_actor_critic(self, critic_group=None, **kwargs):
-        raise NotImplementedError("Megatron Lite slime-family backend does not support critic training yet.")
+        raise NotImplementedError("Megatron Lite miles backend does not support critic training yet.")
 
     def _get_parallel_config(self):
         return self.train_parallel_config
 
 
-def _make_actor_class(pkg: str):
-    train_actor_mod = importlib.import_module(f"{pkg}.ray.train_actor")
-    base_cls = train_actor_mod.TrainRayActor
-    return type(
-        "MLiteTrainRayActor",
-        (_MLiteTrainRayActorMixin, base_cls),
-        {
-            "__module__": __name__,
-            "__doc__": f"Megatron Lite TrainRayActor patched into {pkg}.",
-            "_slime_family_pkg": pkg,
-        },
-    )
+class MLiteTrainRayActor(_MLiteTrainRayActorMixin, _MilesTrainRayActor):
+    """Megatron Lite TrainRayActor patched into miles."""
 
 
-def _load_or_synthesize_actor_module(pkg: str, import_error: ImportError) -> ModuleType:
-    module_name = f"{pkg}.backends.megatron_utils.actor"
+def _load_or_synthesize_actor_module(import_error: ImportError) -> ModuleType:
+    module_name = "miles.backends.megatron_utils.actor"
     actor_mod = ModuleType(module_name)
-    actor_mod.__package__ = f"{pkg}.backends.megatron_utils"
-    actor_mod.__doc__ = f"Synthetic MLite actor patch module for {pkg}."
+    actor_mod.__package__ = "miles.backends.megatron_utils"
+    actor_mod.__doc__ = "Synthetic MLite actor patch module for miles."
     sys.modules[module_name] = actor_mod
 
     parent_mod = importlib.import_module(actor_mod.__package__)
@@ -328,26 +492,13 @@ def _load_or_synthesize_actor_module(pkg: str, import_error: ImportError) -> Mod
     return actor_mod
 
 
-def patch_slime_family_backends(packages: tuple[str, ...] = SUPPORTED_PACKAGES) -> dict[str, type]:
-    """Patch installed slime-family packages and return patched actor classes."""
-    global MLiteTrainRayActor
-
-    patched: dict[str, type] = {}
-    for pkg in packages:
-        try:
-            importlib.import_module(pkg)
-        except ImportError:
-            continue
-
-        actor_cls = _make_actor_class(pkg)
-        actor_mod_name = f"{pkg}.backends.megatron_utils.actor"
-        try:
-            actor_mod = importlib.import_module(actor_mod_name)
-        except ImportError as exc:
-            actor_mod = _load_or_synthesize_actor_module(pkg, exc)
-        actor_mod.MegatronTrainRayActor = actor_cls
-        patched[pkg] = actor_cls
-        if MLiteTrainRayActor is None:
-            MLiteTrainRayActor = actor_cls
-        logger.info("Patched %s MegatronTrainRayActor with Megatron Lite.", pkg)
-    return patched
+def patch_miles_backend() -> type:
+    """Patch installed miles and return the patched actor class."""
+    importlib.import_module("miles")
+    try:
+        actor_mod = importlib.import_module("miles.backends.megatron_utils.actor")
+    except ImportError as exc:
+        actor_mod = _load_or_synthesize_actor_module(exc)
+    actor_mod.MegatronTrainRayActor = MLiteTrainRayActor
+    logger.info("Patched miles MegatronTrainRayActor with Megatron Lite.")
+    return MLiteTrainRayActor

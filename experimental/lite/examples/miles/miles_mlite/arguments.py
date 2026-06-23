@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Megatron Lite flags for slime-family launchers."""
+"""Megatron Lite flags for miles launchers."""
 
 from __future__ import annotations
 
@@ -19,13 +19,13 @@ def optimizer_backend_to_impl(backend: str) -> str:
 
 
 def add_mlite_arguments(parser):
-    """Register Megatron Lite flags on a slime-family parser."""
+    """Register Megatron Lite flags on a miles parser."""
     group = parser.add_argument_group(title="megatron-lite")
     group.add_argument(
         "--mlite-backend-patch",
         action="store_true",
         default=False,
-        help="Patch the slime-family Megatron actor slot to use Megatron Lite.",
+        help="Patch the miles Megatron actor slot to use Megatron Lite.",
     )
     group.add_argument(
         "--mlite-model-name",

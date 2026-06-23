@@ -34,9 +34,10 @@ resolve_script_path() {
 }
 
 SCRIPT_PATH="$(resolve_script_path)"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/slime.sqsh}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/miles.sqsh}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre}"
 DRY_RUN="${DRY_RUN:-0}"
+unset PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF
 
 if [[ "${IN_MILES_CONTAINER:-0}" != "1" ]]; then
    if [[ ! -r "${CONTAINER_IMAGE}" ]]; then
@@ -79,7 +80,7 @@ add_pythonpath() { [[ -n "${1:-}" ]] && export PYTHONPATH="${1}:${PYTHONPATH:-}"
 MILES_ROOT="${MILES_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/miles}"
 MEGATRON_ROOT="${MEGATRON_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/megatron_lite/Megatron-LM}"
 MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/shunyad/models/Qwen/Qwen3-30B-A3B}"
-TRAIN_DATA="${TRAIN_DATA:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/gsm8k_sft_slime/train.parquet}"
+TRAIN_DATA="${TRAIN_DATA:?Set TRAIN_DATA to a messages parquet file for miles SFT.}"
 
 add_pythonpath "${EXAMPLE_ROOT}"
 add_pythonpath "${LITE_ROOT}/examples"
@@ -229,7 +230,6 @@ paths = ["${EXAMPLE_ROOT}", "${LITE_ROOT}/examples", "${LITE_ROOT}", "${REPO_ROO
 env = {
     "PYTHONPATH": ":".join(paths + [os.environ.get("PYTHONPATH", "")]),
     "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
-    "DEPRECATED_MEGATRON_COMPATIBLE": "1",
 }
 print(json.dumps({"env_vars": env}))
 PY
@@ -247,7 +247,11 @@ trap 'ray stop --force || true' EXIT
 ray stop --force || true
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT:-8265}"
 set +e
-ray job submit --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" --runtime-env-json="${RUNTIME_ENV_JSON}" -- "${JOB_ARGS[@]}"
+ray job submit \
+   --address "${RAY_ADDRESS:-http://127.0.0.1:8265}" \
+   --runtime-env-json "${RUNTIME_ENV_JSON}" \
+   -- \
+   "${JOB_ARGS[@]}"
 rc=$?
 set -e
 echo "MILES_${TRAIN_BACKEND^^}_SFT_DONE rc=${rc}"

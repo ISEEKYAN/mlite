@@ -1,7 +1,0 @@
-Repository: https://github.com/THUDM/slime
-Branch: main
-Commit: 77037513d079b7ebfd0f070879cfd4de566aaac0
-
-Required structure:
-- slime.ray.actor_group imports MegatronTrainRayActor inside actor allocation.
-- slime.ray.train_actor.TrainRayActor defines the common slime-family actor API.

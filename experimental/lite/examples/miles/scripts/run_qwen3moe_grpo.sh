@@ -2,15 +2,16 @@
 #SBATCH --job-name=mlite_miles_grpo
 #SBATCH --partition=batch
 #SBATCH --account=coreai_devtech_all
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=2010G
-#SBATCH --time=01:00:00
+#SBATCH --mem=1000G
+#SBATCH --time=04:00:00
 #SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/mlite_miles_grpo-%j.log
 
-# Qwen3 MoE GRPO with miles using either the Megatron Lite patch or native Megatron.
+# Qwen3 MoE GRPO using miles' qwen3-next-80B-A3B 8-GPU recipe, with only
+# the training backend swapped to Megatron Lite.
 set -euo pipefail
 
 if [[ "${VERBOSE:-0}" == "1" ]]; then set -x; fi
@@ -34,22 +35,68 @@ resolve_script_path() {
 }
 
 SCRIPT_PATH="$(resolve_script_path)"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/slime.sqsh}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/miles.sqsh}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre}"
 DRY_RUN="${DRY_RUN:-0}"
+RAY_PORT="${RAY_PORT:-6379}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+RAY_EXPECTED_NODES="${RAY_EXPECTED_NODES:-2}"
+SYSTEM_PATH="${MLITE_SYSTEM_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+SYSTEM_CC="${MLITE_CC:-/usr/bin/gcc}"
+SYSTEM_CXX="${MLITE_CXX:-/usr/bin/g++}"
+SYSTEM_CPATH="${MLITE_CPATH:-/usr/include:/usr/include/x86_64-linux-gnu}"
+
+MLITE_SAVE_OPTIMIZER_CHECKPOINT="${MLITE_SAVE_OPTIMIZER_CHECKPOINT:-0}"
+MLITE_SAVE_RNG_CHECKPOINT="${MLITE_SAVE_RNG_CHECKPOINT:-0}"
+MLITE_LOAD_OPTIMIZER_CHECKPOINT="${MLITE_LOAD_OPTIMIZER_CHECKPOINT:-0}"
+MLITE_LOAD_RNG_CHECKPOINT="${MLITE_LOAD_RNG_CHECKPOINT:-0}"
+MLITE_VERIFY_CHECKPOINT_LOAD="${MLITE_VERIFY_CHECKPOINT_LOAD:-1}"
+MLITE_DELETE_CHECKPOINT_AFTER_LOAD="${MLITE_DELETE_CHECKPOINT_AFTER_LOAD:-1}"
+MLITE_RESET_ROLLOUT_AFTER_LOAD="${MLITE_RESET_ROLLOUT_AFTER_LOAD:-1}"
 
 if [[ "${IN_MILES_CONTAINER:-0}" != "1" ]]; then
    if [[ ! -r "${CONTAINER_IMAGE}" ]]; then
       echo "Container image not readable: ${CONTAINER_IMAGE}" >&2
       exit 2
    fi
+   if [[ -z "${MASTER_ADDR:-}" && -n "${SLURM_JOB_NODELIST:-}" ]] && command -v scontrol >/dev/null 2>&1; then
+      MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)"
+   fi
+   MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
    SRUN_CMD=(
       srun
+      --nodes=2
+      --ntasks=2
+      --ntasks-per-node=1
       --container-image="${CONTAINER_IMAGE}"
       --container-mounts="${CONTAINER_MOUNTS}"
       --container-workdir=/
-      env IN_MILES_CONTAINER=1 MLITE_MILES_SCRIPT_PATH="${SCRIPT_PATH}"
+      env
+      -u CONDA_PREFIX
+      -u CONDA_DEFAULT_ENV
+      -u CONDA_EXE
+      -u CONDA_PYTHON_EXE
+      -u CONDA_SHLVL
+      -u _CE_CONDA
+      -u _CE_M
+      PATH="${SYSTEM_PATH}"
+      CC="${SYSTEM_CC}"
+      CXX="${SYSTEM_CXX}"
+      CPATH="${SYSTEM_CPATH}"
+      IN_MILES_CONTAINER=1
+      MLITE_MILES_SCRIPT_PATH="${SCRIPT_PATH}"
+      MASTER_ADDR="${MASTER_ADDR}"
+      RAY_PORT="${RAY_PORT}"
+      RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT}"
+      RAY_EXPECTED_NODES="${RAY_EXPECTED_NODES}"
+      MLITE_SAVE_OPTIMIZER_CHECKPOINT="${MLITE_SAVE_OPTIMIZER_CHECKPOINT}"
+      MLITE_SAVE_RNG_CHECKPOINT="${MLITE_SAVE_RNG_CHECKPOINT}"
+      MLITE_LOAD_OPTIMIZER_CHECKPOINT="${MLITE_LOAD_OPTIMIZER_CHECKPOINT}"
+      MLITE_LOAD_RNG_CHECKPOINT="${MLITE_LOAD_RNG_CHECKPOINT}"
+      MLITE_VERIFY_CHECKPOINT_LOAD="${MLITE_VERIFY_CHECKPOINT_LOAD}"
+      MLITE_DELETE_CHECKPOINT_AFTER_LOAD="${MLITE_DELETE_CHECKPOINT_AFTER_LOAD}"
+      MLITE_RESET_ROLLOUT_AFTER_LOAD="${MLITE_RESET_ROLLOUT_AFTER_LOAD}"
       bash "${SCRIPT_PATH}"
    )
 
@@ -69,20 +116,69 @@ if [[ "${IN_MILES_CONTAINER:-0}" != "1" ]]; then
    exec "${SRUN_CMD[@]}"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)"
+set -ex
+
+export PATH="${SYSTEM_PATH}"
+export CC="${SYSTEM_CC}"
+export CXX="${SYSTEM_CXX}"
+export CPATH="${SYSTEM_CPATH}"
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE CONDA_PYTHON_EXE CONDA_SHLVL _CE_CONDA _CE_M
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -L)"
 EXAMPLE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -L)"
 LITE_ROOT="$(cd "${EXAMPLE_ROOT}/../.." && pwd -L)"
 REPO_ROOT="$(cd "${LITE_ROOT}/../.." && pwd -L)"
-
-add_pythonpath() { [[ -n "${1:-}" ]] && export PYTHONPATH="${1}:${PYTHONPATH:-}"; }
 
 MILES_ROOT="${MILES_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/miles}"
 MEGATRON_ROOT="${MEGATRON_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/megatron_lite/Megatron-LM}"
 MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/shunyad/models/Qwen/Qwen3-30B-A3B}"
 RUN_ROOT="${RUN_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/mlite_miles_runs}"
-SOURCE_PROMPT_DATA="${SOURCE_PROMPT_DATA:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/verl_tmp/data/gsm8k/train.parquet}"
-PROMPT_DATA="${PROMPT_DATA:-${RUN_ROOT}/data/gsm8k_miles_math.jsonl}"
+DAPO_MATH_DATA="${DAPO_MATH_DATA:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/achartier/dapo-math-17k/dapo-math-17k.jsonl}"
+LOAD_DIR="${LOAD_DIR:-${RUN_ROOT}/qwen3moe_sft_mlite/13021984}"
+SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/qwen3moe_grpo_mlite/${SLURM_JOB_ID:-dryrun}}"
+REF_LOAD="${REF_LOAD:-${MODEL_PATH}}"
 
+if [[ ! -d "${MODEL_PATH}" ]]; then
+   echo "MODEL_PATH does not exist: ${MODEL_PATH}" >&2
+   exit 2
+fi
+if [[ ! -s "${DAPO_MATH_DATA}" ]]; then
+   echo "DAPO_MATH_DATA does not exist: ${DAPO_MATH_DATA}" >&2
+   exit 2
+fi
+if [[ ! -d "${LOAD_DIR}" ]]; then
+   echo "LOAD_DIR does not exist: ${LOAD_DIR}" >&2
+   exit 2
+fi
+mkdir -p "${SAVE_DIR}"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+   NVLINK_COUNT=0
+   HAS_NVLINK=0
+else
+   NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+   if [[ "${NVLINK_COUNT}" -gt 0 ]]; then
+      HAS_NVLINK=1
+   else
+      HAS_NVLINK=0
+   fi
+fi
+echo "HAS_NVLINK: ${HAS_NVLINK} (detected ${NVLINK_COUNT} NVLink references)"
+
+source "${MILES_ROOT}/scripts/models/qwen3-30B-A3B.sh"
+
+export PYTHONBUFFERED=16
+export PYTHONUNBUFFERED=1
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export RAY_PORT RAY_DASHBOARD_PORT RAY_EXPECTED_NODES
+export no_proxy="127.0.0.1,${MASTER_ADDR}"
+export MLITE_SAVE_OPTIMIZER_CHECKPOINT MLITE_SAVE_RNG_CHECKPOINT
+export MLITE_LOAD_OPTIMIZER_CHECKPOINT MLITE_LOAD_RNG_CHECKPOINT
+export MLITE_VERIFY_CHECKPOINT_LOAD MLITE_DELETE_CHECKPOINT_AFTER_LOAD
+export MLITE_RESET_ROLLOUT_AFTER_LOAD
+
+add_pythonpath() { [[ -n "${1:-}" ]] && export PYTHONPATH="${1}:${PYTHONPATH:-}"; }
 add_pythonpath "${EXAMPLE_ROOT}"
 add_pythonpath "${LITE_ROOT}/examples"
 add_pythonpath "${LITE_ROOT}"
@@ -90,217 +186,237 @@ add_pythonpath "${REPO_ROOT}"
 add_pythonpath "${MEGATRON_ROOT}"
 add_pythonpath "${MILES_ROOT}"
 
-MODEL_SCRIPT="${MODEL_SCRIPT:-${MILES_ROOT}/scripts/models/qwen3-30B-A3B.sh}"
-NUM_GPUS="${NUM_GPUS:-8}"
-TRAIN_BACKEND="${TRAIN_BACKEND:-mlite}"
-case "${TRAIN_BACKEND}" in
-   mlite|megatron) ;;
-   *) echo "TRAIN_BACKEND must be 'mlite' or 'megatron'." >&2; exit 2 ;;
-esac
-SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/qwen3moe_grpo_${TRAIN_BACKEND}/${SLURM_JOB_ID:-dryrun}}"
-
-TP_SIZE="${TP_SIZE:-2}"
-PP_SIZE="${PP_SIZE:-1}"
-CP_SIZE="${CP_SIZE:-1}"
-EP_SIZE="${EP_SIZE:-8}"
-ETP_SIZE="${ETP_SIZE:-1}"
-MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-qwen3_moe}"
-MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
-OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-1}"
-PARAM_OFFLOAD="${PARAM_OFFLOAD:-0}"
-if [[ -z "${MEGATRON_TO_HF_MODE:-}" ]]; then
-   if [[ "${TRAIN_BACKEND}" == "mlite" ]]; then
-      MEGATRON_TO_HF_MODE="raw"
-   else
-      MEGATRON_TO_HF_MODE="bridge"
-   fi
-fi
-
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-9216}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-1}"
-LR="${LR:-1e-6}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-100000}"
-RM_TYPE="${RM_TYPE:-math}"
-USE_KL_LOSS="${USE_KL_LOSS:-0}"
-
-mkdir -p "${SAVE_DIR}"
-if [[ ! -s "${PROMPT_DATA}" && "${PROMPT_DATA}" == *.jsonl ]]; then
-   mkdir -p "$(dirname "${PROMPT_DATA}")"
-   python3 - <<PY
-import json
-import pyarrow.parquet as pq
-
-src = "${SOURCE_PROMPT_DATA}"
-dst = "${PROMPT_DATA}"
-table = pq.read_table(src)
-rows = table.to_pylist()
-with open(dst, "w", encoding="utf-8") as f:
-    for row in rows:
-        reward_model = row.get("reward_model") or {}
-        label = reward_model.get("ground_truth")
-        if label is None:
-            extra = row.get("extra_info") or {}
-            label = extra.get("answer")
-        if label is None:
-            raise ValueError(f"missing label in {src}")
-        f.write(json.dumps({"prompt": row["prompt"], "label": str(label)}) + "\\n")
-print(f"Wrote {len(rows)} records to {dst}")
-PY
-fi
-source "${MODEL_SCRIPT}"
-
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
-export PYTHONUNBUFFERED=1
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export no_proxy="${no_proxy:-127.0.0.1,${MASTER_ADDR}}"
-
-BACKEND_ARGS=(
-   --train-backend megatron
-   --model-name qwen3_moe
-   --megatron-to-hf-mode "${MEGATRON_TO_HF_MODE}"
-)
-if [[ "${TRAIN_BACKEND}" == "mlite" ]]; then
-   BACKEND_ARGS+=(
-      --mlite-backend-patch
-      --mlite-model-name "${MLITE_MODEL_NAME}"
-      --mlite-impl lite
-      --mlite-optimizer-backend "${MLITE_OPTIMIZER_BACKEND}"
-   )
-   if [[ "${OPTIMIZER_OFFLOAD}" == "1" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "True" ]]; then
-      BACKEND_ARGS+=(--mlite-optimizer-offload)
-   fi
-   if [[ "${PARAM_OFFLOAD}" == "1" || "${PARAM_OFFLOAD}" == "true" || "${PARAM_OFFLOAD}" == "True" ]]; then
-      BACKEND_ARGS+=(--mlite-param-offload)
-   fi
-fi
-
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_PATH}"
+   --ref-load "${REF_LOAD}"
+   --load "${LOAD_DIR}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL}"
+   --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data "${PROMPT_DATA}"
-   --input-key "${INPUT_KEY:-prompt}"
-   --label-key "${LABEL_KEY:-label}"
+   --prompt-data "${DAPO_MATH_DATA}"
+   --input-key prompt
+   --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type "${RM_TYPE}"
-   --num-rollout "${NUM_ROLLOUT}"
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
-   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
-   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-2048}"
-   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
-   --global-batch-size "${GLOBAL_BATCH_SIZE}"
+   --rm-type deepscaler
+   --num-rollout "${NUM_ROLLOUT:-5}"
+   --rollout-batch-size 16
+   --n-samples-per-prompt 4
+   --rollout-max-response-len 8192
+   --rollout-temperature 0.8
+   --global-batch-size 64
    --balance-data
+   --custom-rollout-log-function-path miles_mlite.gsm8k_reward.log_rollout_data
 )
-if [[ -n "${REWARD_KEY:-}" ]]; then
-   ROLLOUT_ARGS+=(--reward-key "${REWARD_KEY}")
-fi
-
-GRPO_ARGS=(
-   --loss-type policy_loss
-   --advantage-estimator grpo
-   --use-rollout-logprobs
-   --kl-loss-coef "${KL_LOSS_COEF:-0.0}"
-   --kl-loss-type low_var_kl
-   --entropy-coef "${ENTROPY_COEF:-0.0}"
-   --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
-)
-if [[ "${USE_KL_LOSS}" == "1" || "${USE_KL_LOSS}" == "true" || "${USE_KL_LOSS}" == "True" ]]; then
-   GRPO_ARGS+=(--use-kl-loss --ref-load "${REF_LOAD:-${MODEL_PATH}}")
-fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${TP_SIZE}"
+   --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size "${PP_SIZE}"
-   --context-parallel-size "${CP_SIZE}"
-   --expert-model-parallel-size "${EP_SIZE}"
-   --expert-tensor-parallel-size "${ETP_SIZE}"
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 8
+   --expert-tensor-parallel-size 1
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --max-tokens-per-gpu 2048
+)
+
+GRPO_ARGS=(
+   --advantage-estimator gspo
+   --use-rollout-logprobs
+   --kl-loss-coef 0.00
+   --kl-loss-type low_var_kl
+   --kl-coef 0.00
+   --entropy-coef 0.00
+   --eps-clip 4e-4
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr "${LR}"
+   --lr 1e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
-   --clip-grad 1.0
 )
-if [[ "${TRAIN_BACKEND}" == "megatron" ]] && [[ "${OPTIMIZER_OFFLOAD}" == "1" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "True" ]]; then
-   OPTIMIZER_ARGS+=(
-      --optimizer-cpu-offload
-      --overlap-cpu-optimizer-d2h-h2d
-      --use-precision-aware-optimizer
-   )
-fi
+
+BACKEND_ARGS=(
+   --train-backend megatron
+   --model-name qwen3_moe
+   --megatron-to-hf-mode raw
+   --mlite-backend-patch
+   --mlite-model-name qwen3_moe
+   --mlite-impl lite
+   --mlite-optimizer-backend dist_opt
+   --mlite-optimizer-offload
+)
 
 SGLANG_ARGS=(
-   --colocate
-   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
-   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.7}"
+   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus 8
+   --sglang-mem-fraction-static 0.8
+   --sglang-ep-size 1
+   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 128)
+   --update-weight-buffer-size $((1024 * 1024 * 1024 * 4))
 )
 
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
    --attention-backend flash
-   --log-throughput
+   --moe-token-dispatcher-type alltoall
    --log-passrate
 )
 
 JOB_ARGS=(
    python3 -m miles_mlite.launch
    --actor-num-nodes 1
-   --actor-num-gpus-per-node "${NUM_GPUS}"
-   --num-gpus-per-node "${NUM_GPUS}"
+   --actor-num-gpus-per-node 8
+   --num-gpus-per-node 8
    "${MODEL_ARGS[@]}"
-   "${BACKEND_ARGS[@]}"
    "${CKPT_ARGS[@]}"
    "${ROLLOUT_ARGS[@]}"
-   "${GRPO_ARGS[@]}"
    "${OPTIMIZER_ARGS[@]}"
+   "${GRPO_ARGS[@]}"
    "${PERF_ARGS[@]}"
    "${SGLANG_ARGS[@]}"
    "${MISC_ARGS[@]}"
+   "${BACKEND_ARGS[@]}"
 )
 
 RUNTIME_ENV_JSON="$(
 python3 - <<PY
-import json, os
-paths = ["${EXAMPLE_ROOT}", "${LITE_ROOT}/examples", "${LITE_ROOT}", "${REPO_ROOT}", "${MILES_ROOT}", "${MEGATRON_ROOT}"]
+import json
+import os
+
+paths = [
+    "${EXAMPLE_ROOT}",
+    "${LITE_ROOT}/examples",
+    "${LITE_ROOT}",
+    "${REPO_ROOT}",
+    "${MILES_ROOT}",
+    "${MEGATRON_ROOT}",
+]
 env = {
     "PYTHONPATH": ":".join(paths + [os.environ.get("PYTHONPATH", "")]),
+    "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+    "CC": os.environ.get("CC", "/usr/bin/gcc"),
+    "CXX": os.environ.get("CXX", "/usr/bin/g++"),
+    "CPATH": os.environ.get("CPATH", "/usr/include:/usr/include/x86_64-linux-gnu"),
     "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
-    "DEPRECATED_MEGATRON_COMPATIBLE": "1",
+    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
+    "MASTER_ADDR": os.environ.get("MASTER_ADDR", "127.0.0.1"),
+    "MLITE_SAVE_OPTIMIZER_CHECKPOINT": os.environ.get("MLITE_SAVE_OPTIMIZER_CHECKPOINT", "0"),
+    "MLITE_SAVE_RNG_CHECKPOINT": os.environ.get("MLITE_SAVE_RNG_CHECKPOINT", "0"),
+    "MLITE_LOAD_OPTIMIZER_CHECKPOINT": os.environ.get("MLITE_LOAD_OPTIMIZER_CHECKPOINT", "0"),
+    "MLITE_LOAD_RNG_CHECKPOINT": os.environ.get("MLITE_LOAD_RNG_CHECKPOINT", "0"),
+    "MLITE_VERIFY_CHECKPOINT_LOAD": os.environ.get("MLITE_VERIFY_CHECKPOINT_LOAD", "1"),
+    "MLITE_DELETE_CHECKPOINT_AFTER_LOAD": os.environ.get("MLITE_DELETE_CHECKPOINT_AFTER_LOAD", "1"),
+    "MLITE_RESET_ROLLOUT_AFTER_LOAD": os.environ.get("MLITE_RESET_ROLLOUT_AFTER_LOAD", "1"),
+    "no_proxy": os.environ.get("no_proxy", "127.0.0.1,localhost"),
 }
 print(json.dumps({"env_vars": env}))
 PY
 )"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-   printf 'inner ray start: ray start --head --node-ip-address=%q --num-gpus=%q --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=%q\n' "${MASTER_ADDR}" "${NUM_GPUS}" "${RAY_DASHBOARD_PORT:-8265}"
-   printf 'inner ray job: ray job submit --address=%q --runtime-env-json=%q -- ' "${RAY_ADDRESS:-http://127.0.0.1:8265}" "${RUNTIME_ENV_JSON}"
+   printf 'inner ray head: ray start --head --node-ip-address=%q --port=%q --num-gpus=8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=%q\n' \
+      "${MASTER_ADDR}" "${RAY_PORT}" "${RAY_DASHBOARD_PORT}"
+   printf 'inner ray worker: ray start --address=%q --num-gpus=8 --node-ip-address=<worker> --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=%q\n' \
+      "${MASTER_ADDR}:${RAY_PORT}" "${RAY_DASHBOARD_PORT}"
+   printf 'inner ray job: ray job submit --address=%q --runtime-env-json=%q -- ' \
+      "${RAY_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT}}" "${RUNTIME_ENV_JSON}"
    printf '%q ' "${JOB_ARGS[@]}"
    printf '\n'
    exit 0
 fi
 
-trap 'ray stop --force || true' EXIT
+RAY_NODE_RANK="${SLURM_PROCID:-0}"
+RAY_DONE_FILE="${RUN_ROOT}/.mlite_miles_grpo_${SLURM_JOB_ID:-manual}.done"
+NODE_ADDR="$(hostname -s)"
+
 ray stop --force || true
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT:-8265}"
+pkill -9 sglang || true
+pkill -9 ray || true
+sleep 3
+ray stop --force || true
+
+cleanup() {
+   if [[ "${RAY_NODE_RANK}" == "0" ]]; then
+      touch "${RAY_DONE_FILE}" || true
+   fi
+   ray stop --force || true
+}
+trap cleanup EXIT
+
+if [[ "${RAY_NODE_RANK}" != "0" ]]; then
+   for attempt in $(seq 1 120); do
+      if ray start \
+         --address="${MASTER_ADDR}:${RAY_PORT}" \
+         --num-gpus 8 \
+         --node-ip-address "${NODE_ADDR}" \
+         --disable-usage-stats \
+         --dashboard-host=0.0.0.0 \
+         --dashboard-port="${RAY_DASHBOARD_PORT}"; then
+         break
+      fi
+      if [[ "${attempt}" == "120" ]]; then
+         echo "Failed to join Ray head at ${MASTER_ADDR}:${RAY_PORT}" >&2
+         exit 1
+      fi
+      sleep 2
+   done
+   while [[ ! -f "${RAY_DONE_FILE}" ]]; do
+      sleep 10
+   done
+   exit 0
+fi
+
+rm -f "${RAY_DONE_FILE}"
+
+ray start \
+   --head \
+   --node-ip-address "${MASTER_ADDR}" \
+   --port="${RAY_PORT}" \
+   --num-gpus 8 \
+   --disable-usage-stats \
+   --dashboard-host=0.0.0.0 \
+   --dashboard-port="${RAY_DASHBOARD_PORT}"
+
+python3 - <<'PY'
+import os
+import time
+
+import ray
+
+expected = int(os.environ.get("RAY_EXPECTED_NODES", "1"))
+address = f"{os.environ['MASTER_ADDR']}:{os.environ['RAY_PORT']}"
+ray.init(address=address)
+deadline = time.time() + 300
+while True:
+    alive = [node for node in ray.nodes() if node.get("Alive")]
+    print(f"RAY_CLUSTER_NODES {len(alive)}/{expected}", flush=True)
+    if len(alive) >= expected:
+        break
+    if time.time() > deadline:
+        raise SystemExit(f"Timed out waiting for Ray nodes: {len(alive)}/{expected}")
+    time.sleep(2)
+ray.shutdown()
+PY
+
 set +e
-ray job submit --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" --runtime-env-json="${RUNTIME_ENV_JSON}" -- "${JOB_ARGS[@]}"
+ray job submit \
+   --address "${RAY_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT}}" \
+   --runtime-env-json "${RUNTIME_ENV_JSON}" \
+   -- \
+   "${JOB_ARGS[@]}"
 rc=$?
 set -e
-echo "MILES_${TRAIN_BACKEND^^}_GRPO_DONE rc=${rc}"
+echo "MILES_MLITE_GRPO_DONE rc=${rc}"
 exit "${rc}"

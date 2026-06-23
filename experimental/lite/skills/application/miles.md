@@ -3,8 +3,8 @@
 Use this when wiring Megatron Lite into radixark/miles examples.
 
 - Keep the external miles CLI backend as `--train-backend megatron`; the MLite
-  integration is activated by importing `slime_family.mlite_backend_patch`
-  before miles constructs `RayTrainGroup`.
+  integration is activated by importing `miles_mlite.backend_patch` before miles
+  constructs `RayTrainGroup`.
 - Add `experimental/lite`, `experimental/lite/examples`, this repository root,
   and the miles checkout to `PYTHONPATH` for both the driver and Ray runtime
   environment.

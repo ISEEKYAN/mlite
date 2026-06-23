@@ -1,12 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""External loss functions for the slime-family MLite actor."""
+"""External loss functions for the miles MLite actor."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
+from megatron.lite.runtime.contracts.loss import LossContext
 
 
 def _nested_to_list(output: torch.Tensor, seq_lens: torch.Tensor) -> list[torch.Tensor]:
@@ -28,7 +29,7 @@ def _unpack_output(handle, runtime_batch, output: torch.Tensor) -> list[torch.Te
     proto = handle._extras.get("protocol")
     unpack = getattr(proto, "unpack_forward_output", None)
     if unpack is None:
-        raise ValueError("Model protocol must expose unpack_forward_output for slime-family losses.")
+        raise ValueError("Model protocol must expose unpack_forward_output for miles losses.")
     model = handle._model[0] if isinstance(handle._model, list | tuple) else handle._model
     return _nested_to_list(unpack(model, runtime_batch, output), runtime_batch.seq_lens)
 
@@ -133,10 +134,23 @@ def make_runtime_loss_fn(
     handle,
     *,
     forward_store: list[dict[str, list[torch.Tensor]]] | None = None,
+    loss_context_iter: Iterator[LossContext] | None = None,
 ) -> Callable:
     """Build a Megatron Lite runtime loss_fn for SFT, forward-only logprob, or policy loss."""
 
-    def _loss_fn(raw_output: dict[str, torch.Tensor], runtime_batch, loss_context):
+    def _next_loss_context() -> LossContext | None:
+        if loss_context_iter is None:
+            return None
+        try:
+            return next(loss_context_iter)
+        except StopIteration as exc:
+            raise RuntimeError("MLite miles loss context iterator ended before loss_fn calls.") from exc
+
+    def _loss_fn(raw_output: dict[str, torch.Tensor], runtime_batch, loss_context=None):
+        if loss_context is None:
+            loss_context = _next_loss_context()
+        if loss_context is None or loss_context.source_batch is None:
+            raise ValueError("MLite miles loss_fn requires a LossContext with source_batch.")
         source_batch = loss_context.source_batch
         current = extract_response_log_probs(raw_output, runtime_batch, source_batch, handle)
         if forward_store is not None:
@@ -149,6 +163,6 @@ def make_runtime_loss_fn(
             return _sft_loss(current, source_batch)
         if loss_type == "policy_loss":
             return _policy_loss(args, current, source_batch)
-        raise NotImplementedError(f"Megatron Lite slime-family actor does not support loss_type={loss_type!r}.")
+        raise NotImplementedError(f"Megatron Lite miles actor does not support loss_type={loss_type!r}.")
 
     return _loss_fn

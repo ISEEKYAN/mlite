@@ -1,14 +1,14 @@
 # Miles Megatron Lite Example
 
 This example runs radixark/miles with Megatron Lite as the training actor by
-applying the shared slime-family runtime patch from
-`experimental/lite/examples/slime_family/mlite_backend_patch.py`.
+applying the miles runtime patch from
+`experimental/lite/examples/miles/miles_mlite/backend_patch.py`.
 
-The patch intentionally keeps `--train-backend megatron`: miles, slime, and vime
-all import `MegatronTrainRayActor` from their Megatron backend module inside the
-actor allocation path, so replacing that source symbol before allocation routes
-the existing Megatron slot to `MLiteTrainRayActor` without changing fork code or
-CLI choices.
+The patch intentionally keeps `--train-backend megatron`: miles imports
+`MegatronTrainRayActor` from its Megatron backend module inside the actor
+allocation path, so replacing that source symbol before allocation routes the
+existing Megatron slot to `MLiteTrainRayActor` without changing miles code or CLI
+choices.
 
 ## Layout
 
@@ -30,6 +30,7 @@ export MILES_ROOT=/path/to/miles
 export MEGATRON_ROOT=/path/to/full/Megatron-LM  # if Megatron-Core is not installed
 export MODEL_PATH=/path/to/Qwen3-30B-A3B
 export TRAIN_DATA=/path/to/messages.parquet
+export CONTAINER_IMAGE=/path/to/miles.sqsh
 bash experimental/lite/examples/miles/scripts/run_qwen3moe_sft.sh
 ```
 
@@ -50,6 +51,7 @@ export MILES_ROOT=/path/to/miles
 export MEGATRON_ROOT=/path/to/full/Megatron-LM  # if Megatron-Core is not installed
 export MODEL_PATH=/path/to/Qwen3-30B-A3B
 export PROMPT_DATA=/path/to/prompts.jsonl
+export CONTAINER_IMAGE=/path/to/miles.sqsh
 bash experimental/lite/examples/miles/scripts/run_qwen3moe_grpo.sh
 ```
 
