@@ -149,16 +149,15 @@ Useful GRPO knobs:
 - `ACTOR_TP`, `ACTOR_PP`, `ACTOR_VPP`, `ACTOR_CP`, `ACTOR_EP`, `ACTOR_ETP`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
 - `INFER_BACKEND=vllm`
-- `USE_LEGACY_WORKER_IMPL=disable` to use VERL's new engine worker path
 - `POLICY_LOSS_MODE=vanilla` and `LOSS_AGG_MODE=seq-mean-token-sum-norm`
   select the pure GRPO baseline policy loss and aggregation mode.
 
 The GRPO launcher keeps the reference policy disabled by default
 (`algorithm.use_kl_in_reward=False`, `actor_rollout_ref.actor.use_kl_loss=False`)
 so the example exercises the current MLite actor path without expanding scope
-to a separate reference model. It also disables VERL's legacy worker path by
-default so `actor@actor_rollout_ref.actor=mlite_actor` is handled by the new
-engine worker implementation.
+to a separate reference model. On latest verl, both the v0 and V1 trainer paths
+route `actor@actor_rollout_ref.actor=mlite_actor` to the unified engine workers,
+so the MLite actor is wired up correctly without any extra worker-path knob.
 
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
@@ -189,4 +188,4 @@ cover end-to-end SFT or GRPO training.
     `actor_rollout_ref.actor.engine.impl=lite`,
     `actor_rollout_ref.actor.engine.ep=8`,
     `algorithm.adv_estimator=grpo`, `actor_rollout_ref.actor.policy_loss.loss_mode=vanilla`,
-    `critic.enable=False`, and `trainer.use_legacy_worker_impl=disable`.
+    and `critic.enable=False`.
