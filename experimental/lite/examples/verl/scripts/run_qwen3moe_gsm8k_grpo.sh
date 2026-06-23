@@ -114,8 +114,8 @@ RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
-# Recent VERL removed trainer.use_legacy_worker_impl and always uses the unified
-# engine worker, so the launcher never sets it (legacy path is not supported).
+# Recent VERL always uses the unified engine workers; the launcher sets no
+# worker-path override.
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_ARGS=("$@")
 

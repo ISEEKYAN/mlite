@@ -25,7 +25,7 @@ Install or expose these packages before running:
 
 - VERL with the new engine worker path.
   See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt) for the reference upstream
-  release tag.
+  source pin (commit).
 - Megatron-LM from this repository, or another source tree via
   `MEGATRON_ROOT=/path/to/Megatron-LM`.
 - Megatron Lite from this repository. The script automatically adds
