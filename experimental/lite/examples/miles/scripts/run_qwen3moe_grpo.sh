@@ -208,6 +208,7 @@ ROLLOUT_ARGS=(
    --rollout-temperature 0.8
    --global-batch-size 64
    --balance-data
+   --custom-rollout-log-function-path miles_mlite.reward_log.log_rollout_data
 )
 
 PERF_ARGS=(
