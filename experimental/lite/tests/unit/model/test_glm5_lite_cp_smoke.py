@@ -3,6 +3,29 @@ from __future__ import annotations
 import pytest
 
 
+def _make_train_config(ps):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        tp=ps.tp_size,
+        ep=ps.ep_size,
+        etp=ps.etp_size,
+        pp=ps.pp_size,
+        cp=ps.cp_size,
+        vpp=None,
+        use_deepep=False,
+        fp8=False,
+        recompute_modules=[],
+        deterministic=True,
+    )
+
+
+def _make_glm5_model(cfg, ps, **kwargs):
+    from megatron.lite.model.glm5.lite.model import Glm5Model
+
+    return Glm5Model(cfg, _make_train_config(ps), ps, **kwargs)
+
+
 def _init_dist_or_skip():
     import os
 
@@ -196,7 +219,6 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -208,9 +230,11 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(777)
-    cp_model = Glm5ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
+    cp_model = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     torch.manual_seed(777)
-    ref_model = Glm5ForCausalLM(cfg, ps=ParallelState()).to(device=device, dtype=torch.bfloat16)
+    ref_model = _make_glm5_model(cfg, ps=ParallelState()).to(
+        device=device, dtype=torch.bfloat16
+    )
     cp_model.eval()
     ref_model.eval()
 
@@ -233,7 +257,6 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -245,8 +268,7 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(1234)
-    model = Glm5ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
-    model.initialize_weights()
+    model = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(55)
@@ -274,7 +296,6 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.parallel.state import ParallelState
     from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
 
@@ -288,7 +309,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(20260614)
-    model = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True, mtp_enable_train=True).to(
+    model = _make_glm5_model(cfg, ps=ps, mtp_enable=True, mtp_enable_train=True).to(
         device=device, dtype=torch.bfloat16
     )
     model.train()
@@ -338,9 +359,9 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
             grad_norm = grad_norm + param.grad.detach().float().norm()
     assert torch.isfinite(grad_norm)
 
-    nested_logits = unpack_packed_thd_to_nested(out["logits"], packed)
-    assert nested_logits.offsets().numel() == len(lengths) + 1
-    assert [int(x) for x in nested_logits.offsets().diff().cpu()] == lengths
+    nested_log_probs = unpack_packed_thd_to_nested(out["log_probs"], packed)
+    assert nested_log_probs.offsets().numel() == len(lengths) + 1
+    assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
 
     if rank == 0:
         print(
@@ -359,7 +380,6 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -378,7 +398,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref), str(rank_tmp_path))
 
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
-    native = Glm5ForCausalLM(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
+    native = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     native.eval()
     load_hf_weights(native, str(rank_tmp_path), cfg, ps)
 
@@ -398,7 +418,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
                 )
             )
         )
-    for layer in native.model.layers:
+    for layer in native.layers:
         hooks.append(
             layer.register_forward_hook(
                 lambda _module, _inputs, outputs: native_layer_outputs.append(

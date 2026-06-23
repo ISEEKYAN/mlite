@@ -5,6 +5,31 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _make_train_config(ps):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        tp=ps.tp_size,
+        ep=ps.ep_size,
+        etp=ps.etp_size,
+        pp=ps.pp_size,
+        cp=ps.cp_size,
+        vpp=None,
+        use_deepep=False,
+        fp8=False,
+        recompute_modules=[],
+        deterministic=True,
+    )
+
+
+def _make_glm5_model(cfg, ps=None, **kwargs):
+    from megatron.lite.model.glm5.lite.model import Glm5Model
+    from megatron.lite.primitive.parallel import ParallelState
+
+    ps = ParallelState() if ps is None else ps
+    return Glm5Model(cfg, _make_train_config(ps), ps, **kwargs)
+
+
 def _tiny_config_kwargs():
     return dict(
         num_hidden_layers=2,
@@ -176,10 +201,15 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
 
 
 def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
+    import pytest
     import torch
 
     from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
+
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5 native attention requires CUDA (Transformer Engine RMSNorm)")
+    device = torch.device("cuda")
 
     calls = {}
 
@@ -235,10 +265,13 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
         index_topk=2,
         rms_norm_eps=1e-5,
     )
+    attn.to(device=device, dtype=torch.bfloat16)
     attn.train()
-    x = torch.randn(1, 4, 16)
-    cos, sin = build_rope_cache(dim=4, max_position_embeddings=4, rope_theta=1_000_000.0)
-    position_ids = torch.arange(4).unsqueeze(0)
+    x = torch.randn(1, 4, 16, device=device, dtype=torch.bfloat16)
+    cos, sin = build_rope_cache(
+        dim=4, max_position_embeddings=4, rope_theta=1_000_000.0, device=device
+    )
+    position_ids = torch.arange(4, device=device).unsqueeze(0)
 
     out = attn(x, cos=cos, sin=sin, position_ids=position_ids)
 
@@ -258,18 +291,23 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
 
 
 def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
+    import pytest
     import torch
 
     from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
+
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5 native attention requires CUDA (Transformer Engine RMSNorm)")
+    device = torch.device("cuda")
 
     calls = {}
 
     def fake_indexer_topk(q_indexer, k_indexer, weights, topk, ratio, indexer_softmax_scale=1.0):
         del q_indexer, k_indexer, weights, indexer_softmax_scale
         calls["indexer"] = {"topk": topk, "ratio": ratio}
-        idx = torch.zeros((1, 4, topk), dtype=torch.int32)
-        return idx, torch.full((1, 4), topk, dtype=torch.int32)
+        idx = torch.zeros((1, 4, topk), dtype=torch.int32, device=device)
+        return idx, torch.full((1, 4), topk, dtype=torch.int32, device=device)
 
     def fake_dsa_sparse_attn(
         query,
@@ -301,10 +339,13 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
         index_topk=2,
         rms_norm_eps=1e-5,
     )
+    attn.to(device=device, dtype=torch.bfloat16)
     attn.eval()
-    x = torch.randn(1, 4, 16)
-    cos, sin = build_rope_cache(dim=4, max_position_embeddings=4, rope_theta=1_000_000.0)
-    position_ids = torch.arange(4).unsqueeze(0)
+    x = torch.randn(1, 4, 16, device=device, dtype=torch.bfloat16)
+    cos, sin = build_rope_cache(
+        dim=4, max_position_embeddings=4, rope_theta=1_000_000.0, device=device
+    )
+    position_ids = torch.arange(4, device=device).unsqueeze(0)
 
     with torch.no_grad():
         out = attn(x, cos=cos, sin=sin, position_ids=position_ids)
@@ -314,20 +355,19 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     assert calls["sparse"] == {"topk_length_is_set": True, "value_dim": 4}
 
 
-def test_glm5_lite_model_exports_hf_style_state_names():
+def test_glm5_lite_model_exports_native_state_names():
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
 
-    model = Glm5ForCausalLM(Glm5Config(**_tiny_config_kwargs()))
+    model = _make_glm5_model(Glm5Config(**_tiny_config_kwargs()))
     keys = set(model.state_dict())
 
-    assert "model.embed_tokens.weight" in keys
-    assert "model.layers.0.self_attn.q_a_proj.weight" in keys
-    assert "model.layers.0.mlp.gate_proj.weight" in keys
-    assert "model.layers.1.mlp.gate.weight" in keys
-    assert "model.layers.1.mlp.experts.0.gate_proj.weight" in keys
-    assert "model.layers.1.mlp.shared_experts.gate_proj.weight" in keys
-    assert "lm_head.weight" in keys
+    assert "embed.embedding.weight" in keys
+    assert "layers.0.self_attention.self_attention.q_a_proj.weight" in keys
+    assert "layers.0.mlp.gate_up.linear.weight" in keys
+    assert "layers.1.moe.router.gate.weight" in keys
+    assert "layers.1.moe.experts.fc1.weight0" in keys
+    assert "layers.1.moe.shared_expert.gate_up.linear.weight" in keys
+    assert "head.col.linear.weight" in keys
 
 
 def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
@@ -338,26 +378,24 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     from megatron.lite.model.glm5.lite.checkpoint import (
         export_hf_weights,
         save_hf_weights,
-        save_weights,
     )
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.parallel import ParallelState
 
     cfg = Glm5Config(**_tiny_config_kwargs())
-    model = Glm5ForCausalLM(cfg)
     ps = ParallelState()
-    model.model.layers[1].mlp.gate.e_score_correction_bias.copy_(torch.tensor([0.25, -0.5, 1.0]))
+    model = _make_glm5_model(cfg, ps=ps)
+    model.layers[1].moe.router.expert_bias.copy_(torch.tensor([0.25, -0.5, 1.0]))
 
     exported = dict(export_hf_weights(model, cfg, ps))
     state = model.state_dict()
 
     assert torch.equal(
         exported["model.layers.1.mlp.experts.2.gate_proj.weight"],
-        state["model.layers.1.mlp.experts.2.gate_proj.weight"],
+        state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size].detach().cpu(),
     )
     assert torch.equal(
         exported["model.layers.1.mlp.gate.e_score_correction_bias"],
-        state["model.layers.1.mlp.gate.e_score_correction_bias"],
+        state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
     assert "model.layers.1.mlp.experts.gate_up_proj" not in exported
 
@@ -366,20 +404,20 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     with safe_open(str(hf_dir / "model.safetensors"), framework="pt", device="cpu") as handle:
         assert torch.equal(
             handle.get_tensor("model.layers.1.mlp.experts.2.down_proj.weight"),
-            state["model.layers.1.mlp.experts.2.down_proj.weight"],
+            state["layers.1.moe.experts.fc2.weight2"].detach().cpu(),
         )
         assert torch.equal(
             handle.get_tensor("model.layers.1.mlp.gate.e_score_correction_bias"),
-            state["model.layers.1.mlp.gate.e_score_correction_bias"],
+            state["layers.1.moe.router.expert_bias"].detach().cpu(),
         )
 
-    loaded = Glm5ForCausalLM(cfg)
+    loaded = _make_glm5_model(cfg, ps=ps)
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
 
     load_hf_weights(loaded, str(hf_dir), cfg, ps)
     assert torch.equal(
-        loaded.state_dict()["model.layers.1.mlp.gate.e_score_correction_bias"],
-        state["model.layers.1.mlp.gate.e_score_correction_bias"],
+        loaded.state_dict()["layers.1.moe.router.expert_bias"].detach().cpu(),
+        state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
 
     hf_bf16_dir = tmp_path / "hf_bf16"
@@ -392,20 +430,20 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
         }
         assert floating_dtypes == {torch.bfloat16}
 
-    loaded_bf16 = Glm5ForCausalLM(cfg)
+    loaded_bf16 = _make_glm5_model(cfg, ps=ps)
     load_hf_weights(loaded_bf16, str(hf_bf16_dir), cfg, ps)
     assert torch.equal(
-        loaded_bf16.state_dict()["model.layers.1.mlp.experts.2.up_proj.weight"],
-        state["model.layers.1.mlp.experts.2.up_proj.weight"].to(torch.bfloat16).to(torch.float32),
+        loaded_bf16.state_dict()["layers.1.moe.experts.fc1.weight2"][
+            cfg.moe_intermediate_size :
+        ]
+        .detach()
+        .cpu(),
+        state["layers.1.moe.experts.fc1.weight2"][cfg.moe_intermediate_size :]
+        .detach()
+        .cpu()
+        .to(torch.bfloat16)
+        .to(torch.float32),
     )
-
-    native_dir = tmp_path / "native"
-    save_weights(model, str(native_dir), cfg, ps)
-    with safe_open(str(native_dir / "model.safetensors"), framework="pt", device="cpu") as handle:
-        assert torch.equal(
-            handle.get_tensor("model.layers.1.mlp.experts.0.up_proj.weight"),
-            state["model.layers.1.mlp.experts.0.up_proj.weight"],
-        )
 
 
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
@@ -413,175 +451,52 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
 
     cfg = Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1)
     ps = ParallelState()
-    model = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True)
+    model = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
     state = model.state_dict()
 
-    assert "model.mtp.layers.0.eh_proj.weight" in state
-    assert "model.mtp.layers.0.transformer_layer.input_layernorm.weight" in state
+    assert "mtp.layers.0.eh_proj.linear.weight" in state
+    assert "mtp.layers.0.transformer_layer.input_layernorm.weight" in state
 
     exported = dict(export_hf_weights(model, cfg, ps))
     assert "model.layers.2.eh_proj.weight" in exported
     assert "model.layers.2.enorm.weight" in exported
     assert "model.layers.2.hnorm.weight" in exported
-    assert "model.layers.2.final_layernorm.weight" in exported
+    assert "model.layers.2.shared_head.norm.weight" in exported
     assert "model.layers.2.input_layernorm.weight" in exported
     assert "model.layers.2.mlp.gate.weight" in exported
 
     save_safetensors(exported, str(tmp_path))
-    loaded = Glm5ForCausalLM(cfg, ps=ps, mtp_enable=True)
+    loaded = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
     load_hf_weights(loaded, str(tmp_path), cfg, ps)
     assert torch.equal(
-        loaded.state_dict()["model.mtp.layers.0.eh_proj.weight"],
-        state["model.mtp.layers.0.eh_proj.weight"],
+        loaded.state_dict()["mtp.layers.0.eh_proj.linear.weight"],
+        state["mtp.layers.0.eh_proj.linear.weight"],
     )
 
 
-def test_glm5_initialize_weights_resets_all_router_weights():
+def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM, Glm5Router
+    from megatron.lite.model.glm5.lite.model import Glm5SigmoidTopKRouter
 
-    model = Glm5ForCausalLM(
+    model = _make_glm5_model(
         Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1), mtp_enable=True
     )
-    routers = [module for module in model.modules() if isinstance(module, Glm5Router)]
+    routers = [module for module in model.modules() if isinstance(module, Glm5SigmoidTopKRouter)]
     assert len(routers) == 2
     for router in routers:
-        router.weight.data.fill_(float("nan"))
-        router.e_score_correction_bias.data.fill_(float("nan"))
-
-    model.initialize_weights()
-
-    for router in routers:
-        assert torch.isfinite(router.weight).all()
+        assert hasattr(router, "gate")
+        assert hasattr(router, "expert_bias")
+        assert torch.isfinite(router.gate.weight).all()
         assert torch.equal(
-            router.e_score_correction_bias, torch.zeros_like(router.e_score_correction_bias)
+            router.expert_bias, torch.zeros_like(router.expert_bias)
         )
-
-
-def test_glm5_hf_loader_resolves_grouped_expert_tensors():
-    import torch
-
-    from megatron.lite.model.glm5.lite.checkpoint import _resolve_hf_tensor
-
-    class FakeReader:
-        def __init__(self, tensors):
-            self.tensors = tensors
-            self.index = {name: "model.safetensors" for name in tensors}
-
-        def get_tensor(self, name):
-            return self.tensors[name]
-
-    hf_gate_up = torch.arange(3 * 12 * 16, dtype=torch.float32).reshape(3, 12, 16)
-    hf_down = torch.arange(3 * 16 * 6, dtype=torch.float32).reshape(3, 16, 6)
-    hf_reader = FakeReader(
-        {
-            "model.layers.1.mlp.experts.gate_up_proj": hf_gate_up,
-            "model.layers.1.mlp.experts.down_proj": hf_down,
-        }
-    )
-
-    gate_target = torch.empty(6, 16)
-    down_target = torch.empty(16, 6)
-    assert torch.equal(
-        _resolve_hf_tensor(hf_reader, "model.layers.1.mlp.experts.2.gate_proj.weight", gate_target),
-        hf_gate_up[2, :6, :],
-    )
-    assert torch.equal(
-        _resolve_hf_tensor(hf_reader, "model.layers.1.mlp.experts.2.up_proj.weight", gate_target),
-        hf_gate_up[2, 6:, :],
-    )
-    assert torch.equal(
-        _resolve_hf_tensor(hf_reader, "model.layers.1.mlp.experts.2.down_proj.weight", down_target),
-        hf_down[2],
-    )
-
-    automodel_gate_up = torch.arange(3 * 16 * 12, dtype=torch.float32).reshape(3, 16, 12)
-    automodel_down = torch.arange(3 * 6 * 16, dtype=torch.float32).reshape(3, 6, 16)
-    automodel_reader = FakeReader(
-        {
-            "model.layers.1.mlp.experts.gate_and_up_projs": automodel_gate_up,
-            "model.layers.1.mlp.experts.down_projs": automodel_down,
-        }
-    )
-    assert torch.equal(
-        _resolve_hf_tensor(
-            automodel_reader, "model.layers.1.mlp.experts.1.gate_proj.weight", gate_target
-        ),
-        automodel_gate_up[1, :, :6].T,
-    )
-    assert torch.equal(
-        _resolve_hf_tensor(
-            automodel_reader, "model.layers.1.mlp.experts.1.up_proj.weight", gate_target
-        ),
-        automodel_gate_up[1, :, 6:].T,
-    )
-    assert torch.equal(
-        _resolve_hf_tensor(
-            automodel_reader, "model.layers.1.mlp.experts.1.down_proj.weight", down_target
-        ),
-        automodel_down[1].T,
-    )
-
-
-def test_glm5_hf_loader_slices_full_expert_tensors_for_proxy_targets():
-    import torch
-
-    from megatron.lite.model.glm5.lite.checkpoint import _slice_to_target_shape
-
-    source = torch.arange(256 * 8, dtype=torch.float32).reshape(256, 8)
-    target = torch.empty(4, 8)
-    assert torch.equal(_slice_to_target_shape(source, target), source[:4])
-
-    source3d = torch.arange(256 * 6 * 8, dtype=torch.float32).reshape(256, 6, 8)
-    target3d = torch.empty(4, 6, 8)
-    assert torch.equal(_slice_to_target_shape(source3d, target3d), source3d[:4])
-
-
-def test_glm5_hf_loader_resolves_packed_experts_from_single_safetensor(tmp_path):
-    import torch
-
-    from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import _resolve_named_parameter_tensor
-    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, save_safetensors
-    from megatron.lite.primitive.parallel import ParallelState
-
-    cfg = Glm5Config(**_tiny_config_kwargs())
-    gate_up = torch.arange(3 * 12 * 16, dtype=torch.float32).reshape(3, 12, 16)
-    down = torch.arange(3 * 16 * 6, dtype=torch.float32).reshape(3, 16, 6)
-    save_safetensors(
-        {
-            "model.layers.1.mlp.experts.gate_up_proj": gate_up,
-            "model.layers.1.mlp.experts.down_proj": down,
-        },
-        str(tmp_path),
-    )
-    reader = SafeTensorReader(str(tmp_path))
-
-    resolved_gate_up = _resolve_named_parameter_tensor(
-        reader,
-        "model.layers.1.mlp.experts.gate_up_proj",
-        torch.empty(3, 12, 16),
-        config=cfg,
-        ps=ParallelState(),
-    )
-    resolved_down = _resolve_named_parameter_tensor(
-        reader,
-        "model.layers.1.mlp.experts.down_proj",
-        torch.empty(3, 16, 6),
-        config=cfg,
-        ps=ParallelState(),
-    )
-
-    assert torch.equal(resolved_gate_up, gate_up)
-    assert torch.equal(resolved_down, down)
 
 
 def test_glm5_protocol_allows_cp_only_parallel_scope():
@@ -590,11 +505,14 @@ def test_glm5_protocol_allows_cp_only_parallel_scope():
     from megatron.lite.model.glm5.lite.protocol import _validate_parallel_scope
     from megatron.lite.runtime.contracts import ParallelConfig
 
+    # CP-only as well as PP/VPP/EP are supported and must validate cleanly.
     _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=2, pp=1, vpp=1))
+    _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=1, pp=2, vpp=2))
+    # GLM-5 native DSA attention rejects tensor / expert-tensor parallelism.
     with pytest.raises(NotImplementedError):
         _validate_parallel_scope(ParallelConfig(tp=2, ep=1, etp=1, cp=1, pp=1, vpp=1))
     with pytest.raises(NotImplementedError):
-        _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=1, pp=2, vpp=2))
+        _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=2, cp=1, pp=1, vpp=1))
 
 
 def test_glm5_impl_config_accepts_runtime_mtp_fields():
@@ -606,18 +524,6 @@ def test_glm5_impl_config_accepts_runtime_mtp_fields():
     assert ImplConfig(mtp_enable=False, mtp_enable_train=False).mtp_enable is False
     assert ImplConfig(mtp_enable=True, mtp_enable_train=True).mtp_enable_train is True
     assert cfg.num_nextn_predict_layers == 1
-
-
-def test_glm5_pipeline_layer_split_handles_non_divisible_pp():
-    from types import SimpleNamespace
-
-    from megatron.lite.model.glm5.lite.model import _build_glm5_pipeline_layers
-
-    def split_for_rank(pp_rank):
-        ps = SimpleNamespace(pp_size=4, pp_rank=pp_rank)
-        return _build_glm5_pipeline_layers(5, ps)
-
-    assert [split_for_rank(rank) for rank in range(4)] == [[], [0, 1], [2, 3], [4]]
 
 
 def test_glm5_protocol_uses_mlite_optimizer_api():
@@ -638,12 +544,16 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     assert "build_dist_opt_training_optimizer" in protocol_text
 
 
-def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
+def test_glm5_lite_tiny_forward_backward(monkeypatch):
+    import pytest
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5ForCausalLM
     from megatron.lite.primitive.modules.attention import dsa
+
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5 native model requires CUDA (Transformer Engine RMSNorm)")
+    device = torch.device("cuda")
 
     def fake_fused_indexer_sparse_attn(
         query,
@@ -688,13 +598,17 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
     )
 
     torch.manual_seed(1234)
-    model = Glm5ForCausalLM(Glm5Config(**_tiny_config_kwargs()))
-    input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
-    labels = torch.randint(0, model.config.vocab_size, (2, 5))
+    model = _make_glm5_model(Glm5Config(**_tiny_config_kwargs())).to(
+        device=device, dtype=torch.bfloat16
+    )
+    input_ids = torch.randint(0, model.config.vocab_size, (2, 5), device=device)
+    labels = torch.randint(0, model.config.vocab_size, (2, 5), device=device)
 
     output = model(input_ids=input_ids, labels=labels)
 
-    assert output["hidden_states"].shape == (2, 5, model.config.hidden_size)
+    # hidden_states stays in (seq, batch, hidden) layout; logits are transposed
+    # back to (batch, seq, *) inside forward.
+    assert output["hidden_states"].shape == (5, 2, model.config.hidden_size)
     assert output["loss"].ndim == 0
     output["loss"].backward()
     grad_norm = sum(
@@ -702,19 +616,25 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
     )
     assert torch.isfinite(grad_norm)
 
-    mtp_model = Glm5ForCausalLM(
+    mtp_model = _make_glm5_model(
         Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1),
         mtp_enable=True,
         mtp_enable_train=True,
-    )
+    ).to(device=device, dtype=torch.bfloat16)
+    # Inference path (no labels) exposes the per-MTP-head logits.
+    mtp_infer = mtp_model(input_ids=input_ids)
+    assert len(mtp_infer["mtp_hidden_states"]) == 1
+    assert len(mtp_infer["mtp_logits"]) == 1
+    assert mtp_infer["mtp_hidden_states"][0].shape == (5, 2, mtp_model.config.hidden_size)
+    assert mtp_infer["mtp_logits"][0].shape == (2, 5, mtp_model.config.vocab_size)
+
+    # Training path (with labels) returns the MTP loss instead of logits.
     mtp_output = mtp_model(
         input_ids=input_ids, labels=labels, loss_mask=torch.ones_like(labels, dtype=torch.float32)
     )
 
     assert len(mtp_output["mtp_hidden_states"]) == 1
-    assert len(mtp_output["mtp_logits"]) == 1
-    assert mtp_output["mtp_hidden_states"][0].shape == (2, 5, mtp_model.config.hidden_size)
-    assert mtp_output["mtp_logits"][0].shape == (2, 5, mtp_model.config.vocab_size)
+    assert mtp_output["mtp_hidden_states"][0].shape == (5, 2, mtp_model.config.hidden_size)
     assert mtp_output["mtp_loss"].ndim == 0
     mtp_output["loss"].backward()
     mtp_grad_norm = sum(
