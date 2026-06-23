@@ -359,9 +359,9 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
             grad_norm = grad_norm + param.grad.detach().float().norm()
     assert torch.isfinite(grad_norm)
 
-    nested_logits = unpack_packed_thd_to_nested(out["logits"], packed)
-    assert nested_logits.offsets().numel() == len(lengths) + 1
-    assert [int(x) for x in nested_logits.offsets().diff().cpu()] == lengths
+    nested_log_probs = unpack_packed_thd_to_nested(out["log_probs"], packed)
+    assert nested_log_probs.offsets().numel() == len(lengths) + 1
+    assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
 
     if rank == 0:
         print(
