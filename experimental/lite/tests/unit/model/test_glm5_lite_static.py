@@ -489,11 +489,14 @@ def test_glm5_protocol_allows_cp_only_parallel_scope():
     from megatron.lite.model.glm5.lite.protocol import _validate_parallel_scope
     from megatron.lite.runtime.contracts import ParallelConfig
 
+    # CP-only as well as PP/VPP/EP are supported and must validate cleanly.
     _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=2, pp=1, vpp=1))
+    _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=1, pp=2, vpp=2))
+    # GLM-5 native DSA attention rejects tensor / expert-tensor parallelism.
     with pytest.raises(NotImplementedError):
         _validate_parallel_scope(ParallelConfig(tp=2, ep=1, etp=1, cp=1, pp=1, vpp=1))
     with pytest.raises(NotImplementedError):
-        _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=1, cp=1, pp=2, vpp=2))
+        _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=2, cp=1, pp=1, vpp=1))
 
 
 def test_glm5_impl_config_accepts_runtime_mtp_fields():
@@ -593,14 +596,20 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
         mtp_enable=True,
         mtp_enable_train=True,
     )
+    # Inference path (no labels) exposes the per-MTP-head logits.
+    mtp_infer = mtp_model(input_ids=input_ids)
+    assert len(mtp_infer["mtp_hidden_states"]) == 1
+    assert len(mtp_infer["mtp_logits"]) == 1
+    assert mtp_infer["mtp_hidden_states"][0].shape == (2, 5, mtp_model.config.hidden_size)
+    assert mtp_infer["mtp_logits"][0].shape == (2, 5, mtp_model.config.vocab_size)
+
+    # Training path (with labels) returns the MTP loss instead of logits.
     mtp_output = mtp_model(
         input_ids=input_ids, labels=labels, loss_mask=torch.ones_like(labels, dtype=torch.float32)
     )
 
     assert len(mtp_output["mtp_hidden_states"]) == 1
-    assert len(mtp_output["mtp_logits"]) == 1
     assert mtp_output["mtp_hidden_states"][0].shape == (2, 5, mtp_model.config.hidden_size)
-    assert mtp_output["mtp_logits"][0].shape == (2, 5, mtp_model.config.vocab_size)
     assert mtp_output["mtp_loss"].ndim == 0
     mtp_output["loss"].backward()
     mtp_grad_norm = sum(
