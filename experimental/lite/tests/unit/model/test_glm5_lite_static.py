@@ -201,10 +201,15 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
 
 
 def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
+    import pytest
     import torch
 
     from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
+
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5 native attention requires CUDA (Transformer Engine RMSNorm)")
+    device = torch.device("cuda")
 
     calls = {}
 
@@ -260,10 +265,13 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
         index_topk=2,
         rms_norm_eps=1e-5,
     )
+    attn.to(device=device, dtype=torch.bfloat16)
     attn.train()
-    x = torch.randn(1, 4, 16)
-    cos, sin = build_rope_cache(dim=4, max_position_embeddings=4, rope_theta=1_000_000.0)
-    position_ids = torch.arange(4).unsqueeze(0)
+    x = torch.randn(1, 4, 16, device=device, dtype=torch.bfloat16)
+    cos, sin = build_rope_cache(
+        dim=4, max_position_embeddings=4, rope_theta=1_000_000.0, device=device
+    )
+    position_ids = torch.arange(4, device=device).unsqueeze(0)
 
     out = attn(x, cos=cos, sin=sin, position_ids=position_ids)
 
@@ -283,18 +291,23 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
 
 
 def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
+    import pytest
     import torch
 
     from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
+
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5 native attention requires CUDA (Transformer Engine RMSNorm)")
+    device = torch.device("cuda")
 
     calls = {}
 
     def fake_indexer_topk(q_indexer, k_indexer, weights, topk, ratio, indexer_softmax_scale=1.0):
         del q_indexer, k_indexer, weights, indexer_softmax_scale
         calls["indexer"] = {"topk": topk, "ratio": ratio}
-        idx = torch.zeros((1, 4, topk), dtype=torch.int32)
-        return idx, torch.full((1, 4), topk, dtype=torch.int32)
+        idx = torch.zeros((1, 4, topk), dtype=torch.int32, device=device)
+        return idx, torch.full((1, 4), topk, dtype=torch.int32, device=device)
 
     def fake_dsa_sparse_attn(
         query,
@@ -326,10 +339,13 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
         index_topk=2,
         rms_norm_eps=1e-5,
     )
+    attn.to(device=device, dtype=torch.bfloat16)
     attn.eval()
-    x = torch.randn(1, 4, 16)
-    cos, sin = build_rope_cache(dim=4, max_position_embeddings=4, rope_theta=1_000_000.0)
-    position_ids = torch.arange(4).unsqueeze(0)
+    x = torch.randn(1, 4, 16, device=device, dtype=torch.bfloat16)
+    cos, sin = build_rope_cache(
+        dim=4, max_position_embeddings=4, rope_theta=1_000_000.0, device=device
+    )
+    position_ids = torch.arange(4, device=device).unsqueeze(0)
 
     with torch.no_grad():
         out = attn(x, cos=cos, sin=sin, position_ids=position_ids)
@@ -528,11 +544,16 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     assert "build_dist_opt_training_optimizer" in protocol_text
 
 
-def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
+def test_glm5_lite_tiny_forward_backward(monkeypatch):
+    import pytest
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.modules.attention import dsa
+
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5 native model requires CUDA (Transformer Engine RMSNorm)")
+    device = torch.device("cuda")
 
     def fake_fused_indexer_sparse_attn(
         query,
@@ -577,13 +598,17 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
     )
 
     torch.manual_seed(1234)
-    model = _make_glm5_model(Glm5Config(**_tiny_config_kwargs()))
-    input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
-    labels = torch.randint(0, model.config.vocab_size, (2, 5))
+    model = _make_glm5_model(Glm5Config(**_tiny_config_kwargs())).to(
+        device=device, dtype=torch.bfloat16
+    )
+    input_ids = torch.randint(0, model.config.vocab_size, (2, 5), device=device)
+    labels = torch.randint(0, model.config.vocab_size, (2, 5), device=device)
 
     output = model(input_ids=input_ids, labels=labels)
 
-    assert output["hidden_states"].shape == (2, 5, model.config.hidden_size)
+    # hidden_states stays in (seq, batch, hidden) layout; logits are transposed
+    # back to (batch, seq, *) inside forward.
+    assert output["hidden_states"].shape == (5, 2, model.config.hidden_size)
     assert output["loss"].ndim == 0
     output["loss"].backward()
     grad_norm = sum(
@@ -595,12 +620,12 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
         Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1),
         mtp_enable=True,
         mtp_enable_train=True,
-    )
+    ).to(device=device, dtype=torch.bfloat16)
     # Inference path (no labels) exposes the per-MTP-head logits.
     mtp_infer = mtp_model(input_ids=input_ids)
     assert len(mtp_infer["mtp_hidden_states"]) == 1
     assert len(mtp_infer["mtp_logits"]) == 1
-    assert mtp_infer["mtp_hidden_states"][0].shape == (2, 5, mtp_model.config.hidden_size)
+    assert mtp_infer["mtp_hidden_states"][0].shape == (5, 2, mtp_model.config.hidden_size)
     assert mtp_infer["mtp_logits"][0].shape == (2, 5, mtp_model.config.vocab_size)
 
     # Training path (with labels) returns the MTP loss instead of logits.
@@ -609,7 +634,7 @@ def test_glm5_lite_tiny_cpu_forward_backward(monkeypatch):
     )
 
     assert len(mtp_output["mtp_hidden_states"]) == 1
-    assert mtp_output["mtp_hidden_states"][0].shape == (2, 5, mtp_model.config.hidden_size)
+    assert mtp_output["mtp_hidden_states"][0].shape == (5, 2, mtp_model.config.hidden_size)
     assert mtp_output["mtp_loss"].ndim == 0
     mtp_output["loss"].backward()
     mtp_grad_norm = sum(
