@@ -1,7 +1,6 @@
 radixark/miles source reference for this example.
 
 Repository: https://github.com/radixark/miles
-Fork used for inspection: https://github.com/ISEEKYAN/miles
 Branch: main
 Commit: 55c8d8b22f82a5afa0db69b758e5df281c6f8f2d
 
