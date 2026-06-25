@@ -138,7 +138,6 @@ RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
-USE_LEGACY_WORKER_IMPL="${USE_LEGACY_WORKER_IMPL:-disable}"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_ARGS=("$@")
 
@@ -325,7 +324,6 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
-  "trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL}"
 )
 
 COMMAND=(
