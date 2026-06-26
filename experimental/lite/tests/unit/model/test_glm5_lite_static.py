@@ -570,6 +570,135 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     )
 
 
+def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
+    import importlib.util
+    import torch
+
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    checkpoint_path = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "glm5"
+        / "lite"
+        / "checkpoint.py"
+    )
+    module_spec = importlib.util.spec_from_file_location("_glm5_checkpoint_test", checkpoint_path)
+    assert module_spec is not None and module_spec.loader is not None
+    checkpoint_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(checkpoint_module)
+
+    cfg = Glm5Config(
+        **{
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 6,
+            "num_nextn_predict_layers": 1,
+        },
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(num_layers=6),
+        index_share_for_mtp_iteration=True,
+    )
+    spec = checkpoint_module.Glm5WeightSpec(cfg)
+    tensor = torch.ones(1)
+
+    assert spec.native_to_hf(
+        "layers.2.self_attention.self_attention.indexer.wq_b.weight", tensor
+    ) == [("model.layers.2.self_attn.indexer.wq_b.weight", tensor)]
+    assert (
+        spec.native_to_hf("layers.3.self_attention.self_attention.indexer.wq_b.weight", tensor)
+        == []
+    )
+    assert spec.native_to_hf(
+        "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight",
+        tensor,
+    ) == [("model.layers.6.self_attn.indexer.wq_b.weight", tensor)]
+
+    base_names = {
+        "model.layers.3.self_attn.q_a_proj.weight",
+        "model.layers.3.self_attn.q_a_layernorm.weight",
+        "model.layers.3.self_attn.q_b_proj.weight",
+        "model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+        "model.layers.3.self_attn.kv_a_layernorm.weight",
+        "model.layers.3.self_attn.kv_b_proj.weight",
+        "model.layers.3.self_attn.o_proj.weight",
+    }
+
+    class Reader:
+        index = {name: "model.safetensors" for name in base_names}
+
+        def get_tensor(self, name):
+            if name not in self.index:
+                raise KeyError(name)
+            return torch.ones(1)
+
+    out = {}
+    checkpoint_module._load_attention(
+        out,
+        local_prefix="layers.3",
+        hf_prefix="model.layers.3.self_attn",
+        reader=Reader(),
+        ps=object(),
+        load_indexer=False,
+    )
+    assert "layers.3.self_attention.self_attention.q_a_proj.weight" in out
+    assert not any(".indexer." in name for name in out)
+
+
+def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp_path):
+    import pytest
+    import torch
+
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+    except (ModuleNotFoundError, OSError) as exc:
+        pytest.skip(f"Transformer Engine is not importable in this environment: {exc}")
+
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
+    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+    from megatron.lite.primitive.parallel import ParallelState
+
+    cfg = Glm5Config(
+        **{
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 6,
+            "num_nextn_predict_layers": 1,
+        },
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(num_layers=6),
+        index_share_for_mtp_iteration=True,
+    )
+    ps = ParallelState()
+    model = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
+    state = model.state_dict()
+
+    exported = dict(export_hf_weights(model, cfg, ps))
+    assert "model.layers.2.self_attn.indexer.wq_b.weight" in exported
+    assert "model.layers.3.self_attn.indexer.wq_b.weight" not in exported
+    assert "model.layers.6.self_attn.indexer.wq_b.weight" in exported
+
+    save_safetensors(exported, str(tmp_path))
+    loaded = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
+    load_hf_weights(loaded, str(tmp_path), cfg, ps)
+    loaded_state = loaded.state_dict()
+
+    assert torch.equal(
+        loaded_state["layers.2.self_attention.self_attention.indexer.wq_b.weight"],
+        state["layers.2.self_attention.self_attention.indexer.wq_b.weight"],
+    )
+    assert "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in loaded_state
+    assert torch.equal(
+        loaded_state[
+            "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"
+        ],
+        state["mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"],
+    )
+
+
 def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
