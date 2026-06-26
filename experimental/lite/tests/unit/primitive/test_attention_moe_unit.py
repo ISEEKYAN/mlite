@@ -147,3 +147,48 @@ def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
     assert torch.isfinite(grad_with_aux).all()
     assert torch.isfinite(grad_no_aux).all()
     assert (grad_with_aux - grad_no_aux).abs().sum().item() > 0.0
+
+
+def test_dsa_index_share_schedule_and_state():
+    from megatron.lite.primitive.modules.attention.dsa import (
+        DSAIndexShareState,
+        dsa_indexer_type_for_layer,
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    assert is_dsa_skip_topk_layer(3, skip_topk_offset=3, topk_freq=4) is False
+    assert is_dsa_skip_topk_layer(4, skip_topk_offset=3, topk_freq=4) is True
+    assert dsa_indexer_type_for_layer(7, skip_topk_offset=3, topk_freq=4) == "full"
+    assert source_dsa_compute_layer(6, skip_topk_offset=3, topk_freq=4) == 3
+
+    state = DSAIndexShareState()
+    topk = torch.tensor([[[0, 1], [1, 2]]], dtype=torch.int32)
+    state.save_topk(3, topk, sequence_key=0)
+    assert torch.equal(state.get_topk(6, 3, sequence_key=0), topk)
+    with pytest.raises(AssertionError, match="source layer 3"):
+        state.get_topk(5, 3, sequence_key=1)
+
+
+def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
+    from megatron.lite.primitive.modules.attention.dsa import (
+        validate_dsa_index_share_pipeline_split,
+    )
+
+    validate_dsa_index_share_pipeline_split(
+        [0, 1, 2, 3],
+        topk_freq=4,
+        skip_topk_offset=3,
+    )
+    with pytest.raises(ValueError, match="cannot cross pipeline stages"):
+        validate_dsa_index_share_pipeline_split(
+            [3, 4, 5],
+            topk_freq=4,
+            skip_topk_offset=3,
+        )
+    with pytest.raises(ValueError, match="must execute before"):
+        validate_dsa_index_share_pipeline_split(
+            [3, 2],
+            topk_freq=4,
+            skip_topk_offset=3,
+        )

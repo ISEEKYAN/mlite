@@ -36,8 +36,10 @@ import transformer_engine.pytorch as te
 
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.primitive.modules.attention import (
+    DSAIndexShareState,
     DynamicSparseAttention,
     build_rotary_embeddings,
+    validate_dsa_index_share_pipeline_split,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -159,7 +161,7 @@ class Glm5DSAAttention(nn.Module):
     The Kimi skeleton therefore never observes the batch-first interior.
     """
 
-    def __init__(self, config: Glm5Config, ps: ParallelState):
+    def __init__(self, config: Glm5Config, ps: ParallelState, layer_idx: int):
         super().__init__()
         self.ps = ps
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -182,6 +184,10 @@ class Glm5DSAAttention(nn.Module):
             indexer_rope_interleaved=config.indexer_rope_interleave,
             indexer_rope_first=config.indexer_rope_first,
             indexer_use_hadamard=config.indexer_use_hadamard,
+            layer_number=layer_idx + 1,
+            index_topk_freq=config.index_topk_freq,
+            index_skip_topk_offset=config.index_skip_topk_offset,
+            indexer_type=config.dsa_indexer_type(layer_idx),
             indexer_loss_coeff=config.dsa_indexer_loss_coeff,
             indexer_use_sparse_loss=config.dsa_indexer_use_sparse_loss,
             calculate_per_token_loss=config.calculate_per_token_loss,
@@ -190,7 +196,12 @@ class Glm5DSAAttention(nn.Module):
             cp_group=ps.cp_group,
         )
 
-    def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        packed_seq_params=None,
+        dsa_index_share_state: DSAIndexShareState | None = None,
+    ) -> torch.Tensor:
         # Kimi feeds SBHD [S, B, H]; DSA needs batch-first [B, S, H].
         x_bsh = x.transpose(0, 1).contiguous()
         batch, seq_len, _ = x_bsh.shape
@@ -214,6 +225,7 @@ class Glm5DSAAttention(nn.Module):
             position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
+            index_share_state=dsa_index_share_state,
         )
         # Back to SBHD [S, B, H] for the Kimi skeleton.
         return out_bsh.transpose(0, 1).contiguous()
@@ -454,7 +466,7 @@ class Glm5Layer(nn.Module):
         # The wrapper preserves the SBHD self_attention(x, packed_seq_params=)
         # contract so this layer's forward stays identical to Kimi's.
         del use_thd  # DSA derives its own THD handling from packed_seq_params.
-        self.self_attention = Glm5DSAAttention(config, ps)
+        self.self_attention = Glm5DSAAttention(config, ps, layer_idx)
         if config.is_moe_layer(layer_idx):
             self.mlp_norm: nn.Module | None = te.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -473,8 +485,17 @@ class Glm5Layer(nn.Module):
             self.moe = None
             self.mlp = DenseMLP(config, ps)
 
-    def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
-        x = x + self.self_attention(self.input_layernorm(x), packed_seq_params=packed_seq_params)
+    def forward(
+        self,
+        x: torch.Tensor,
+        packed_seq_params=None,
+        dsa_index_share_state: DSAIndexShareState | None = None,
+    ) -> torch.Tensor:
+        x = x + self.self_attention(
+            self.input_layernorm(x),
+            packed_seq_params=packed_seq_params,
+            dsa_index_share_state=dsa_index_share_state,
+        )
         if self.moe is not None:
             assert self.mlp_norm is not None
             mlp_input = self.mlp_norm(x)
@@ -545,6 +566,7 @@ class Glm5MTPLayer(nn.Module):
         hidden_states: torch.Tensor,
         rotary_position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
+        dsa_index_share_state: DSAIndexShareState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         del rotary_position_ids
         input_ids, _ = _roll_mtp_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
@@ -564,7 +586,11 @@ class Glm5MTPLayer(nn.Module):
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
-        hidden_states = self.transformer_layer(hidden_states, packed_seq_params=packed_seq_params)
+        hidden_states = self.transformer_layer(
+            hidden_states,
+            packed_seq_params=packed_seq_params,
+            dsa_index_share_state=dsa_index_share_state,
+        )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
 
@@ -613,6 +639,7 @@ class Glm5MTPBlock(nn.Module):
         position_ids: torch.Tensor | None,
         hidden_states: torch.Tensor,
         packed_seq_params=None,
+        dsa_index_share_state: DSAIndexShareState | None = None,
     ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor] = []
         rotary_position_ids = position_ids
@@ -624,6 +651,7 @@ class Glm5MTPBlock(nn.Module):
                 hidden_states=hidden_states,
                 rotary_position_ids=rotary_position_ids,
                 packed_seq_params=packed_seq_params,
+                dsa_index_share_state=dsa_index_share_state,
             )
             outputs.append(hidden_states)
         return outputs
@@ -695,6 +723,12 @@ class Glm5Model(nn.Module):
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed
         self.post_process = layout.has_head
+        validate_dsa_index_share_pipeline_split(
+            self.layer_indices,
+            topk_freq=config.index_topk_freq,
+            skip_topk_offset=config.index_skip_topk_offset,
+            indexer_types=config.indexer_types,
+        )
         # GLM-5 does not tie embeddings (no tie_word_embeddings HF field); the
         # attribute is preserved for the dist-opt / distckpt interface.
         self.share_embeddings_and_output_weights = bool(
@@ -788,10 +822,17 @@ class Glm5Model(nn.Module):
             else nullcontext()
         )
         with fp8_ctx:
+            dsa_index_share_state = (
+                DSAIndexShareState() if self.config.uses_dsa_index_share else None
+            )
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
             for layer in self.layers:
-                h = layer(h, packed_seq_params=packed_seq_params)
+                h = layer(
+                    h,
+                    packed_seq_params=packed_seq_params,
+                    dsa_index_share_state=dsa_index_share_state,
+                )
 
         output = {"hidden_states": h}
         if self.head is not None:
@@ -802,6 +843,7 @@ class Glm5Model(nn.Module):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
+                dsa_index_share_state=dsa_index_share_state,
             )
             if mtp_hidden_states is not None:
                 output["mtp_hidden_states"] = mtp_hidden_states
@@ -860,6 +902,7 @@ class Glm5Model(nn.Module):
         input_ids: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         packed_seq_params,
+        dsa_index_share_state: DSAIndexShareState | None,
     ) -> list[torch.Tensor] | None:
         if self.mtp is None:
             return None
@@ -872,6 +915,7 @@ class Glm5Model(nn.Module):
             position_ids=position_ids,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
+            dsa_index_share_state=dsa_index_share_state,
         )
 
     def _apply_mtp_loss(
