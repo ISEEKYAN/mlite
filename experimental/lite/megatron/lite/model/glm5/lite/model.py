@@ -687,6 +687,28 @@ def _apply_attention_backend_override(backend: str | None) -> None:
     ) = env
 
 
+def _dsa_index_share_decoder_layer_groups(config: Glm5Config) -> list[list[int]] | None:
+    if not config.uses_dsa_index_share:
+        return None
+
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_source: int | None = None
+    for layer_idx in range(config.num_hidden_layers):
+        if config.dsa_indexer_type(layer_idx) == "shared":
+            source_idx = config.dsa_indexer_source_layer(layer_idx)
+        else:
+            source_idx = layer_idx
+        if current and source_idx != current_source:
+            groups.append(current)
+            current = []
+        current.append(layer_idx)
+        current_source = source_idx
+    if current:
+        groups.append(current)
+    return groups
+
+
 class Glm5Model(nn.Module):
     def __init__(
         self,
@@ -719,6 +741,7 @@ class Glm5Model(nn.Module):
             train_config.vpp,
             vpp_chunk_id,
             num_mtp_layers=config.num_nextn_predict_layers if mtp_enable else 0,
+            decoder_layer_groups=_dsa_index_share_decoder_layer_groups(config),
         )
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed
