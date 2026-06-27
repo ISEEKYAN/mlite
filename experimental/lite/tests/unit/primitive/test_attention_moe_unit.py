@@ -52,6 +52,35 @@ def _walk_grad_fn_names(tensor: torch.Tensor) -> set[str]:
     return names
 
 
+def test_attention_public_api_is_narrow():
+    from megatron.lite.primitive.modules import attention
+
+    assert attention.__all__ == [
+        "DSAIndexShareState",
+        "DynamicSparseAttention",
+        "MultiLatentAttention",
+        "RMSNorm",
+        "build_rope_cache",
+        "build_rotary_embeddings",
+    ]
+    assert attention.DynamicSparseAttention is attention.dsa.DynamicSparseAttention
+    assert attention.DSAIndexShareState is attention.dsa.DSAIndexShareState
+    for internal_name in (
+        "dsa_indexer_type_for_layer",
+        "is_dsa_skip_topk_layer",
+        "source_dsa_compute_layer",
+        "validate_dsa_index_share_pipeline_split",
+    ):
+        assert not hasattr(attention, internal_name)
+    for internal_name in (
+        "dsa_indexer_type_for_layer",
+        "is_dsa_skip_topk_layer",
+        "source_dsa_compute_layer",
+    ):
+        assert internal_name not in attention.dsa.__all__
+    assert "validate_dsa_index_share_pipeline_split" in attention.dsa.__all__
+
+
 def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     split_grouped_qkvg = _split_grouped_qkvg()
     qkv = torch.arange(24).reshape(1, 24)

@@ -39,7 +39,7 @@ from megatron.lite.primitive.modules.attention import (
     DSAIndexShareState,
     DynamicSparseAttention,
     build_rotary_embeddings,
-    validate_dsa_index_share_pipeline_split,
+    dsa,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -788,7 +788,7 @@ class Glm5Model(nn.Module):
                     config.num_hidden_layers + mtp_layers_to_build,
                 )
             )
-        validate_dsa_index_share_pipeline_split(
+        dsa.validate_dsa_index_share_pipeline_split(
             local_dsa_layer_indices,
             topk_freq=config.index_topk_freq,
             skip_topk_offset=config.index_skip_topk_offset,
