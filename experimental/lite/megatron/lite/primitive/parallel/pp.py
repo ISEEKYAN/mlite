@@ -29,7 +29,13 @@ class PipelineChunkLayout:
     has_mtp: bool = False
 
 
-def _auto_layout(num_hidden_layers: int, pp_size: int, num_mtp_layers: int):
+def _auto_layout(
+    num_hidden_layers: int,
+    pp_size: int,
+    num_mtp_layers: int,
+    *,
+    rows: list[list[str]] | None = None,
+):
     """Balance ``[E, decoder*N, mtp*K, loss]`` into even contiguous chunks; the
     embedding/MTP/loss slots make their stages carry fewer decoders (e.g. 6/pp4 ->
     [1,2,2,1]) — Megatron's embedding/loss split accounting."""
@@ -37,12 +43,13 @@ def _auto_layout(num_hidden_layers: int, pp_size: int, num_mtp_layers: int):
         PipelineParallelLayerLayout,
     )
 
-    units = ["embedding"] + ["decoder"] * num_hidden_layers + ["mtp"] * max(num_mtp_layers, 0) + ["loss"]
-    base, remainder = divmod(len(units), pp_size)
-    rows, pos = [], 0
-    for size in (base + (1 if s < remainder else 0) for s in range(pp_size)):
-        rows.append(units[pos : pos + size])
-        pos += size
+    if rows is None:
+        units = ["embedding"] + ["decoder"] * num_hidden_layers + ["mtp"] * max(num_mtp_layers, 0) + ["loss"]
+        base, remainder = divmod(len(units), pp_size)
+        rows, pos = [], 0
+        for size in (base + (1 if s < remainder else 0) for s in range(pp_size)):
+            rows.append(units[pos : pos + size])
+            pos += size
     return PipelineParallelLayerLayout(rows, pipeline_model_parallel_size=pp_size)
 
 
@@ -74,10 +81,6 @@ def _auto_layout_with_decoder_groups(
     decoder_layer_groups: Sequence[Sequence[int]],
 ):
     """Auto-balance like ``_auto_layout`` while never splitting protected decoder groups."""
-    from megatron.core.transformer.pipeline_parallel_layer_layout import (
-        PipelineParallelLayerLayout,
-    )
-
     groups = _validate_decoder_layer_groups(num_hidden_layers, decoder_layer_groups)
     lengths = [len(group) for group in groups]
     prefix = [0]
@@ -148,7 +151,12 @@ def _auto_layout_with_decoder_groups(
             row.extend(["mtp"] * max(num_mtp_layers, 0))
             row.append("loss")
         rows.append(row)
-    return PipelineParallelLayerLayout(rows, pipeline_model_parallel_size=pp_size)
+    return _auto_layout(
+        num_hidden_layers,
+        pp_size,
+        num_mtp_layers,
+        rows=rows,
+    )
 
 
 def build_pipeline_chunk_layout(
