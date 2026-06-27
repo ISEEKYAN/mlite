@@ -969,10 +969,7 @@ __all__ = [
     "apply_rotary_pos_emb",
     "build_rope_cache",
     "build_rotary_embeddings",
-    "dsa_indexer_type_for_layer",
-    "is_dsa_skip_topk_layer",
     "rotate_activation",
     "rotate_half",
-    "source_dsa_compute_layer",
     "validate_dsa_index_share_pipeline_split",
 ]
