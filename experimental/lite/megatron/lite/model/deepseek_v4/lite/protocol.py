@@ -5,14 +5,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     EXPERT_CLASSIFIER,
     PLACEMENT_FN,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     export_hf_weights as _export_hf_weights_impl,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.protocol_utils import add_loss_context_kwargs
@@ -112,12 +118,7 @@ def _as_batch_row(tensor):
     return tensor
 
 
-def _infer_cp_local_seq_len(
-    *,
-    input_ids,
-    position_ids,
-    cp_size,
-):
+def _infer_cp_local_seq_len(*, input_ids, position_ids, cp_size):
     seq_len = input_ids.size(1)
     if cp_size <= 1:
         return seq_len
@@ -512,10 +513,14 @@ def load_hf_weights(
     hf_path: str,
     model_cfg: DeepseekV4Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
     if not hf_path:
         return
-    _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+    _load_hf_weights_impl(
+        chunk, hf_path, model_cfg, ps, participating_group=participating_group
+    )
 
 
 def load_hf_weights_many(
@@ -523,8 +528,12 @@ def load_hf_weights_many(
     hf_path: str,
     model_cfg: DeepseekV4Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    load_hf_weights(chunks, hf_path, model_cfg, ps)
+    load_hf_weights(
+        chunks, hf_path, model_cfg, ps, participating_group=participating_group
+    )
 
 
 def export_hf_weights(

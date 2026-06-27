@@ -1,4 +1,6 @@
 # Reference VERL source for the Megatron Lite VERL example.
-# Requires verl latest main (engine-worker / V1 trainer architecture).
-# Pinned reference commit: a6ef5009 (verl main as of 2026-06-22).
-verl @ git+https://github.com/verl-project/verl.git@a6ef5009
+# Requires the engine-worker / V1 trainer architecture on upstream main.
+# Pinned upstream main commit: 1ff76cc625e9820d2434dad1b6d9b8e5dd26a359
+# (2026-06-27). The former a6ef5009 pin was PR #6791's pre-squash head,
+# not a main-branch authority commit.
+verl @ git+https://github.com/verl-project/verl.git@1ff76cc625e9820d2434dad1b6d9b8e5dd26a359

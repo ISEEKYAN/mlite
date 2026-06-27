@@ -43,14 +43,15 @@ wrong vs real HF would pass silently. This smoke closes that blind spot:
     decoder layers to bound memory/time.
 
 Run single GPU:
-  torchrun --nproc_per_node=1 -m pytest tests/smoke/primitive/test_qwen35_hf_numeric_roundtrip_smoke.py
+  torchrun --nproc_per_node=1 -m pytest --mlite-smoke --mlite-fail-on-skip \
+    experimental/lite/tests/smoke/primitive/test_qwen35_hf_numeric_roundtrip_smoke.py
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import json
 
 import pytest
 import torch
@@ -59,10 +60,7 @@ import torch.nn.functional as F
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu]
 
-_FP32_CHECKPOINT_SUFFIXES = (
-    ".linear_attn.A_log",
-    ".linear_attn.norm.weight",
-)
+_FP32_CHECKPOINT_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
 
 
 def _qwen35_tiny_cfg():
@@ -95,7 +93,9 @@ def _qwen35_tiny_cfg():
     )
 
 
-def _build(cfg, seed, *, optimizer="dist_opt", mtp_enable=False):
+def _build(
+    cfg, seed, *, optimizer="dist_opt", mtp_enable=False, mtp_enable_train=False
+):
     from megatron.lite.model.qwen3_5.lite import protocol
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
@@ -108,6 +108,7 @@ def _build(cfg, seed, *, optimizer="dist_opt", mtp_enable=False):
         use_deepep=False,
         deterministic=True,
         mtp_enable=mtp_enable,
+        mtp_enable_train=mtp_enable_train,
     )
     bundle = protocol.build_model(cfg, impl_cfg=impl)
     return bundle, protocol
@@ -190,9 +191,7 @@ def _save_transformers_512_tiny_qwen35(path):
         num_position_embeddings=16,
     )
     config = Qwen3_5MoeConfig(
-        text_config=text_config,
-        vision_config=vision_config,
-        tie_word_embeddings=False,
+        text_config=text_config, vision_config=vision_config, tie_word_embeddings=False
     )
     torch.manual_seed(20260627)
     model = Qwen3_5MoeForConditionalGeneration(config).to(torch.bfloat16)
@@ -269,8 +268,7 @@ def _save_transformers_512_tiny_qwen35(path):
     tensors["mtp.norm.weight"] = tensors["model.language_model.norm.weight"].clone()
     tensors["mtp.fc.weight"] = (
         torch.arange(
-            text_config.hidden_size * 2 * text_config.hidden_size,
-            dtype=torch.float32,
+            text_config.hidden_size * 2 * text_config.hidden_size, dtype=torch.float32
         )
         .reshape(text_config.hidden_size, 2 * text_config.hidden_size)
         .to(torch.bfloat16)
@@ -303,17 +301,13 @@ def _force_hf_torch_reference_kernels(model) -> None:
         # fused gated RMSNorm inside the HF reference model. Replace it with the
         # Transformers implementation while preserving the checkpoint weight.
         reference_norm = hf_impl.Qwen3_5MoeRMSNormGated(
-            linear_attn.head_v_dim,
-            eps=linear_attn.layer_norm_epsilon,
-        ).to(
-            device=linear_attn.norm.weight.device,
-            dtype=linear_attn.norm.weight.dtype,
-        )
+            linear_attn.head_v_dim, eps=linear_attn.layer_norm_epsilon
+        ).to(device=linear_attn.norm.weight.device, dtype=linear_attn.norm.weight.dtype)
         reference_norm.load_state_dict(linear_attn.norm.state_dict(), strict=True)
         linear_attn.norm = reference_norm
-    assert linear_layers == 1, (
-        f"expected one linear-attention layer, got {linear_layers}"
-    )
+    assert (
+        linear_layers == 1
+    ), f"expected one linear-attention layer, got {linear_layers}"
 
 
 def _build_transformers_512_mtp_decoder_equation_reference(source_dir: str):
@@ -346,9 +340,7 @@ def _build_transformers_512_mtp_decoder_equation_reference(source_dir: str):
                 text_config.hidden_size, eps=text_config.rms_norm_eps
             ),
             "fc": torch.nn.Linear(
-                2 * text_config.hidden_size,
-                text_config.hidden_size,
-                bias=False,
+                2 * text_config.hidden_size, text_config.hidden_size, bias=False
             ),
             "layer": hf_impl.Qwen3_5MoeDecoderLayer(text_config, layer_idx=0),
             "final_norm": hf_impl.Qwen3_5MoeRMSNorm(
@@ -511,9 +503,9 @@ def _assert_tensor_parity(
     norm_ratio_min: float = 0.99,
     norm_ratio_max: float = 1.01,
 ) -> dict[str, float]:
-    assert lite_value.shape == hf_value.shape, (
-        f"{name}: lite shape {tuple(lite_value.shape)} != HF shape {tuple(hf_value.shape)}"
-    )
+    assert (
+        lite_value.shape == hf_value.shape
+    ), f"{name}: lite shape {tuple(lite_value.shape)} != HF shape {tuple(hf_value.shape)}"
     hf = hf_value.detach().float()
     lite = lite_value.detach().float()
     assert torch.isfinite(hf).all(), f"{name}: HF produced non-finite values"
@@ -523,9 +515,9 @@ def _assert_tensor_parity(
     lite_flat = lite.reshape(-1)
     hf_norm = torch.linalg.vector_norm(hf_flat)
     lite_norm = torch.linalg.vector_norm(lite_flat)
-    assert hf_norm > 0 and lite_norm > 0, (
-        f"{name}: zero-norm comparison is not meaningful"
-    )
+    assert (
+        hf_norm > 0 and lite_norm > 0
+    ), f"{name}: zero-norm comparison is not meaningful"
     cosine = F.cosine_similarity(hf_flat, lite_flat, dim=0).item()
     diff_rms = torch.sqrt(torch.mean((hf - lite).square()))
     symmetric_scale = torch.maximum(
@@ -541,12 +533,12 @@ def _assert_tensor_parity(
     )
 
     assert cosine >= cosine_min, f"{name}: cosine {cosine} < {cosine_min}"
-    assert rms_relative <= rms_relative_max, (
-        f"{name}: RMS-relative {rms_relative} > {rms_relative_max}"
-    )
-    assert norm_ratio_min <= norm_ratio <= norm_ratio_max, (
-        f"{name}: norm ratio {norm_ratio} outside [{norm_ratio_min}, {norm_ratio_max}]"
-    )
+    assert (
+        rms_relative <= rms_relative_max
+    ), f"{name}: RMS-relative {rms_relative} > {rms_relative_max}"
+    assert (
+        norm_ratio_min <= norm_ratio <= norm_ratio_max
+    ), f"{name}: norm ratio {norm_ratio} outside [{norm_ratio_min}, {norm_ratio_max}]"
     assert max_abs <= max_abs_max, f"{name}: max-abs {max_abs} > {max_abs_max}"
     return {
         "cosine": cosine,
@@ -671,9 +663,7 @@ def test_qwen35_transformers_512_checkpoint_ground_truth(tmp_path):
         re.search(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.weight$", key)
         for key in expected
         if key.startswith("model.language_model.")
-    ), (
-        "Transformers emitted legacy per-expert tensors instead of the production packed layout"
-    )
+    ), "Transformers emitted legacy per-expert tensors instead of the production packed layout"
     mtp_expected = {key for key in expected if key.startswith("mtp.")}
     assert {
         "mtp.pre_fc_norm_embedding.weight",
@@ -731,9 +721,9 @@ def test_qwen35_transformers_512_checkpoint_ground_truth(tmp_path):
         elif not torch.equal(want, got):
             max_abs = (want.float() - got.float()).abs().max().item()
             mismatches.append(f"{key}: values differ (max_abs={max_abs})")
-    assert not mismatches, (
-        "lite does not preserve Transformers 5.12 HF tensors:\n" + "\n".join(mismatches)
-    )
+    assert (
+        not mismatches
+    ), "lite does not preserve Transformers 5.12 HF tensors:\n" + "\n".join(mismatches)
     print(
         "QWEN35_HF_MTP_SCHEMA_DTYPE_PARITY "
         f"mtp_keys={len(mtp_expected)} "
@@ -755,7 +745,6 @@ def test_qwen35_transformers_512_mtp_decoder_equation_parity(tmp_path):
     pytest.importorskip("safetensors")
 
     import transformers
-
     from megatron.lite.model.qwen3_5.config import Qwen35Config
 
     assert transformers.__version__ == "5.12.0", (
@@ -773,7 +762,9 @@ def test_qwen35_transformers_512_mtp_decoder_equation_parity(tmp_path):
     cfg = Qwen35Config.from_hf(source_dir)
     assert cfg.num_nextn_predict_layers == 1
     assert cfg.mtp_layer_types == ["full_attention"]
-    lite_bundle, protocol = _build(cfg, seed=20260701, optimizer=None, mtp_enable=True)
+    lite_bundle, protocol = _build(
+        cfg, seed=20260701, optimizer=None, mtp_enable=True, mtp_enable_train=True
+    )
     lite_model = lite_bundle.chunks[0]
     protocol.load_hf_weights(lite_model, source_dir, cfg, lite_bundle.parallel_state)
     lite_model.eval()
@@ -785,10 +776,7 @@ def test_qwen35_transformers_512_mtp_decoder_equation_parity(tmp_path):
     assert lite_mtp_layer.embedding is lite_model.embed
 
     input_ids = torch.tensor(
-        [
-            [3, 5, 7, 11, 13, 17, 19, 23],
-            [29, 31, 37, 41, 43, 47, 53, 59],
-        ],
+        [[3, 5, 7, 11, 13, 17, 19, 23], [29, 31, 37, 41, 43, 47, 53, 59]],
         dtype=torch.long,
         device="cuda",
     )
@@ -901,10 +889,90 @@ def test_qwen35_transformers_512_mtp_decoder_equation_parity(tmp_path):
         "MTP canonical embedding gradient norm ratio "
         f"{grad_norm_ratio} is outside [0.99, 1.01]"
     )
+
+    # Exercise the production route, including the main-label second shift,
+    # rolled validity mask, token-count normalization, and AutoScaler factor.
+    # The MTP-only fc parameter cleanly separates its auxiliary gradient from
+    # the main causal loss, so it must equal an independently computed direct
+    # predictor CE gradient times the configured scale.
+    from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
+
+    main_labels = _roll_left_zero_reference(input_ids)
+    main_loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    main_loss_mask[:, -1] = 0
+    captured_norm_hidden: list[torch.Tensor] = []
+
+    def _capture_norm_hidden(_module, _inputs, output):
+        captured_norm_hidden.append(output.detach().clone())
+
+    lite_model.zero_grad(set_to_none=True)
+    norm_hook = lite_model.norm.register_forward_hook(_capture_norm_hidden)
+    previous_backward_scale = MTPLossAutoScaler.main_loss_backward_scale
+    try:
+        MTPLossAutoScaler.set_loss_scale(1.0)
+        production_output = lite_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_seq_params=None,
+            labels=main_labels,
+            loss_mask=main_loss_mask,
+            temperature=1.0,
+            use_fused_kernels=False,
+        )
+        assert "mtp_loss" in production_output
+        production_output["loss"].backward()
+    finally:
+        norm_hook.remove()
+        MTPLossAutoScaler.set_loss_scale(previous_backward_scale)
+
+    assert len(captured_norm_hidden) == 1
+    production_mtp_loss = production_output["mtp_loss"]
+    mtp_fc_weight = lite_mtp_layer.eh_proj.linear.weight
+    production_mtp_fc_grad = mtp_fc_weight.grad
+    assert production_mtp_fc_grad is not None
+    production_mtp_fc_grad = production_mtp_fc_grad.detach().clone()
+    assert torch.count_nonzero(production_mtp_fc_grad).item() > 0
+
+    lite_model.zero_grad(set_to_none=True)
+    direct_hidden_sbh, _direct_shifted_ids, _direct_shifted_positions = lite_mtp_layer(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        hidden_states=captured_norm_hidden[0],
+        rotary_position_ids=position_ids,
+        packed_seq_params=None,
+    )
+    direct_logits = lite_model.head.gather(lite_model.head(direct_hidden_sbh))
+    direct_logits = direct_logits.transpose(0, 1).contiguous()
+    direct_ce, direct_labels, direct_mask = _mtp_depth1_ce_from_raw_tokens(
+        direct_logits, input_ids
+    )
+    assert torch.equal(direct_labels, _roll_left_zero_reference(main_labels))
+    assert torch.equal(direct_mask, _roll_left_zero_reference(main_loss_mask))
+    production_loss_abs = abs(production_mtp_loss.item() - direct_ce.item())
+    assert production_loss_abs <= 0.005, (
+        "Qwen3.5 production _apply_mtp_loss disagrees with the independent "
+        f"depth-1 target/mask equation by {production_loss_abs}"
+    )
+
+    direct_ce.backward()
+    direct_mtp_fc_grad = mtp_fc_weight.grad
+    assert direct_mtp_fc_grad is not None
+    expected_scaled_mtp_fc_grad = (
+        direct_mtp_fc_grad.detach().float() * cfg.mtp_loss_scaling_factor
+    )
+    production_scale_grad_metrics = _assert_tensor_parity(
+        "production-mtp-fc-scaled-gradient",
+        expected_scaled_mtp_fc_grad,
+        production_mtp_fc_grad,
+        cosine_min=0.999,
+        rms_relative_max=0.02,
+        max_abs_max=0.01,
+    )
     print(
         "NON_SKIP_QWEN35_TRANSFORMERS_512_MTP_DECODER_EQUATION_PARITY_PASSED "
         "authority=transformers_decoder_plus_released_root_equation "
-        "mtp_layers=1 layer_type=full_attention depth2_target=True batch=2 seq=8 "
+        "mtp_layers=1 layer_type=full_attention depth2_target=True "
+        "production_apply_mtp_loss=True batch=2 seq=8 "
         f"hidden_cosine={hidden_metrics['cosine']:.9f} "
         f"hidden_rms_relative={hidden_metrics['rms_relative']:.9f} "
         f"logits_cosine={logits_metrics['cosine']:.9f} "
@@ -913,7 +981,12 @@ def test_qwen35_transformers_512_mtp_decoder_equation_parity(tmp_path):
         f"embedding_grad_cosine={embedding_grad_metrics['cosine']:.9f} "
         f"embedding_grad_rms_relative="
         f"{embedding_grad_metrics['rms_relative']:.9f} "
-        f"embedding_grad_norm_ratio={grad_norm_ratio:.9f}"
+        f"embedding_grad_norm_ratio={grad_norm_ratio:.9f} "
+        f"production_mtp_loss_abs={production_loss_abs:.9f} "
+        f"production_scale_grad_cosine="
+        f"{production_scale_grad_metrics['cosine']:.9f} "
+        f"production_scale_grad_rms_relative="
+        f"{production_scale_grad_metrics['rms_relative']:.9f}"
     )
 
 
@@ -925,9 +998,8 @@ def test_qwen35_transformers_512_full_model_numeric_parity(tmp_path):
     pytest.importorskip("safetensors")
 
     import transformers
-    from transformers import Qwen3_5MoeForConditionalGeneration
-
     from megatron.lite.model.qwen3_5.config import Qwen35Config
+    from transformers import Qwen3_5MoeForConditionalGeneration
 
     assert transformers.__version__ == "5.12.0", (
         "the Qwen3.5 HF numeric authority is pinned to Transformers 5.12.0; "
@@ -941,9 +1013,7 @@ def test_qwen35_transformers_512_full_model_numeric_parity(tmp_path):
     _save_transformers_512_tiny_qwen35(source_dir)
 
     hf_model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
-        source_dir,
-        dtype=torch.bfloat16,
-        attn_implementation="eager",
+        source_dir, dtype=torch.bfloat16, attn_implementation="eager"
     ).cuda()
     _force_hf_torch_reference_kernels(hf_model)
     hf_model.eval()
@@ -958,10 +1028,7 @@ def test_qwen35_transformers_512_full_model_numeric_parity(tmp_path):
     # Fixed, non-padding token batch.  Tokens are deliberately unique so the
     # embedding-output gradient probe is not obscured by repeated-row reduction.
     input_ids = torch.tensor(
-        [
-            [3, 5, 7, 11, 13, 17, 19, 23],
-            [29, 31, 37, 41, 43, 47, 53, 59],
-        ],
+        [[3, 5, 7, 11, 13, 17, 19, 23], [29, 31, 37, 41, 43, 47, 53, 59]],
         dtype=torch.long,
         device="cuda",
     )
@@ -1001,9 +1068,7 @@ def test_qwen35_transformers_512_full_model_numeric_parity(tmp_path):
             return_dict=True,
         )
         lite_output = lite_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            packed_seq_params=None,
+            input_ids=input_ids, position_ids=position_ids, packed_seq_params=None
         )
     finally:
         for handle in [
@@ -1084,9 +1149,9 @@ def test_qwen35_transformers_512_full_model_numeric_parity(tmp_path):
         "[qwen35-hf-parity] embedding-output-gradient norms: "
         f"hf={hf_grad_norm:.9f} lite={lite_grad_norm:.9f} ratio={grad_norm_ratio:.9f}"
     )
-    assert 0.99 <= grad_norm_ratio <= 1.01, (
-        f"embedding-output gradient norm ratio {grad_norm_ratio} is outside [0.99, 1.01]"
-    )
+    assert (
+        0.99 <= grad_norm_ratio <= 1.01
+    ), f"embedding-output gradient norm ratio {grad_norm_ratio} is outside [0.99, 1.01]"
     print(
         "NON_SKIP_QWEN35_TRANSFORMERS_512_FULL_MODEL_PARITY_PASSED "
         "layers=2 layer_types=[full_attention,linear_attention] batch=2 seq=8 "
@@ -1114,11 +1179,10 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
         pytest.skip("ground-truth smoke runs single-rank (tp1).")
     import json
 
-    from safetensors import safe_open
-
     from megatron.lite.model.qwen3_5.config import Qwen35Config
     from megatron.lite.model.qwen3_5.lite import protocol
     from megatron.lite.runtime.contracts.config import ParallelConfig
+    from safetensors import safe_open
 
     model_dir = os.environ["QWEN35_HF_DIR"]
     cfg = Qwen35Config.from_hf(model_dir)
@@ -1189,6 +1253,6 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
             o, e, atol=2e-2, rtol=2e-2
         ):  # bf16-cast export tolerance
             mism.append(f"{k} max_abs_diff={(o - e).abs().max().item()}")
-    assert not mism, (
-        "lite export does not match original HF safetensors:\n" + "\n".join(mism)
-    )
+    assert (
+        not mism
+    ), "lite export does not match original HF safetensors:\n" + "\n".join(mism)

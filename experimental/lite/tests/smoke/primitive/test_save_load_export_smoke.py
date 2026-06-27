@@ -13,7 +13,7 @@ tp2/ep2/pp2 topology (exactly 8 GPUs). fsdp2 cases use torch DCP on a
 pure-DP mesh. Both checkpoint paths are exercised through the unified
 MegatronLiteRuntime so the matrix guards the runtime entry points.
 
-Run with torchrun --nproc_per_node=8 -m pytest, selecting per-env subsets
+Run with torchrun --nproc_per_node=8 -m pytest --mlite-smoke, selecting per-env subsets
 with -k (qwen3_5 needs the qwen3.5 canary site; the four deepseek/qwen3_moe
 models need the DSA overlay). Models gate themselves with importorskip so a
 wrong-env invocation skips rather than errors.
@@ -21,14 +21,15 @@ wrong-env invocation skips rather than errors.
 
 from __future__ import annotations
 
+import copy
 import os
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
@@ -176,7 +177,19 @@ def _glm5():
         n_routed_experts=4,
         n_shared_experts=1,
         num_experts_per_tok=2,
+        # Exercise GLM5.2 rather than the legacy all-full GLM5 path in both
+        # exact-resume backends.  The explicit list is the canonical HF
+        # schedule; freq/offset remain present so a future fallback cannot
+        # silently change this fixture's model family.
+        index_topk_freq=2,
+        index_skip_topk_offset=1,
+        indexer_types=["full", "shared"],
+        rope_interleave=True,
+        indexer_rope_interleave=True,
     )
+    assert cfg.resolved_dsa_indexer_types == ("full", "shared")
+    assert cfg.uses_dsa_index_share is True
+    assert cfg.uses_configured_dsa_rope_layout is True
     return cfg, protocol
 
 
@@ -280,19 +293,69 @@ def _single_node_cuda_dist():
             dist.destroy_process_group()
 
 
+# Process groups created by MLite's ``init_parallel`` are independent of
+# MCore's globals and must be destroyed explicitly after every matrix case.  A
+# round-trip builds both a source and a fresh destination model, so retaining
+# these groups across ten parameterized cases exhausts communicators quickly.
+_BUILT_PARALLEL_STATES: list = []
+_PS_GROUP_ATTRS = (
+    "tp_group",
+    "ep_group",
+    "etp_group",
+    "cp_group",
+    "pp_group",
+    "pp_cpu_group",
+    "embedding_group",
+    "dp_group",
+    "dp_cp_group",
+    "tp_ep_group",
+    "ep_dp_group",
+)
+
+
 @pytest.fixture(autouse=True)
 def _reset_parallel_state_between_tests():
-    """Tear down Megatron model-parallel groups after each case.
+    """Tear down MCore and MLite process groups after each case.
 
     The matrix builds models with different topologies (tp2/ep2/pp2 for
-    dist_opt, pure-DP for fsdp2). Leaving a prior case's mpu groups initialized
-    desyncs the next case's collectives, so reset between tests.
+    dist_opt, pp2/dp4 for fsdp2). Leaving a prior case's groups initialized
+    leaks roughly twenty MLite communicators per round-trip and can desync a
+    later case's collectives, so reset both group owners between tests.
     """
     yield
+    import gc
+
     from megatron.core import parallel_state as mpu
 
     if mpu.is_initialized():
         mpu.destroy_model_parallel()
+    gc.collect()
+
+    cleanup_errors: list[str] = []
+    destroyed_groups: list[object] = []
+    for ps in _BUILT_PARALLEL_STATES:
+        for attr in _PS_GROUP_ATTRS:
+            group = getattr(ps, attr, None)
+            if group is None or group is dist.group.WORLD:
+                continue
+            setattr(ps, attr, None)
+            if any(group is destroyed for destroyed in destroyed_groups):
+                continue
+            destroyed_groups.append(group)
+            try:
+                dist.destroy_process_group(group)
+            except Exception as exc:  # report on every rank after best-effort cleanup
+                cleanup_errors.append(f"{attr}: {type(exc).__name__}: {exc}")
+    _BUILT_PARALLEL_STATES.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # A rank-local cleanup failure must fail the entire distributed case rather
+    # than letting peers enter the next test with asymmetric group state.
+    gathered_errors: list[list[str] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_errors, cleanup_errors)
+    if any(gathered_errors):
+        pytest.fail(f"MLite process-group cleanup failed by rank: {gathered_errors}")
 
 
 # GLM5 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
@@ -364,6 +427,7 @@ def _build_handle(
         mtp_enable_train=train_mtp,
     )
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
+    _BUILT_PARALLEL_STATES.append(bundle.parallel_state)
     chunks = bundle.chunks
 
     if bundle.extras.get("optimizer_backend") == "fsdp2":
@@ -391,6 +455,33 @@ def _build_handle(
         _extras=extras,
     )
     return handle, cfg, protocol
+
+
+def _assert_glm52_index_share_model_contract(handle: ModelHandle, cfg) -> None:
+    """Prove the distributed GLM resume fixture really built full/shared DSA."""
+
+    assert cfg.resolved_dsa_indexer_types == ("full", "shared")
+    assert cfg.uses_dsa_index_share is True
+    assert cfg.uses_configured_dsa_rope_layout is True
+
+    local_full = 0
+    local_shared = 0
+    for chunk in handle._extras["model_chunks"]:
+        for layer_idx, layer in zip(chunk.layer_indices, chunk.layers, strict=True):
+            attention = layer.self_attention.self_attention
+            if cfg.dsa_indexer_type(layer_idx) == "shared":
+                local_shared += 1
+                assert attention.skip_topk is True
+                assert attention.indexer is None
+            else:
+                local_full += 1
+                assert attention.skip_topk is False
+                assert attention.indexer is not None
+
+    counts = torch.tensor([local_full, local_shared], device="cuda", dtype=torch.int64)
+    dist.all_reduce(counts, group=dist.group.WORLD)
+    assert int(counts[0]) > 0, "GLM5.2 resume fixture built no full indexer layer"
+    assert int(counts[1]) > 0, "GLM5.2 resume fixture built no shared indexer layer"
 
 
 def _shared_tmp_path(tmp_path, suffix: str) -> str:
@@ -446,14 +537,106 @@ def _local_named_params(handle: ModelHandle) -> dict[str, torch.Tensor]:
     return params
 
 
-def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
-    lhs_params = _local_named_params(lhs)
-    rhs_params = _local_named_params(rhs)
-    assert lhs_params.keys() == rhs_params.keys()
-    assert lhs_params, "expected at least one local parameter to compare."
+def _local_persistent_buffers(handle: ModelHandle) -> dict[str, torch.Tensor]:
+    from megatron.lite.primitive.ckpt.hf_weights import named_persistent_buffers
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
+
+    buffers: dict[str, torch.Tensor] = {}
+    for chunk_idx, chunk in enumerate(handle._extras["model_chunks"]):
+        for name, buffer in named_persistent_buffers(chunk):
+            buffers[f"{chunk_idx}.{name}"] = (
+                to_local_tensor(buffer.detach()).cpu().clone()
+            )
+    return buffers
+
+
+def _local_model_state(handle: ModelHandle) -> dict[str, torch.Tensor]:
+    return {
+        **{
+            f"parameter.{name}": value
+            for name, value in _local_named_params(handle).items()
+        },
+        **{
+            f"persistent_buffer.{name}": value
+            for name, value in _local_persistent_buffers(handle).items()
+        },
+    }
+
+
+def _seed_persistent_buffers(handle: ModelHandle, cfg) -> int:
+    """Make checkpointed buffers non-default so a fresh build cannot fake restore."""
+    from megatron.lite.primitive.ckpt.hf_weights import named_persistent_buffers
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
+
+    local_count = 0
+    num_experts = max(
+        int(getattr(cfg, "num_experts", getattr(cfg, "n_routed_experts", 2))), 1
+    )
+    with torch.no_grad():
+        for chunk in handle._extras["model_chunks"]:
+            for _name, buffer in named_persistent_buffers(chunk):
+                local = to_local_tensor(buffer)
+                if local.numel() == 0:
+                    continue
+                values = torch.arange(local.numel(), device=local.device).reshape(
+                    local.shape
+                )
+                if local.dtype == torch.bool:
+                    values = values.remainder(2).bool()
+                elif local.dtype.is_floating_point:
+                    values = values.float().mul_(0.001).add_(0.125).to(local.dtype)
+                else:
+                    values = values.remainder(num_experts).to(local.dtype)
+                local.copy_(values)
+                local_count += 1
+
+    counts: list[int | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(counts, local_count)
+    return sum(int(count or 0) for count in counts)
+
+
+def _assert_rng_state_equal(lhs: dict, rhs: dict, context: str) -> None:
+    assert lhs["random_rng_state"] == rhs["random_rng_state"], context
+    lhs_np, rhs_np = lhs["np_rng_state"], rhs["np_rng_state"]
+    assert lhs_np[0] == rhs_np[0], context
+    np.testing.assert_array_equal(lhs_np[1], rhs_np[1], err_msg=context)
+    assert lhs_np[2:] == rhs_np[2:], context
+    torch.testing.assert_close(
+        lhs["torch_rng_state"], rhs["torch_rng_state"], atol=0, rtol=0, msg=context
+    )
+    for key in ("cuda_rng_state",):
+        if lhs[key] is None or rhs[key] is None:
+            assert lhs[key] is rhs[key], context
+        else:
+            torch.testing.assert_close(lhs[key], rhs[key], atol=0, rtol=0, msg=context)
+    assert lhs["rng_tracker_states"], f"{context}: RNG tracker state is empty"
+    assert rhs["rng_tracker_states"], f"{context}: RNG tracker state is empty"
+    assert lhs["rng_tracker_states"].keys() == rhs["rng_tracker_states"].keys(), context
+    for name in lhs["rng_tracker_states"]:
+        torch.testing.assert_close(
+            lhs["rng_tracker_states"][name],
+            rhs["rng_tracker_states"][name],
+            atol=0,
+            rtol=0,
+            msg=f"{context}: tracker={name}",
+        )
+
+
+def _assert_packed_batch_equal(lhs: PackedBatch, rhs: PackedBatch) -> None:
+    for name in ("input_ids", "labels", "seq_lens"):
+        torch.testing.assert_close(
+            getattr(lhs, name), getattr(rhs, name), atol=0, rtol=0, msg=name
+        )
+
+
+def _assert_model_state_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
+    lhs_state = _local_model_state(lhs)
+    rhs_state = _local_model_state(rhs)
+    assert lhs_state.keys() == rhs_state.keys()
+    assert lhs_state, "expected at least one local model-state tensor to compare."
     mismatches = []
-    for name in lhs_params:
-        lhs_tensor, rhs_tensor = lhs_params[name], rhs_params[name]
+    for name in lhs_state:
+        lhs_tensor, rhs_tensor = lhs_state[name], rhs_state[name]
         if (
             lhs_tensor.shape != rhs_tensor.shape
             or lhs_tensor.dtype != rhs_tensor.dtype
@@ -465,9 +648,9 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
                 else float("inf")
             )
             mismatches.append(f"{name} (max_abs_diff={diff})")
-    assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(
-        mismatches
-    )
+    assert (
+        not mismatches
+    ), "save/load not bitwise; mismatched model state:\n" + "\n".join(mismatches)
 
 
 def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
@@ -489,40 +672,10 @@ def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
     return key.startswith("model.") or key in ("lm_head.weight",)
 
 
-def _export_and_reload(
-    handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str
-) -> None:
-    """Export HF weights (bf16) and assert the reloaded shards are valid.
-
-    The integration gate deliberately requests BF16 from the canonical export
-    generator. Materialization uses the production distributed writer so
-    duplicate keys, generator errors, empty rank-0 output, and write failures
-    are propagated to every rank instead of being hidden by ``dict(generator)``.
-    """
-    chunks = handle._extras["model_chunks"]
-    ps = handle._parallel_state
-
-    if not hasattr(protocol, "export_hf_weights"):
-        raise AssertionError(f"{protocol.__name__} exposes no HF export path.")
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        save_hf_weight_pairs_distributed,
-    )
-
-    save_hf_weight_pairs_distributed(
-        protocol.export_hf_weights(
-            chunks,
-            cfg,
-            ps,
-            rank0_only=True,
-            export_dtype=torch.bfloat16,
-        ),
-        out_dir,
-    )
-
-    if dist.get_rank() != 0:
-        dist.barrier()
-        return
-
+def _validate_rank0_hf_export_file(
+    expected: dict[str, torch.Tensor], cfg, out_dir: str, model_name: str
+) -> int:
+    """Require every persisted tensor to equal the canonical source export."""
     from safetensors import safe_open
 
     shards = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
@@ -538,22 +691,45 @@ def _export_and_reload(
         with safe_open(os.path.join(out_dir, shard), framework="pt") as fh:
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
+                assert key not in keys, f"duplicate HF export key across files: {key}"
+                assert key in expected, f"file contains unexpected HF export key {key}"
+                source_tensor = expected[key].detach().cpu().contiguous()
+                assert tensor.shape == source_tensor.shape, (
+                    f"{key} file shape={tuple(tensor.shape)}, "
+                    f"canonical export shape={tuple(source_tensor.shape)}"
+                )
+                assert tensor.dtype == source_tensor.dtype, (
+                    f"{key} file dtype={tensor.dtype}, "
+                    f"canonical export dtype={source_tensor.dtype}"
+                )
+                torch.testing.assert_close(
+                    tensor,
+                    source_tensor,
+                    atol=0,
+                    rtol=0,
+                    msg=f"{key}: safetensors differs from canonical source export",
+                )
                 if tensor.dtype.is_floating_point:
-                    assert tensor.dtype == torch.bfloat16, (
-                        f"{key} exported as {tensor.dtype}, want bf16"
-                    )
+                    assert (
+                        tensor.dtype == torch.bfloat16
+                    ), f"{key} exported as {tensor.dtype}, want bf16"
                 else:
-                    assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
-                        f"{key} exported as unexpected non-float dtype {tensor.dtype}"
-                    )
-                assert torch.isfinite(tensor.float()).all(), (
-                    f"{key} has non-finite values"
-                )
-                assert _is_valid_hf_export_key(key, model_name), (
-                    f"unexpected non-HF export key: {key}"
-                )
+                    assert tensor.dtype in (
+                        torch.int64,
+                        torch.int32,
+                        torch.bool,
+                    ), f"{key} exported as unexpected non-float dtype {tensor.dtype}"
+                assert torch.isfinite(
+                    tensor.float()
+                ).all(), f"{key} has non-finite values"
+                assert _is_valid_hf_export_key(
+                    key, model_name
+                ), f"unexpected non-HF export key: {key}"
                 keys.add(key)
-    assert keys, "exported zero tensors"
+    assert keys == expected.keys() and keys, (
+        "safetensors key set differs from the canonical source export: "
+        f"missing={sorted(expected.keys() - keys)} unexpected={sorted(keys - expected.keys())}"
+    )
     # PP-gather completeness: the rank-0 export must carry EVERY decoder layer's
     # weights (all pipeline stages gathered), not just the first stage's — guards
     # against a pp-blind export silently dropping later stages' layers.
@@ -570,7 +746,161 @@ def _export_and_reload(
         f"export missing decoder layers {missing} (PP gather incomplete); "
         f"sample keys: {sorted(keys)[:6]}"
     )
-    dist.barrier()
+    return len(expected)
+
+
+def _export_and_reload(
+    handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str
+) -> int:
+    """Export HF weights once and verify the persisted key/value state exactly.
+
+    The integration gate deliberately requests BF16 from the canonical export
+    generator. Materialization uses the production distributed writer so
+    duplicate keys, generator errors, empty rank-0 output, and write failures
+    are propagated to every rank instead of being hidden by ``dict(generator)``.
+    """
+    chunks = handle._extras["model_chunks"]
+    ps = handle._parallel_state
+
+    if not hasattr(protocol, "export_hf_weights"):
+        raise AssertionError(f"{protocol.__name__} exposes no HF export path.")
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        materialize_hf_weights_distributed,
+        save_hf_weight_pairs_distributed,
+    )
+
+    # Consume the collective-bearing canonical generator exactly once. Keep
+    # rank 0's materialized key/value oracle, then give the writer only the
+    # side-effect-free dict view so file validation cannot accidentally execute
+    # TP/EP/PP/FSDP collectives a second time.
+    expected = materialize_hf_weights_distributed(
+        protocol.export_hf_weights(
+            chunks, cfg, ps, rank0_only=True, export_dtype=torch.bfloat16
+        )
+    )
+    save_hf_weight_pairs_distributed(expected.items(), out_dir)
+
+    outcome: list[str | int | None] = [None, None]
+    if dist.get_rank() == 0:
+        try:
+            outcome[1] = _validate_rank0_hf_export_file(
+                expected, cfg, out_dir, model_name
+            )
+        except Exception as exc:
+            outcome[0] = f"{type(exc).__name__}: {exc}"
+    # A rank-0 validation failure must release peers instead of stranding them
+    # at a barrier until the external torchrun timeout fires.
+    dist.broadcast_object_list(outcome, src=0)
+    if outcome[0] is not None:
+        raise AssertionError(f"synchronized HF export validation failed: {outcome[0]}")
+    assert isinstance(outcome[1], int) and outcome[1] > 0
+    return outcome[1]
+
+
+def _assert_live_fsdp2_dtensors_materialize_exactly(
+    handle: ModelHandle,
+) -> dict[str, int | bool]:
+    """Prove that live FSDP2 parameters are DTensors and reconstruct exactly.
+
+    ``DTensor.full_tensor()`` is the production HF-export boundary.  Checking
+    only that an export file is finite would let a no-op FSDP wrapper or a
+    duplicated/misordered shard reconstruction pass.  For every live DTensor,
+    independently all-gather its local shards over the DTensor mesh, trim any
+    FSDP padding using the public ``Shard`` metadata, and require bitwise
+    equality with ``full_tensor()``.
+    """
+    from torch.distributed.tensor import DTensor, Shard
+
+    local_dtensor_count = 0
+    local_exact_count = 0
+    for chunk in handle._extras["model_chunks"]:
+        for name, parameter in chunk.named_parameters():
+            if not isinstance(parameter, DTensor):
+                continue
+            local_dtensor_count += 1
+            placements = tuple(parameter.placements)
+            mesh = parameter.device_mesh
+            assert mesh.ndim == 1 and len(placements) == 1, (
+                f"{name}: FSDP2 export expected one-dimensional DTensor sharding, "
+                f"got mesh_ndim={mesh.ndim} placements={placements}"
+            )
+            placement = placements[0]
+            assert isinstance(
+                placement, Shard
+            ), f"{name}: FSDP2 export expected a Shard placement, got {placement}"
+
+            local = parameter.to_local().detach()
+            mesh_size = int(mesh.size())
+            group = mesh.get_group()
+            shard_dim = int(placement.dim)
+            global_dim = int(parameter.shape[shard_dim])
+            # Uneven dim-0 FSDP shards expose their logical (possibly empty)
+            # local shape through DTensor, while the collective itself uses
+            # equal padded chunks. Recreate that neutral padding explicitly so
+            # the independent all-gather also covers dimensions smaller than
+            # the DP mesh.
+            padded_dim = (global_dim + mesh_size - 1) // mesh_size
+            padded_shape = list(local.shape)
+            padded_shape[shard_dim] = padded_dim
+            padded_local = local.new_zeros(padded_shape)
+            if local.numel() > 0:
+                padded_local.narrow(shard_dim, 0, local.shape[shard_dim]).copy_(local)
+            gathered = [torch.empty_like(padded_local) for _ in range(mesh_size)]
+            dist.all_gather(gathered, padded_local.contiguous(), group=group)
+
+            logical_parts = []
+            for mesh_rank, shard in enumerate(gathered):
+                logical_size, _offset = Shard.local_shard_size_and_offset(
+                    global_dim, mesh_size, mesh_rank
+                )
+                logical_parts.append(shard.narrow(shard_dim, 0, int(logical_size)))
+            independently_gathered = torch.cat(logical_parts, dim=shard_dim)
+            materialized = parameter.detach().full_tensor()
+
+            assert not isinstance(
+                materialized, DTensor
+            ), f"{name}: full_tensor() returned another DTensor"
+            assert tuple(materialized.shape) == tuple(parameter.shape), (
+                f"{name}: full_tensor shape={tuple(materialized.shape)}, "
+                f"global shape={tuple(parameter.shape)}"
+            )
+            assert tuple(independently_gathered.shape) == tuple(parameter.shape), (
+                f"{name}: independent shard gather shape="
+                f"{tuple(independently_gathered.shape)}, global shape={tuple(parameter.shape)}"
+            )
+            torch.testing.assert_close(
+                materialized,
+                independently_gathered,
+                atol=0,
+                rtol=0,
+                msg=f"{name}: full_tensor() differs from independently gathered FSDP shards",
+            )
+            local_exact_count += 1
+
+    local_counts: list[tuple[int, int] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        local_counts, (local_dtensor_count, local_exact_count), group=dist.group.WORLD
+    )
+    assert all(counts is not None and counts[0] > 0 for counts in local_counts), (
+        "FSDP2 export expected every rank to own live DTensor parameters, "
+        f"got per-rank counts={local_counts}"
+    )
+    assert all(
+        counts[0] == counts[1] for counts in local_counts if counts is not None
+    ), (
+        "not every observed FSDP2 DTensor passed exact full-tensor reconstruction: "
+        f"{local_counts}"
+    )
+    global_dtensor_count = sum(
+        counts[0] for counts in local_counts if counts is not None
+    )
+    global_exact_count = sum(counts[1] for counts in local_counts if counts is not None)
+    return {
+        "global_dtensor_count": global_dtensor_count,
+        "global_exact_count": global_exact_count,
+        "materialized_exactly": global_dtensor_count > 0
+        and global_exact_count == global_dtensor_count,
+    }
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -587,15 +917,33 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     set_deterministic(2026)
 
     saved, cfg, _protocol = _build_handle(model_name, backend, seed=4242)
+    if model_name == "glm5":
+        _assert_glm52_index_share_model_contract(saved, cfg)
     _train_step(saved, backend, cfg)
+    seeded_buffer_count = _seed_persistent_buffers(saved, cfg)
+    if model_name in {"kimi_k2", "glm5", "deepseek_v4"}:
+        assert (
+            seeded_buffer_count > 0
+        ), f"{model_name} proxy unexpectedly exposes no persistent checkpoint buffers"
 
     ckpt_dir = _shared_tmp_path(tmp_path, "ckpt")
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.save_checkpoint(saved, ckpt_dir, step=1)
+    from megatron.lite.primitive.ckpt import dcp as dcp_impl
+
+    checkpoint_rng_state = copy.deepcopy(dcp_impl._get_rng_state())
 
     loaded, _cfg2, _proto2 = _build_handle(model_name, backend, seed=9999)
+    if model_name == "glm5":
+        _assert_glm52_index_share_model_contract(loaded, _cfg2)
     assert runtime.load_checkpoint(loaded, ckpt_dir) == 1
-    _assert_params_bitwise_equal(saved, loaded)
+    _assert_model_state_bitwise_equal(saved, loaded)
+    restored_rng_state = copy.deepcopy(dcp_impl._get_rng_state())
+    _assert_rng_state_equal(
+        checkpoint_rng_state,
+        restored_rng_state,
+        f"{model_name}/{backend} RNG state after load",
+    )
 
     # A checkpoint is not resume-ready merely because model tensors reload.
     # Require non-empty optimizer moments/steps and, where the backend exposes
@@ -618,10 +966,22 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     else:
         assert saved_master == loaded_master == {}
         master_weights_evidence = "not_applicable"
-    resume_batch = _random_packed_batch(cfg.vocab_size)
-    _train_step(saved, backend, cfg, batch=resume_batch, seed=20260628)
-    _train_step(loaded, backend, cfg, batch=resume_batch, seed=20260628)
-    _assert_params_bitwise_equal(saved, loaded)
+    dcp_impl._restore_rng_state(copy.deepcopy(restored_rng_state))
+    saved_resume_batch = _random_packed_batch(cfg.vocab_size)
+    _train_step(saved, backend, cfg, batch=saved_resume_batch)
+    saved_post_step_rng = copy.deepcopy(dcp_impl._get_rng_state())
+
+    dcp_impl._restore_rng_state(copy.deepcopy(restored_rng_state))
+    loaded_resume_batch = _random_packed_batch(cfg.vocab_size)
+    _assert_packed_batch_equal(saved_resume_batch, loaded_resume_batch)
+    _train_step(loaded, backend, cfg, batch=loaded_resume_batch)
+    loaded_post_step_rng = copy.deepcopy(dcp_impl._get_rng_state())
+    _assert_rng_state_equal(
+        saved_post_step_rng,
+        loaded_post_step_rng,
+        f"{model_name}/{backend} RNG state after resumed step",
+    )
+    _assert_model_state_bitwise_equal(saved, loaded)
     _assert_nonempty_named_bitwise_equal(
         _opt_state_snapshot(saved, backend),
         _opt_state_snapshot(loaded, backend),
@@ -649,35 +1009,74 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
             enabled=bool(ps.embedding_groups_initialized),
         )
     if dist.get_rank() == 0:
+        dsa_index_share_evidence = (
+            "full_shared_exact" if model_name == "glm5" else "not_applicable"
+        )
         print(
             "NON_SKIP_DISTRIBUTED_CHECKPOINT_RESUME_EXACT "
-            f"model={model_name} backend={backend} model_params=nonempty_exact "
+            f"model={model_name} backend={backend} model_state=nonempty_exact "
+            f"seeded_persistent_buffers_global={seeded_buffer_count} "
             "optimizer_state=nonempty_exact "
             f"master_weights={master_weights_evidence} next_step=bitwise_exact "
-            "mtp_embedding_replicas=validated_when_enabled"
+            "rng_sidecar=exact resume_batch_from_rng=bitwise_exact "
+            "mtp_embedding_replicas=validated_when_enabled "
+            f"dsa_index_share={dsa_index_share_evidence}"
         )
 
 
-@pytest.mark.parametrize("model_name", list(MODELS))
-def test_export_hf_bf16_reload(model_name, tmp_path):
+_EXPORT_CASES = [
+    *((model_name, "dist_opt") for model_name in MODELS),
+    ("deepseek_v4", "fsdp2"),
+    ("qwen3_5", "fsdp2"),
+]
+
+
+@pytest.mark.parametrize(("model_name", "backend"), _EXPORT_CASES)
+def test_export_hf_bf16_reload(model_name, backend, tmp_path):
     """Export HF weights (bf16) and reload the safetensors shards.
 
-    Export output is backend-agnostic, so this exercises the canonical export
-    path: a dist_opt model whose TP/EP/PP shards are gathered to full HF
-    tensors. NOTE: exporting directly from a live fsdp2 (DTensor-sharded) model
-    is NOT covered here — save_hf_weights' gather is not DTensor-aware and
-    deadlocks; tracked as a known gap.
+    The five dist-opt cases exercise TP/EP/PP gathering. DeepSeek-V4 and
+    Qwen3.5 additionally exercise live FSDP2 DTensor materialization over the
+    PP2 x DP4 topology; these are the release-regression models for PR #66.
     """
     if dist.get_world_size() != 8:
         pytest.skip("export proxy smoke requires exactly 8 GPUs.")
 
     set_deterministic(2026)
 
-    handle, cfg, protocol = _build_handle(model_name, "dist_opt", seed=4242)
-    _train_step(handle, "dist_opt", cfg)
+    handle, cfg, protocol = _build_handle(model_name, backend, seed=4242)
+    _train_step(handle, backend, cfg)
+
+    fsdp_evidence: dict[str, int | bool] | None = None
+    if backend == "fsdp2":
+        fsdp_evidence = _assert_live_fsdp2_dtensors_materialize_exactly(handle)
 
     export_dir = _shared_tmp_path(tmp_path, "hf_export")
-    _export_and_reload(handle, cfg, protocol, export_dir, model_name)
+    exact_exported_tensors = _export_and_reload(
+        handle, cfg, protocol, export_dir, model_name
+    )
+    if dist.get_rank() == 0:
+        observed_dtensors = (
+            int(fsdp_evidence["global_dtensor_count"])
+            if fsdp_evidence is not None
+            else 0
+        )
+        exact_dtensors = (
+            int(fsdp_evidence["global_exact_count"]) if fsdp_evidence is not None else 0
+        )
+        fsdp_materialized = (
+            bool(fsdp_evidence["materialized_exactly"])
+            if fsdp_evidence is not None
+            else False
+        )
+        print(
+            "NON_SKIP_HF_EXPORT_RELOAD "
+            f"model={model_name} backend={backend} pp=2 "
+            f"fsdp_dtensor_materialized={fsdp_materialized} "
+            f"observed_dtensor_params_global={observed_dtensors} "
+            f"full_tensor_exact_params_global={exact_dtensors} "
+            f"canonical_export_file_exact_tensors={exact_exported_tensors}"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -822,18 +1221,18 @@ def test_offload_onload_roundtrip(model_name, backend, tmp_path):
     assert _opt_state_devices(handle, backend) == {"cuda"}
 
     runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
-    assert _opt_state_devices(handle, backend) == {"cpu"}, (
-        "optimizer state not offloaded to CPU."
-    )
+    assert _opt_state_devices(handle, backend) == {
+        "cpu"
+    }, "optimizer state not offloaded to CPU."
     if backend == "fsdp2":
         # fsdp2 moves params to CPU directly; dist_opt instead frees the GPU
         # buffer storage (params keep a 0-size cuda handle), so assert only fsdp2.
         assert _local_param_devices(handle) == {"cpu"}, "params not offloaded to CPU."
 
     runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
-    assert _opt_state_devices(handle, backend) == {"cuda"}, (
-        "optimizer state not back on GPU."
-    )
+    assert _opt_state_devices(handle, backend) == {
+        "cuda"
+    }, "optimizer state not back on GPU."
     assert _local_param_devices(handle) == {"cuda"}, "params not back on GPU."
 
     _assert_named_bitwise_equal(params_before, _local_named_params(handle), "param")
@@ -862,7 +1261,7 @@ def test_offload_fraction_keeps_optimizer_state_on_cpu(model_name, backend, tmp_
         offload_fraction=1.0,
     )
     _train_step(handle, backend, cfg)
-    assert "cpu" in _opt_state_devices(handle, backend), (
-        "offload_fraction=1.0 should keep optimizer update state on CPU."
-    )
+    assert "cpu" in _opt_state_devices(
+        handle, backend
+    ), "offload_fraction=1.0 should keep optimizer update state on CPU."
     _train_step(handle, backend, cfg)  # trains with the offloaded update state

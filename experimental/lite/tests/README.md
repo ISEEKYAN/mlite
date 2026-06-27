@@ -11,6 +11,14 @@ Run unit coverage:
 PYTHONPATH="$(pwd):$(pwd)/experimental/lite" pytest experimental/lite/tests/unit
 ```
 
+Pure config and weight-mapping modules can be imported without `safetensors`.
+Tests or runtime paths that read/write HF checkpoint files require the optional
+`safetensors` package and fail with an explicit dependency error when it is absent.
+Training DCP loads require the completion manifest and model schema emitted by
+the current writer. Pre-manifest checkpoints are rejected by default; a
+one-time migration tool may opt in with `allow_legacy_checkpoint=True`, then
+must re-save in the current format before normal training resumes.
+
 Run smoke coverage on one node:
 
 ```bash
@@ -19,6 +27,24 @@ PYTHONPATH="$(pwd):$(pwd)/experimental/lite" MLITE_RUN_SMOKE=1 MLITE_SMOKE_NPROC
 ```
 
 The smoke suite is skipped by default in regular `pytest` runs. Enable it with `--mlite-smoke` or `MLITE_RUN_SMOKE=1`.
+Release-acceptance commands should also pass `--mlite-fail-on-skip`; this turns
+any selected skip or xfail (including a missing CUDA/kernel dependency) into a
+test failure instead of silently accepting an unexecuted gate.
+
+The pinned GLM-5.2-FP8 real-weight projection gate downloads only the three
+required byte ranges (12,590,080 bytes total), verifies their release hashes,
+and then runs on one GPU:
+
+```bash
+python experimental/lite/tests/fetch_glm52_fp8_projection_authority.py /tmp/glm52-fp8
+GLM52_FP8_PROJECTION_AUTHORITY_DIR=/tmp/glm52-fp8 \
+  pytest --mlite-smoke --mlite-fail-on-skip -q -s \
+  experimental/lite/tests/smoke/model/test_glm52_fp8_real_weight_projection_smoke.py
+```
+
+This is pinned real-checkpoint, dequantized-BF16 q_a projection-level evidence
+through the production `torch.nn.Linear` + Transformer Engine RMSNorm path. It
+is not HF quantized-runtime, full-model, or long-context parity.
 
 Current matrix:
 

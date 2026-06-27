@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.registry import (
@@ -124,9 +123,7 @@ def test_qwen35_protocol_rejects_noncanonical_multi_layer_mtp_before_parallel_in
         protocol.build_model(
             cfg,
             impl_cfg=protocol.ImplConfig(
-                parallel=ParallelConfig(),
-                optimizer=None,
-                mtp_enable=True,
+                parallel=ParallelConfig(), optimizer=None, mtp_enable=True
             ),
         )
 
@@ -219,6 +216,31 @@ def test_qwen_lite_protocols_reexport_checkpoint_hook_names():
         assert "PLACEMENT_FN" in exported
         assert "EXPERT_CLASSIFIER" in checkpoint_imports
         assert "PLACEMENT_FN" in checkpoint_imports
+
+
+def test_qwen3_moe_protocol_bulk_loader_is_atomic_group_aware(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    calls = []
+    participating_group = object()
+
+    def fake_load(chunks, path, model_cfg, ps, *, participating_group=None):
+        calls.append((chunks, path, model_cfg, ps, participating_group))
+
+    monkeypatch.setattr(protocol, "_load_hf_weights_impl", fake_load)
+    chunks = [nn.Linear(1, 1), nn.Linear(1, 1)]
+    model_cfg = object()
+    ps = object()
+
+    protocol.load_hf_weights_many(
+        chunks, "/unused", model_cfg, ps, participating_group=participating_group
+    )
+
+    assert calls == [(chunks, "/unused", model_cfg, ps, participating_group)]
+    assert "load_hf_weights_many" in protocol.__all__
 
 
 def _string_list_assignment(tree: ast.Module, name: str) -> set[str]:

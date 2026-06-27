@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import importlib
+import time
 
 import pytest
 import torch
@@ -31,6 +32,11 @@ _COPY_MODULES = (
     "megatron.lite.model.kimi_k2.lite.checkpoint",
     "megatron.lite.model.deepseek_v4.lite.checkpoint",
     "megatron.lite.model.qwen3_5.lite.checkpoint",
+)
+
+_PROTOCOL_MODULES = tuple(
+    module_name.removesuffix(".checkpoint") + ".protocol"
+    for module_name in _COPY_MODULES
 )
 
 
@@ -114,10 +120,7 @@ def test_model_hf_copy_late_shape_mismatch_does_not_partially_write(
     ):
         copy_loaded_state(
             model,
-            {
-                "first.weight": torch.full((2, 2), 7.0),
-                "last.weight": torch.ones(1),
-            },
+            {"first.weight": torch.full((2, 2), 7.0), "last.weight": torch.ones(1)},
         )
 
     torch.testing.assert_close(
@@ -138,16 +141,81 @@ def test_model_hf_copy_rejects_unmapped_native_key(
 
     with pytest.raises(RuntimeError, match=r"has no native target: stale.weight"):
         copy_loaded_state(
-            model,
-            {
-                "weight": torch.ones(2, 2),
-                "stale.weight": torch.ones(2, 2),
-            },
+            model, {"weight": torch.ones(2, 2), "stale.weight": torch.ones(2, 2)}
         )
 
     torch.testing.assert_close(
         model.weight.detach(), torch.zeros(2, 2), atol=0.0, rtol=0.0
     )
+
+
+@pytest.mark.parametrize("module_name", _COPY_MODULES)
+def test_model_hf_loader_forwards_explicit_participating_group(
+    module_name: str, monkeypatch, transformer_engine_import_stub
+) -> None:
+    transformer_engine_import_stub()
+    checkpoint = importlib.import_module(module_name)
+    participating_group = object()
+    calls = []
+
+    def fake_load_chunks(
+        models,
+        builder,
+        *,
+        context,
+        participating_group=None,
+        allow_missing_parameter=None,
+    ) -> int:
+        del builder, context, allow_missing_parameter
+        calls.append((models, participating_group))
+        return 0
+
+    monkeypatch.setattr(checkpoint, "load_hf_model_chunks_atomically", fake_load_chunks)
+    model = _weight_module((1,))
+    checkpoint.load_hf_weights(
+        model, "/unused", object(), object(), participating_group=participating_group
+    )
+
+    assert calls == [(model, participating_group)]
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_module_name", "protocol_module_name"),
+    zip(_COPY_MODULES, _PROTOCOL_MODULES, strict=True),
+)
+def test_model_protocol_hf_loaders_forward_explicit_participating_group(
+    checkpoint_module_name: str,
+    protocol_module_name: str,
+    monkeypatch,
+    transformer_engine_import_stub,
+) -> None:
+    transformer_engine_import_stub()
+    checkpoint = importlib.import_module(checkpoint_module_name)
+    protocol = importlib.import_module(protocol_module_name)
+    participating_group = object()
+    calls = []
+
+    def fake_load(models, path, model_cfg, ps, *, participating_group=None) -> None:
+        calls.append((models, path, model_cfg, ps, participating_group))
+
+    monkeypatch.setattr(checkpoint, "load_hf_weights", fake_load)
+    if hasattr(protocol, "_load_hf_weights_impl"):
+        monkeypatch.setattr(protocol, "_load_hf_weights_impl", fake_load)
+
+    chunk = _weight_module((1,))
+    model_cfg = object()
+    ps = object()
+    protocol.load_hf_weights(
+        chunk, "/unused", model_cfg, ps, participating_group=participating_group
+    )
+    protocol.load_hf_weights_many(
+        [chunk], "/unused", model_cfg, ps, participating_group=participating_group
+    )
+
+    assert calls == [
+        (chunk, "/unused", model_cfg, ps, participating_group),
+        ([chunk], "/unused", model_cfg, ps, participating_group),
+    ]
 
 
 def test_atomic_hf_copy_requires_persistent_but_not_derived_buffers() -> None:
@@ -159,17 +227,12 @@ def test_atomic_hf_copy_requires_persistent_but_not_derived_buffers() -> None:
 
     with pytest.raises(RuntimeError, match=r"persistent_buffers=\['schema'\]"):
         copy_hf_state_atomically(
-            model,
-            {"weight": torch.ones(2, 2)},
-            context="test HF load",
+            model, {"weight": torch.ones(2, 2)}, context="test HF load"
         )
 
     copy_hf_state_atomically(
         model,
-        {
-            "weight": torch.ones(2, 2),
-            "schema": torch.tensor([3, 4], dtype=torch.int64),
-        },
+        {"weight": torch.ones(2, 2), "schema": torch.tensor([3, 4], dtype=torch.int64)},
         context="test HF load",
     )
     torch.testing.assert_close(model.cache, torch.ones(2), atol=0.0, rtol=0.0)
@@ -221,10 +284,7 @@ def test_atomic_hf_vpp_preflight_rejects_later_chunk_before_any_mutation() -> No
 
     with pytest.raises(RuntimeError, match=r"preflight failed.*chunk1"):
         copy_hf_states_atomically(
-            [
-                (first, {"weight": torch.full((2, 2), 17.0)}),
-                (second, {}),
-            ],
+            [(first, {"weight": torch.full((2, 2), 17.0)}), (second, {})],
             context="VPP HF load",
         )
 
@@ -298,14 +358,10 @@ def _gloo_corrupt_one_stage_worker(rank: int, init_path: str) -> None:
             raise AssertionError("rank-local materialization error was not propagated")
 
         model = _weight_module((2, 2))
-        loaded = {
-            "weight": torch.ones(2, 2) if rank == 0 else torch.ones(1),
-        }
+        loaded = {"weight": torch.ones(2, 2) if rank == 0 else torch.ones(1)}
         try:
             hf_weights.copy_hf_state_atomically(
-                model,
-                loaded,
-                context="distributed test load",
+                model, loaded, context="distributed test load"
             )
         except RuntimeError as exc:
             assert "checkpoint shape mismatch" in str(exc)
@@ -417,9 +473,7 @@ def _gloo_vpp_copy_failure_worker(rank: int, init_path: str) -> None:
 
             calls = 0
 
-            def fail_later_chunk(
-                target: torch.Tensor, source: torch.Tensor
-            ) -> None:
+            def fail_later_chunk(target: torch.Tensor, source: torch.Tensor) -> None:
                 nonlocal calls
                 calls += 1
                 if rank == failing_rank and calls == 3:
@@ -460,12 +514,9 @@ def _gloo_vpp_copy_failure_worker(rank: int, init_path: str) -> None:
                 assert peer_chunks is not None
                 for chunk_idx, restored in enumerate(peer_chunks):
                     expected = torch.full(
-                        (2, 2),
-                        float(100 * peer_rank + 10 * failing_rank + chunk_idx),
+                        (2, 2), float(100 * peer_rank + 10 * failing_rank + chunk_idx)
                     )
-                    torch.testing.assert_close(
-                        restored, expected, atol=0.0, rtol=0.0
-                    )
+                    torch.testing.assert_close(restored, expected, atol=0.0, rtol=0.0)
     finally:
         dist.destroy_process_group()
 
@@ -490,3 +541,143 @@ def test_atomic_hf_vpp_copy_failure_gloo_rolls_back_all_chunks_on_all_ranks(
         process.join(timeout=5)
     assert not alive, "distributed VPP HF load rollback consensus hung"
     assert [process.exitcode for process in processes] == [0, 0]
+
+
+def _run_four_rank_gloo_worker(worker, init_path: str) -> None:
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(target=worker, args=(rank, init_path)) for rank in range(4)
+    ]
+    for process in processes:
+        process.start()
+
+    deadline = time.monotonic() + 30
+    for process in processes:
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+
+    assert not alive, "independent subgroup HF load consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0, 0, 0]
+
+
+def _gloo_independent_success_subgroups_worker(rank: int, init_path: str) -> None:
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=4,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    try:
+        # Every WORLD rank must create groups in the same order.  Each rank then
+        # enters collectives only on the subgroup to which it belongs.
+        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+        subgroup_index = rank // 2
+        participating_group = groups[subgroup_index]
+        model = _weight_module((2, 2))
+
+        # The second subgroup performs one extra transaction.  A hidden WORLD
+        # collective would require ranks 0/1 to enter that operation and either
+        # hang or fail when they independently finish after the first load.
+        for step in range(subgroup_index + 1):
+            expected = torch.full((2, 2), float(10 * subgroup_index + step + 1))
+            hf_weights.copy_hf_state_atomically(
+                model,
+                {"weight": expected.clone()},
+                context=f"subgroup {subgroup_index} success load {step}",
+                participating_group=participating_group,
+            )
+            torch.testing.assert_close(
+                model.weight.detach(), expected, atol=0.0, rtol=0.0
+            )
+
+        dist.barrier(group=participating_group)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is unavailable")
+def test_atomic_hf_load_independent_success_subgroups_do_not_wait_for_world(
+    tmp_path,
+) -> None:
+    _run_four_rank_gloo_worker(
+        _gloo_independent_success_subgroups_worker,
+        str(tmp_path / "gloo-independent-success-init"),
+    )
+
+
+def _gloo_failure_isolated_from_success_subgroup_worker(
+    rank: int, init_path: str
+) -> None:
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=4,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    try:
+        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+        subgroup_index = rank // 2
+        participating_group = groups[subgroup_index]
+        model = _weight_module((2, 2))
+        baseline = torch.full((2, 2), float(rank + 1))
+        model.weight.data.copy_(baseline)
+        expected = torch.full((2, 2), float(rank + 101))
+        real_copy = hf_weights._copy_tensor_for_hf_load
+
+        def fail_on_rank_zero(target: torch.Tensor, source: torch.Tensor) -> None:
+            if rank == 0:
+                raise RuntimeError("rank-0 subgroup-local injected copy failure")
+            real_copy(target, source)
+
+        if subgroup_index == 0:
+            hf_weights._copy_tensor_for_hf_load = fail_on_rank_zero
+        try:
+            if subgroup_index == 0:
+                with pytest.raises(
+                    RuntimeError, match="rank-0 subgroup-local injected copy failure"
+                ):
+                    hf_weights.copy_hf_state_atomically(
+                        model,
+                        {"weight": expected},
+                        context="failing subgroup load",
+                        participating_group=participating_group,
+                    )
+                torch.testing.assert_close(
+                    model.weight.detach(), baseline, atol=0.0, rtol=0.0
+                )
+            else:
+                hf_weights.copy_hf_state_atomically(
+                    model,
+                    {"weight": expected},
+                    context="successful subgroup load",
+                    participating_group=participating_group,
+                )
+                torch.testing.assert_close(
+                    model.weight.detach(), expected, atol=0.0, rtol=0.0
+                )
+        finally:
+            hf_weights._copy_tensor_for_hf_load = real_copy
+
+        # No WORLD synchronization is needed for either subgroup to exit.
+        dist.barrier(group=participating_group)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is unavailable")
+def test_atomic_hf_load_failure_consensus_is_isolated_from_success_subgroup(
+    tmp_path,
+) -> None:
+    _run_four_rank_gloo_worker(
+        _gloo_failure_isolated_from_success_subgroup_worker,
+        str(tmp_path / "gloo-failure-isolation-init"),
+    )

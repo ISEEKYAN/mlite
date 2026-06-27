@@ -1,0 +1,98 @@
+{
+  "canonical_mtp_schema_sha256": "54a42a904540f171d00a8296f2cd457dcdf4b167290f8a4455ee58c3dcb36871",
+  "dtype": "BF16",
+  "expert_templates": {
+    "mtp.layers.0.mlp.experts.{expert_idx}.down_proj.weight": [
+      2048,
+      512
+    ],
+    "mtp.layers.0.mlp.experts.{expert_idx}.gate_proj.weight": [
+      512,
+      2048
+    ],
+    "mtp.layers.0.mlp.experts.{expert_idx}.up_proj.weight": [
+      512,
+      2048
+    ]
+  },
+  "non_expert_shapes": {
+    "mtp.fc.weight": [
+      2048,
+      4096
+    ],
+    "mtp.layers.0.input_layernorm.weight": [
+      2048
+    ],
+    "mtp.layers.0.mlp.gate.weight": [
+      256,
+      2048
+    ],
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight": [
+      2048,
+      512
+    ],
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight": [
+      512,
+      2048
+    ],
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight": [
+      512,
+      2048
+    ],
+    "mtp.layers.0.mlp.shared_expert_gate.weight": [
+      1,
+      2048
+    ],
+    "mtp.layers.0.post_attention_layernorm.weight": [
+      2048
+    ],
+    "mtp.layers.0.self_attn.k_norm.weight": [
+      256
+    ],
+    "mtp.layers.0.self_attn.k_proj.weight": [
+      512,
+      2048
+    ],
+    "mtp.layers.0.self_attn.o_proj.weight": [
+      2048,
+      4096
+    ],
+    "mtp.layers.0.self_attn.q_norm.weight": [
+      256
+    ],
+    "mtp.layers.0.self_attn.q_proj.weight": [
+      8192,
+      2048
+    ],
+    "mtp.layers.0.self_attn.v_proj.weight": [
+      512,
+      2048
+    ],
+    "mtp.norm.weight": [
+      2048
+    ],
+    "mtp.pre_fc_norm_embedding.weight": [
+      2048
+    ],
+    "mtp.pre_fc_norm_hidden.weight": [
+      2048
+    ]
+  },
+  "num_experts": 256,
+  "source": {
+    "config_sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+    "headers": {
+      "model.safetensors-00013-of-00014.safetensors": {
+        "header_bytes": 23344,
+        "header_sha256": "5d7fb10af28ff02acfa88a1e623ccb41b360e442ff2bddeefa131a71235da416"
+      },
+      "model.safetensors-00014-of-00014.safetensors": {
+        "header_bytes": 189072,
+        "header_sha256": "091eaab7a7dd4059a782c2fed3e4c3942546ef4803f9be95ff14bf63bc33c59d"
+      }
+    },
+    "index_sha256": "d8d0b7ca4e61ae107e3e87a3ff21136b3ac7c789e64bb24267227ca804e04205",
+    "repo": "Qwen/Qwen3.5-35B-A3B",
+    "revision": "59d61f3ce65a6d9863b86d2e96597125219dc754"
+  }
+}

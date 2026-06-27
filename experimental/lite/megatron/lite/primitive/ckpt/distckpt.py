@@ -3,17 +3,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-from collections.abc import Callable, Iterable, MutableMapping
+import struct
+import threading
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import replace
 from types import MethodType
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedBase,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.lite.primitive.ckpt.hf_weights import (
     _distributed_raise_if_error,
     named_persistent_buffers,
@@ -31,6 +40,7 @@ _DISTOPT_METADATA = {
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
+_DISTCKPT_COMMON_LOAD_LOCK = threading.RLock()
 
 
 def attach_model_sharded_state_dict(
@@ -77,6 +87,10 @@ def save_dist_opt_checkpoint(
 ) -> None:
     """Save model and DistributedOptimizer state through mcore dist_checkpointing."""
 
+    if type(step) is not int or step < 0:
+        raise TypeError("checkpoint step must be a non-negative integer")
+    if save_optimizer and optimizer is None:
+        raise ValueError("save_optimizer=True requires a non-None sharded optimizer")
     local_error = None
     try:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -98,6 +112,7 @@ def save_dist_opt_checkpoint(
     if save_model or save_optimizer:
         try:
             model_sd = _model_sharded_state_dict(model)
+            _validate_model_sharded_key_namespace(model_sd)
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"
     _distributed_raise_if_error(
@@ -116,6 +131,9 @@ def save_dist_opt_checkpoint(
             try:
                 state_dict["optimizer"] = optimizer.sharded_state_dict(
                     _single_or_all_model_state(model_sd), metadata=_DISTOPT_METADATA
+                )
+                _validate_optimizer_sharded_key_namespace(
+                    state_dict["optimizer"], model_sd
                 )
             finally:
                 _restore_state_dict_patches(patches)
@@ -144,9 +162,13 @@ def load_dist_opt_checkpoint(
     *,
     load_model: bool = True,
     load_optimizer: bool = True,
+    expected_step: int | None = None,
+    allow_legacy_checkpoint: bool = False,
 ) -> int:
     """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
 
+    if load_optimizer and optimizer is None:
+        raise ValueError("load_optimizer=True requires a non-None sharded optimizer")
     model_sd: dict[str, Any] = {}
     local_error = None
     if load_model or load_optimizer:
@@ -172,6 +194,9 @@ def load_dist_opt_checkpoint(
                     is_loading=True,
                     metadata=_DISTOPT_METADATA,
                 )
+                _validate_optimizer_sharded_key_namespace(
+                    load_sd["optimizer"], model_sd
+                )
             finally:
                 _restore_state_dict_patches(patches)
         except Exception as exc:
@@ -179,32 +204,58 @@ def load_dist_opt_checkpoint(
     _distributed_raise_if_error(
         local_error, context="distckpt optimizer state construction failed"
     )
-    # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
-    # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
-    # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
-    _orig_torch_load = torch.load
-
-    def _trusted_torch_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return _orig_torch_load(*args, **kwargs)
-
-    torch.load = _trusted_torch_load
+    requested_keys, checkpoint_keys = _preflight_distckpt_checkpoint_metadata(
+        load_sd,
+        model_sd,
+        checkpoint_dir,
+        load_model=load_model,
+        load_optimizer=load_optimizer,
+    )
+    preloaded_common_state, common_state_fingerprint = _preflight_distckpt_common_state(
+        load_sd,
+        checkpoint_dir,
+        load_optimizer=load_optimizer,
+        requested_sharded_keys=requested_keys,
+        checkpoint_sharded_keys=checkpoint_keys,
+        expected_step=expected_step,
+        allow_legacy_checkpoint=allow_legacy_checkpoint,
+    )
+    _revalidate_distckpt_common_state_file(checkpoint_dir, common_state_fingerprint)
     state_dict: dict[str, Any] = {}
     local_error = None
     try:
-        try:
-            state_dict = dist_checkpointing.load(
-                load_sd, checkpoint_dir, validate_access_integrity=False
-            )
-        except Exception as exc:
-            local_error = f"{type(exc).__name__}: {exc}"
-    finally:
-        torch.load = _orig_torch_load
+        state_dict = _load_distckpt_with_preloaded_common(
+            load_sd,
+            checkpoint_dir,
+            preloaded_common_state,
+            validate_access_integrity=False,
+            strict=StrictHandling.RAISE_UNEXPECTED,
+        )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
     _distributed_raise_if_error(local_error, context="distckpt checkpoint load failed")
+    local_error = None
+    loaded_step = int(state_dict.get("step", 0))
+    if expected_step is not None and loaded_step != expected_step:
+        local_error = (
+            f"checkpoint payload step {loaded_step} does not match completion manifest "
+            f"step {expected_step}"
+        )
+    _distributed_raise_if_error(
+        local_error, context="distckpt checkpoint step validation failed"
+    )
+    local_error = None
+    if load_optimizer and optimizer is not None and "optimizer" not in state_dict:
+        local_error = (
+            "checkpoint is missing optimizer state requested by load_optimizer=True"
+        )
+    _distributed_raise_if_error(
+        local_error, context="distckpt checkpoint completeness validation failed"
+    )
     local_error = None
     if load_model:
         try:
-            _load_model_state_dict(model, state_dict)
+            _load_model_state_dict(model, state_dict, expected_state_dict=model_sd)
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"
     _distributed_raise_if_error(
@@ -212,7 +263,11 @@ def load_dist_opt_checkpoint(
     )
     local_error = None
     try:
-        if load_optimizer and optimizer is not None and "optimizer" in state_dict:
+        if load_optimizer and optimizer is not None:
+            if "optimizer" not in state_dict:
+                raise RuntimeError(
+                    "checkpoint is missing optimizer state requested by load_optimizer=True"
+                )
             load_patches = _patch_native_optimizer_step_load(optimizer)
             try:
                 optimizer.load_state_dict(state_dict["optimizer"])
@@ -228,7 +283,716 @@ def load_dist_opt_checkpoint(
     _distributed_raise_if_error(
         local_error, context="distckpt optimizer state application failed"
     )
-    return int(state_dict.get("step", 0))
+    return loaded_step
+
+
+def _iter_sharded_bases(value: Any) -> Iterable[ShardedBase]:
+    """Yield effective sharded entries, expanding factories without mutation."""
+
+    if isinstance(value, ShardedTensorFactory):
+        yield from _iter_sharded_bases(value.build())
+    elif isinstance(value, ShardedBase):
+        yield value
+    elif isinstance(value, Mapping):
+        for child in value.values():
+            yield from _iter_sharded_bases(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_sharded_bases(child)
+
+
+def _sharded_logical_keys(value: Any) -> set[str]:
+    return set(_sharded_metadata_contracts(value))
+
+
+def _sharded_metadata_contracts(
+    value: Any,
+) -> dict[str, tuple[str, tuple[int, ...], str | None, bool]]:
+    contracts: dict[str, tuple[str, tuple[int, ...], str | None, bool]] = {}
+    for sharded_base in _iter_sharded_bases(value):
+        key = getattr(sharded_base, "key", None)
+        if not isinstance(key, str) or not key:
+            raise RuntimeError(
+                f"distckpt sharded metadata contains an invalid logical key: {key!r}"
+            )
+        global_shape = getattr(sharded_base, "global_shape", None)
+        if not isinstance(global_shape, tuple) or not all(
+            type(dim) is int for dim in global_shape
+        ):
+            raise RuntimeError(
+                f"distckpt sharded metadata for {key!r} has invalid global_shape "
+                f"{global_shape!r}"
+            )
+        if isinstance(sharded_base, ShardedTensor):
+            contract = (
+                "tensor",
+                global_shape,
+                str(sharded_base.dtype),
+                bool(sharded_base.allow_shape_mismatch),
+            )
+        else:
+            contract = ("object", global_shape, None, False)
+        previous = contracts.get(key)
+        if previous is not None and previous != contract:
+            raise RuntimeError(
+                f"distckpt logical key {key!r} has inconsistent metadata contracts: "
+                f"{previous!r} vs {contract!r}"
+            )
+        contracts[key] = contract
+    return contracts
+
+
+def _validate_model_sharded_key_namespace(model_sd: Mapping[str, Any]) -> None:
+    reserved_model_keys = sorted(
+        key for key in _sharded_logical_keys(model_sd) if key.startswith("optimizer.")
+    )
+    if reserved_model_keys:
+        raise RuntimeError(
+            "model checkpoint keys use the reserved 'optimizer.' prefix: "
+            f"{reserved_model_keys}"
+        )
+
+
+def _validate_optimizer_sharded_key_namespace(
+    optimizer_sd: Any, model_sd: Mapping[str, Any]
+) -> None:
+    optimizer_keys = _sharded_logical_keys(optimizer_sd)
+    invalid_optimizer_keys = sorted(
+        key for key in optimizer_keys if not key.startswith("optimizer.")
+    )
+    if invalid_optimizer_keys:
+        raise RuntimeError(
+            "optimizer checkpoint keys must use the reserved 'optimizer.' prefix: "
+            f"{invalid_optimizer_keys}"
+        )
+    overlapping_keys = sorted(optimizer_keys & _sharded_logical_keys(model_sd))
+    if overlapping_keys:
+        raise RuntimeError(
+            f"model and optimizer checkpoint keys overlap: {overlapping_keys}"
+        )
+
+
+def _load_checkpoint_sharded_metadata(checkpoint_dir: str) -> Mapping[str, Any]:
+    # ``load_sharded_metadata`` includes both tensors and ShardedObjects but is
+    # not re-exported from megatron.core.dist_checkpointing.
+    from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
+
+    metadata = load_sharded_metadata(checkpoint_dir)
+    if not isinstance(metadata, Mapping):
+        raise TypeError(
+            "MCore load_sharded_metadata returned "
+            f"{type(metadata).__name__}, expected a mapping"
+        )
+    return metadata
+
+
+def _load_checkpoint_common_state(checkpoint_dir: str) -> Mapping[str, Any]:
+    common_state = dist_checkpointing.load_common_state_dict(checkpoint_dir)
+    if not isinstance(common_state, Mapping):
+        raise TypeError(
+            "MCore load_common_state_dict returned "
+            f"{type(common_state).__name__}, expected a mapping"
+        )
+    return common_state
+
+
+def _common_state_contracts(
+    value: Any, path: tuple[str, ...] = ()
+) -> dict[tuple[str, ...], tuple[str, tuple[int, ...] | None, str | None]]:
+    if isinstance(value, (ShardedBase, LocalNonpersistentObject)):
+        return {}
+
+    def type_name(item: Any) -> str:
+        item_type = type(item)
+        return f"{item_type.__module__}.{item_type.__qualname__}"
+
+    if isinstance(value, Mapping):
+        if not value:
+            return {path + ("<empty>",): (type_name(value), None, None)}
+        contracts = {}
+        for key, child in value.items():
+            segment = f"{type_name(key)}:{key!r}"
+            contracts.update(_common_state_contracts(child, path + (segment,)))
+        if contracts:
+            contracts[path + ("<container>",)] = (type_name(value), None, None)
+        return contracts
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return {path + ("<empty>",): (type_name(value), None, None)}
+        contracts = {}
+        for index, child in enumerate(value):
+            contracts.update(_common_state_contracts(child, path + (f"index:{index}",)))
+        if contracts:
+            contracts[path + ("<container>",)] = (type_name(value), None, None)
+        return contracts
+    if isinstance(value, torch.Tensor):
+        return {path: (type_name(value), tuple(value.shape), str(value.dtype))}
+    return {path: (type_name(value), None, None)}
+
+
+def _common_state_file_fingerprint(checkpoint_dir: str) -> tuple[int, str]:
+    """Hash the exact MCore common-state payload without reserializing it."""
+
+    from megatron.core.msc_utils import MultiStorageClientFeature
+
+    path = os.path.join(checkpoint_dir, "common.pt")
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        open_file = msc.open
+    else:
+        open_file = open
+    digest = hashlib.sha256()
+    size = 0
+    with open_file(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _common_state_semantic_fingerprint(value: Any) -> str:
+    """Hash common-state values using a deterministic, pickle-free encoding."""
+
+    digest = hashlib.sha256()
+    active_containers: set[int] = set()
+
+    def type_name(item: Any) -> str:
+        item_type = type(item)
+        return f"{item_type.__module__}.{item_type.__qualname__}"
+
+    def frame_bytes(tag: bytes, payload: bytes) -> bytes:
+        return (
+            len(tag).to_bytes(4, "big")
+            + tag
+            + len(payload).to_bytes(8, "big")
+            + payload
+        )
+
+    def stable_key_bytes(item: Any, path: str) -> bytes:
+        item_type = type_name(item).encode("utf-8")
+        if item is None:
+            payload = b""
+        elif isinstance(item, bool):
+            payload = b"1" if item else b"0"
+        elif isinstance(item, int):
+            payload = str(item).encode("ascii")
+        elif isinstance(item, float):
+            payload = struct.pack(">d", item)
+        elif isinstance(item, complex):
+            payload = struct.pack(">dd", item.real, item.imag)
+        elif isinstance(item, str):
+            payload = item.encode("utf-8")
+        elif isinstance(item, bytes):
+            payload = item
+        elif isinstance(item, tuple):
+            container_id = id(item)
+            if container_id in active_containers:
+                raise ValueError(f"common-state cycle detected at {path}")
+            active_containers.add(container_id)
+            try:
+                children = b"".join(
+                    frame_bytes(b"item", stable_key_bytes(child, f"{path}[{index}]"))
+                    for index, child in enumerate(item)
+                )
+                payload = frame_bytes(
+                    b"length", str(len(item)).encode("ascii")
+                ) + frame_bytes(b"children", children)
+            finally:
+                active_containers.remove(container_id)
+        else:
+            raise TypeError(
+                f"unsupported common-state mapping key at {path}: {type_name(item)}"
+            )
+        return frame_bytes(b"type", item_type) + frame_bytes(b"value", payload)
+
+    def update(tag: bytes, payload: bytes | memoryview = b"") -> None:
+        digest.update(len(tag).to_bytes(4, "big"))
+        digest.update(tag)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    def visit(item: Any, path: str) -> None:
+        if isinstance(item, (ShardedBase, LocalNonpersistentObject)):
+            raise TypeError(
+                f"sharded/nonpersistent object leaked into common state at {path}: "
+                f"{type_name(item)}"
+            )
+        update(b"type", type_name(item).encode("utf-8"))
+        if item is None:
+            update(b"none")
+        elif isinstance(item, bool):
+            update(b"bool", b"1" if item else b"0")
+        elif isinstance(item, int):
+            update(b"int", str(item).encode("ascii"))
+        elif isinstance(item, float):
+            update(b"float64", struct.pack(">d", item))
+        elif isinstance(item, complex):
+            update(b"complex128", struct.pack(">dd", item.real, item.imag))
+        elif isinstance(item, str):
+            update(b"str", item.encode("utf-8"))
+        elif isinstance(item, bytes):
+            update(b"bytes", item)
+        elif isinstance(item, (bytearray, memoryview)):
+            update(b"bytes-like", memoryview(item))
+        elif isinstance(item, torch.Tensor):
+            if item.layout != torch.strided or item.is_quantized:
+                raise TypeError(
+                    f"unsupported common-state tensor at {path}: "
+                    f"layout={item.layout}, quantized={item.is_quantized}"
+                )
+            if item.device.type == "meta":
+                raise TypeError(f"meta tensor is invalid in common state at {path}")
+            cpu = item.detach().resolve_conj().resolve_neg().cpu().contiguous()
+            update(b"tensor.dtype", str(cpu.dtype).encode("ascii"))
+            update(
+                b"tensor.shape",
+                b",".join(str(dim).encode("ascii") for dim in cpu.shape),
+            )
+            raw = cpu.reshape(-1).view(torch.uint8).numpy()
+            update(b"tensor.bytes", memoryview(raw))
+        elif isinstance(item, Mapping):
+            container_id = id(item)
+            if container_id in active_containers:
+                raise ValueError(f"common-state cycle detected at {path}")
+            active_containers.add(container_id)
+            try:
+                encoded_items = sorted(
+                    [
+                        (stable_key_bytes(key, f"{path}.<key>"), key, child)
+                        for key, child in item.items()
+                    ],
+                    key=lambda entry: entry[0],
+                )
+                for previous, current in zip(
+                    encoded_items, encoded_items[1:], strict=False
+                ):
+                    if previous[0] == current[0]:
+                        raise ValueError(
+                            f"common-state mapping has duplicate canonical keys at {path}"
+                        )
+                update(b"mapping.length", str(len(encoded_items)).encode("ascii"))
+                for key_bytes, key, child in encoded_items:
+                    update(b"mapping.key", key_bytes)
+                    visit(child, f"{path}[{key!r}]")
+                update(b"mapping.end")
+            finally:
+                active_containers.remove(container_id)
+        elif isinstance(item, (list, tuple)):
+            container_id = id(item)
+            if container_id in active_containers:
+                raise ValueError(f"common-state cycle detected at {path}")
+            active_containers.add(container_id)
+            try:
+                update(b"sequence.length", str(len(item)).encode("ascii"))
+                for index, child in enumerate(item):
+                    update(b"sequence.index", str(index).encode("ascii"))
+                    visit(child, f"{path}[{index}]")
+                update(b"sequence.end")
+            finally:
+                active_containers.remove(container_id)
+        elif isinstance(item, (set, frozenset)):
+            container_id = id(item)
+            if container_id in active_containers:
+                raise ValueError(f"common-state cycle detected at {path}")
+            active_containers.add(container_id)
+            try:
+                encoded = sorted(
+                    stable_key_bytes(child, f"{path}.<set-item>") for child in item
+                )
+                update(b"set.length", str(len(encoded)).encode("ascii"))
+                for child in encoded:
+                    update(b"set.item", child)
+                update(b"set.end")
+            finally:
+                active_containers.remove(container_id)
+        elif isinstance(item, torch.dtype):
+            update(b"torch.dtype", str(item).encode("ascii"))
+        elif isinstance(item, torch.device):
+            update(b"torch.device", str(item).encode("ascii"))
+        else:
+            raise TypeError(
+                f"unsupported common-state value at {path}: {type_name(item)}"
+            )
+
+    visit(value, "root")
+    return digest.hexdigest()
+
+
+def _validate_distckpt_content_metadata(
+    common_state: Mapping[str, Any],
+    *,
+    load_optimizer: bool,
+    allow_legacy_checkpoint: bool,
+) -> None:
+    """Require the payload format used to build the live load template."""
+
+    if allow_legacy_checkpoint and not load_optimizer:
+        return
+    if "content_metadata" not in common_state:
+        legacy_detail = (
+            "optimizer restore cannot safely infer its sharding format"
+            if load_optimizer
+            else "set allow_legacy_checkpoint=True only for an explicit legacy load"
+        )
+        raise RuntimeError(
+            "checkpoint common state is missing required content_metadata; "
+            f"{legacy_detail}"
+        )
+    metadata = common_state["content_metadata"]
+    if type(metadata) is not dict:
+        raise RuntimeError(
+            "checkpoint content_metadata must be a plain dict, got "
+            f"{type(metadata).__module__}.{type(metadata).__qualname__}"
+        )
+    missing = sorted(set(_DISTOPT_METADATA) - set(metadata))
+    unexpected = sorted(set(metadata) - set(_DISTOPT_METADATA))
+    mismatched = sorted(
+        key
+        for key in set(metadata) & set(_DISTOPT_METADATA)
+        if type(metadata[key]) is not type(_DISTOPT_METADATA[key])
+        or metadata[key] != _DISTOPT_METADATA[key]
+    )
+    if missing or unexpected or mismatched:
+        raise RuntimeError(
+            "checkpoint content_metadata is incompatible with the MLite distckpt "
+            f"format: missing={missing}, unexpected={unexpected}, "
+            f"mismatched={mismatched}"
+        )
+
+
+def _common_state_format_discriminators(
+    value: Any, path: tuple[str, ...] = ()
+) -> dict[tuple[str, ...], tuple[str, Any]]:
+    """Collect exact common-state fields that select optimizer load branches."""
+
+    if isinstance(value, (ShardedBase, LocalNonpersistentObject)):
+        return {}
+
+    def type_name(item: Any) -> str:
+        item_type = type(item)
+        return f"{item_type.__module__}.{item_type.__qualname__}"
+
+    discriminators: dict[tuple[str, ...], tuple[str, Any]] = {}
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            segment = f"{type_name(key)}:{key!r}"
+            child_path = path + (segment,)
+            if key == "param_state_sharding_type":
+                discriminators[child_path] = (type_name(child), child)
+            discriminators.update(
+                _common_state_format_discriminators(child, child_path)
+            )
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            discriminators.update(
+                _common_state_format_discriminators(child, path + (f"index:{index}",))
+            )
+    return discriminators
+
+
+def _assert_world_consensus(value: Any, *, context: str) -> None:
+    """Require every WORLD rank to report the same picklable metadata value."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    gathered: list[Any] = [None] * dist.get_world_size()
+    local_error = None
+    try:
+        dist.all_gather_object(gathered, value, group=dist.group.WORLD)
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(local_error, context=f"{context} exchange failed")
+    if any(item != gathered[0] for item in gathered[1:]):
+        raise RuntimeError(f"{context}: rank values={gathered!r}")
+
+
+def _preflight_distckpt_common_state(
+    load_sd: Mapping[str, Any],
+    checkpoint_dir: str,
+    *,
+    load_optimizer: bool,
+    requested_sharded_keys: set[str],
+    checkpoint_sharded_keys: set[str],
+    expected_step: int | None,
+    allow_legacy_checkpoint: bool,
+) -> tuple[dict[str, Any], tuple[int, str]]:
+    common_state: Mapping[str, Any] = {}
+    common_contracts: dict = {}
+    optimizer_contracts: dict = {}
+    common_state_fingerprint: tuple[int, str] | None = None
+    common_state_semantic_fingerprint: str | None = None
+    loaded_step: int | None = None
+    local_error = None
+    try:
+        before_fingerprint = _common_state_file_fingerprint(checkpoint_dir)
+        common_state = _load_checkpoint_common_state(checkpoint_dir)
+        common_state_fingerprint = _common_state_file_fingerprint(checkpoint_dir)
+        if common_state_fingerprint != before_fingerprint:
+            raise RuntimeError(
+                "checkpoint common.pt changed while it was being preflighted: "
+                f"before={before_fingerprint!r}, after={common_state_fingerprint!r}"
+            )
+        _validate_distckpt_content_metadata(
+            common_state,
+            load_optimizer=load_optimizer,
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
+        )
+        common_state_semantic_fingerprint = _common_state_semantic_fingerprint(
+            common_state
+        )
+        common_contracts = _common_state_contracts(common_state)
+        raw_step = common_state.get("step")
+        if type(raw_step) is not int or raw_step < 0:
+            raise RuntimeError(
+                f"checkpoint common step must be a non-negative integer, got {raw_step!r}"
+            )
+        loaded_step = raw_step
+        if expected_step is not None and loaded_step != expected_step:
+            raise RuntimeError(
+                f"checkpoint common step {loaded_step} does not match completion "
+                f"manifest step {expected_step}"
+            )
+        if load_optimizer:
+            expected_optimizer_contracts = _common_state_contracts(
+                load_sd.get("optimizer", {})
+            )
+            optimizer_contracts = _common_state_contracts(
+                common_state["optimizer"] if "optimizer" in common_state else {}
+            )
+            expected_discriminators = _common_state_format_discriminators(
+                load_sd.get("optimizer", {})
+            )
+            saved_discriminators = _common_state_format_discriminators(
+                common_state["optimizer"] if "optimizer" in common_state else {}
+            )
+            requested_optimizer_sharded = any(
+                key.startswith("optimizer.") for key in requested_sharded_keys
+            )
+            checkpoint_optimizer_sharded = any(
+                key.startswith("optimizer.") for key in checkpoint_sharded_keys
+            )
+            if (
+                not expected_optimizer_contracts
+                and requested_optimizer_sharded
+                and ("optimizer" not in common_state or not common_state["optimizer"])
+            ):
+                optimizer_contracts = {}
+            if not checkpoint_optimizer_sharded and "optimizer" not in common_state:
+                raise RuntimeError(
+                    "checkpoint is missing optimizer state requested by "
+                    "load_optimizer=True"
+                )
+            if expected_optimizer_contracts != optimizer_contracts:
+                expected_paths = set(expected_optimizer_contracts)
+                saved_paths = set(optimizer_contracts)
+                mismatched_paths = sorted(
+                    path
+                    for path in expected_paths & saved_paths
+                    if expected_optimizer_contracts[path] != optimizer_contracts[path]
+                )
+                raise RuntimeError(
+                    "checkpoint optimizer common-state schema mismatch: "
+                    f"missing={sorted(expected_paths - saved_paths)}, "
+                    f"unexpected={sorted(saved_paths - expected_paths)}, "
+                    f"mismatched={mismatched_paths}"
+                )
+            if expected_discriminators != saved_discriminators:
+                raise RuntimeError(
+                    "checkpoint optimizer format discriminator mismatch: "
+                    f"expected={expected_discriminators!r}, "
+                    f"saved={saved_discriminators!r}"
+                )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt common-state preflight failed"
+    )
+    _assert_world_consensus(
+        {
+            "step": loaded_step,
+            "common_state_semantic_sha256": common_state_semantic_fingerprint,
+            "common_contracts": common_contracts,
+            "optimizer_contracts": optimizer_contracts,
+        },
+        context="distckpt common-state metadata differs across ranks",
+    )
+    assert common_state_fingerprint is not None
+    assert common_state_semantic_fingerprint is not None
+    return dict(common_state), common_state_fingerprint
+
+
+def _revalidate_distckpt_common_state_file(
+    checkpoint_dir: str, expected_fingerprint: tuple[int, str]
+) -> None:
+    current_fingerprint: tuple[int, str] | None = None
+    local_error = None
+    try:
+        current_fingerprint = _common_state_file_fingerprint(checkpoint_dir)
+        if current_fingerprint != expected_fingerprint:
+            raise RuntimeError(
+                "checkpoint common.pt changed after preflight: "
+                f"expected={expected_fingerprint!r}, current={current_fingerprint!r}"
+            )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt common-state revalidation failed"
+    )
+
+
+def _load_distckpt_with_preloaded_common(
+    load_sd: Mapping[str, Any],
+    checkpoint_dir: str,
+    common_state: dict[str, Any],
+    **kwargs,
+) -> dict[str, Any]:
+    """Bind MCore's actual load to the common state validated by preflight."""
+
+    from megatron.core.dist_checkpointing import serialization
+
+    expected_path = os.path.realpath(os.path.abspath(checkpoint_dir))
+    owner_thread = threading.get_ident()
+    with _DISTCKPT_COMMON_LOAD_LOCK:
+        original_load_common = serialization.load_common
+
+        def load_validated_common(actual_checkpoint_dir):
+            actual_path = os.path.realpath(
+                os.path.abspath(os.fspath(actual_checkpoint_dir))
+            )
+            if threading.get_ident() != owner_thread or actual_path != expected_path:
+                return original_load_common(actual_checkpoint_dir)
+            return common_state
+
+        serialization.load_common = load_validated_common
+        try:
+            loaded = dist_checkpointing.load(load_sd, checkpoint_dir, **kwargs)
+        finally:
+            serialization.load_common = original_load_common
+    if not isinstance(loaded, dict):
+        raise TypeError(
+            "MCore dist_checkpointing.load returned "
+            f"{type(loaded).__name__}, expected dict"
+        )
+    return loaded
+
+
+def _gather_world_metadata_contracts(
+    local_contracts: dict[str, tuple[str, tuple[int, ...], str | None, bool]],
+    *,
+    context: str,
+    require_identical: bool,
+) -> dict[str, tuple[str, tuple[int, ...], str | None, bool]]:
+    if not dist.is_available() or not dist.is_initialized():
+        return dict(local_contracts)
+    gathered: list[dict | None] = [None] * dist.get_world_size()
+    local_error = None
+    try:
+        dist.all_gather_object(gathered, local_contracts)
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(local_error, context=f"{context} exchange failed")
+    normalized = [dict(contracts or {}) for contracts in gathered]
+    if require_identical and any(
+        contracts != normalized[0] for contracts in normalized[1:]
+    ):
+        local_error = f"rank metadata contracts differ: {normalized!r}"
+        _distributed_raise_if_error(local_error, context=context)
+    merged: dict[str, tuple[str, tuple[int, ...], str | None, bool]] = {}
+    for rank_contracts in normalized:
+        for key, contract in rank_contracts.items():
+            previous = merged.get(key)
+            if previous is not None and previous != contract:
+                local_error = (
+                    f"logical key {key!r} differs across requested ranks: "
+                    f"{previous!r} vs {contract!r}"
+                )
+                _distributed_raise_if_error(local_error, context=context)
+            merged[key] = contract
+    return merged
+
+
+def _validate_requested_checkpoint_contracts(
+    requested: Mapping[str, tuple[str, tuple[int, ...], str | None, bool]],
+    checkpoint: Mapping[str, tuple[str, tuple[int, ...], str | None, bool]],
+) -> list[str]:
+    mismatches: list[str] = []
+    for key in sorted(set(requested) & set(checkpoint)):
+        requested_kind, requested_shape, requested_dtype, allow_shape_mismatch = (
+            requested[key]
+        )
+        checkpoint_kind, checkpoint_shape, checkpoint_dtype, _ = checkpoint[key]
+        if requested_kind != checkpoint_kind:
+            mismatches.append(f"{key}: type {checkpoint_kind!r} != {requested_kind!r}")
+        if requested_dtype != checkpoint_dtype:
+            mismatches.append(
+                f"{key}: dtype {checkpoint_dtype!r} != {requested_dtype!r}"
+            )
+        if not allow_shape_mismatch and requested_shape != checkpoint_shape:
+            mismatches.append(
+                f"{key}: global_shape {checkpoint_shape!r} != {requested_shape!r}"
+            )
+    return mismatches
+
+
+def _preflight_distckpt_checkpoint_metadata(
+    load_sd: Mapping[str, Any],
+    model_sd: Mapping[str, Any],
+    checkpoint_dir: str,
+    *,
+    load_model: bool,
+    load_optimizer: bool,
+) -> tuple[set[str], set[str]]:
+    """Reject component-aware key mismatches before MCore can mutate live tensors."""
+
+    requested_local: dict = {}
+    checkpoint_local: dict = {}
+    local_error = None
+    try:
+        _validate_model_sharded_key_namespace(model_sd)
+        requested_local = _sharded_metadata_contracts(load_sd)
+        checkpoint_metadata = _load_checkpoint_sharded_metadata(checkpoint_dir)
+        checkpoint_local = _sharded_metadata_contracts(checkpoint_metadata)
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt checkpoint metadata read failed"
+    )
+
+    requested_contracts = _gather_world_metadata_contracts(
+        requested_local, context="distckpt requested metadata", require_identical=False
+    )
+    checkpoint_contracts = _gather_world_metadata_contracts(
+        checkpoint_local,
+        context="distckpt on-disk metadata differs across ranks",
+        require_identical=True,
+    )
+    requested_keys = set(requested_contracts)
+    checkpoint_keys = set(checkpoint_contracts)
+
+    requested_but_absent = sorted(requested_keys - checkpoint_keys)
+    saved_but_unrequested = checkpoint_keys - requested_keys
+    required_saved_but_unrequested = sorted(
+        key
+        for key in saved_but_unrequested
+        if (load_optimizer and key.startswith("optimizer."))
+        or (load_model and not key.startswith("optimizer."))
+    )
+    local_error = None
+    contract_mismatches = _validate_requested_checkpoint_contracts(
+        requested_contracts, checkpoint_contracts
+    )
+    if requested_but_absent or required_saved_but_unrequested or contract_mismatches:
+        local_error = (
+            "sharded key mismatch before load: "
+            f"requested_but_absent={requested_but_absent}, "
+            "saved_but_unrequested_for_requested_components="
+            f"{required_saved_but_unrequested}, "
+            f"contract_mismatches={contract_mismatches}"
+        )
+    _distributed_raise_if_error(
+        local_error, context="distckpt checkpoint metadata preflight failed"
+    )
+    return requested_keys, checkpoint_keys
 
 
 def _synchronize_native_optimizer_steps(optimizer: Any) -> None:
@@ -673,22 +1437,85 @@ def _single_or_all_model_state(model_sd: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_model_state_dict(
-    model: nn.Module | Iterable[nn.Module], state_dict: dict[str, Any]
+    model: nn.Module | Iterable[nn.Module],
+    state_dict: dict[str, Any],
+    *,
+    expected_state_dict: dict[str, Any] | None = None,
 ) -> None:
     chunks = _model_chunks(model)
-    if len(chunks) == 1 and "model" in state_dict:
-        _wrapped_module(chunks[0]).load_state_dict(state_dict["model"], strict=False)
-        return
+    if not chunks:
+        raise RuntimeError("distckpt model load requires at least one model chunk")
     ps = _chunk_parallel_state(chunks[0]) if chunks else None
-    if len(chunks) == 1 and ps is not None and ps.pp_size > 1:
-        key = _model_chunk_key(ps, 0, 1)
-        if key in state_dict:
-            _wrapped_module(chunks[0]).load_state_dict(state_dict[key], strict=False)
-        return
+    expected_state_dict = (
+        _model_sharded_state_dict(model)
+        if expected_state_dict is None
+        else expected_state_dict
+    )
+    assignments: list[tuple[nn.Module, str, dict[str, Any], set[str]]] = []
     for idx, chunk in enumerate(chunks):
         key = _model_chunk_key(ps, idx, len(chunks))
-        if key in state_dict:
-            _wrapped_module(chunk).load_state_dict(state_dict[key], strict=False)
+        if key not in state_dict:
+            raise RuntimeError(
+                f"distckpt checkpoint is missing required model subtree {key!r}"
+            )
+        if key not in expected_state_dict:
+            raise RuntimeError(
+                f"distckpt load template is missing required model subtree {key!r}"
+            )
+        loaded_subtree = state_dict[key]
+        expected_subtree = expected_state_dict[key]
+        if not isinstance(loaded_subtree, dict) or not isinstance(
+            expected_subtree, dict
+        ):
+            raise TypeError(f"distckpt model subtree {key!r} must be a dictionary")
+        loaded_keys = set(loaded_subtree)
+        expected_keys = set(expected_subtree)
+        if loaded_keys != expected_keys:
+            raise RuntimeError(
+                f"distckpt model subtree {key!r} key mismatch: "
+                f"missing={sorted(expected_keys - loaded_keys)}, "
+                f"unexpected={sorted(loaded_keys - expected_keys)}"
+            )
+
+        current_state = _wrapped_module(chunk).state_dict()
+        metadata_errors: list[str] = []
+        for name, loaded_tensor in loaded_subtree.items():
+            current_tensor = current_state.get(name)
+            if not isinstance(current_tensor, torch.Tensor) or not isinstance(
+                loaded_tensor, torch.Tensor
+            ):
+                metadata_errors.append(f"{name}: expected tensor checkpoint entry")
+                continue
+            if current_tensor.shape != loaded_tensor.shape:
+                metadata_errors.append(
+                    f"{name}: shape {tuple(loaded_tensor.shape)} != "
+                    f"{tuple(current_tensor.shape)}"
+                )
+            if current_tensor.dtype != loaded_tensor.dtype:
+                metadata_errors.append(
+                    f"{name}: dtype {loaded_tensor.dtype} != {current_tensor.dtype}"
+                )
+        if metadata_errors:
+            raise RuntimeError(
+                f"distckpt model subtree {key!r} metadata mismatch: {metadata_errors}"
+            )
+        assignments.append((chunk, key, loaded_subtree, expected_keys))
+
+    # Commit only after every chunk passes the read-only preflight. Shared/tied
+    # module aliases are intentionally absent from ``named_parameters`` and thus
+    # from the sharded template, so strict=False is required; missing checkpoint
+    # keys and unexpected loaded keys were already rejected above.
+    for chunk, key, loaded_subtree, expected_keys in assignments:
+        incompatible = _wrapped_module(chunk).load_state_dict(
+            loaded_subtree, strict=False
+        )
+        missing_required = sorted(set(incompatible.missing_keys) & expected_keys)
+        if missing_required or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"distckpt model subtree {key!r} application mismatch: "
+                f"missing_required={missing_required}, "
+                f"unexpected={sorted(incompatible.unexpected_keys)}"
+            )
 
 
 def _chunk_parallel_state(chunk: nn.Module) -> ParallelState | None:

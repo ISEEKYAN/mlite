@@ -26,8 +26,6 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import Replicate, Shard
-
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
@@ -43,6 +41,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
+from torch.distributed.tensor import Replicate, Shard
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -98,11 +97,45 @@ def _has(reader: SafeTensorReader, name: str) -> bool:
 def _dequant_fp8_weight(
     reader: SafeTensorReader, name: str, weight: torch.Tensor
 ) -> torch.Tensor:
-    scale_name = f"{name}_scale_inv"
-    if weight.dim() != 2 or weight.element_size() != 1 or not _has(reader, scale_name):
+    float8_dtypes = {
+        dtype
+        for dtype in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        )
+        if dtype is not None
+    }
+    if weight.dtype not in float8_dtypes:
         return weight
-    scale = reader.get_tensor(scale_name).float()
+    if weight.dim() != 2:
+        raise ValueError(
+            f"FP8 weight {name} must be 2-D, got shape={tuple(weight.shape)}."
+        )
+
+    scale_name = f"{name}_scale_inv"
+    if not _has(reader, scale_name):
+        raise KeyError(
+            f"FP8 weight {name} is missing required block scale {scale_name}."
+        )
+    raw_scale = reader.get_tensor(scale_name)
     rows, cols = weight.shape
+    expected_scale_shape = ((rows + 127) // 128, (cols + 127) // 128)
+    if raw_scale.dtype != torch.float32:
+        raise ValueError(
+            f"FP8 scale {scale_name} must be float32, got {raw_scale.dtype}."
+        )
+    if tuple(raw_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"FP8 scale {scale_name} has shape={tuple(raw_scale.shape)}, "
+            f"expected={expected_scale_shape} for weight shape={tuple(weight.shape)}."
+        )
+    scale = raw_scale.float()
+    if not torch.isfinite(scale).all():
+        raise ValueError(f"FP8 scale {scale_name} contains non-finite values.")
+    if not torch.all(scale > 0):
+        raise ValueError(f"FP8 scale {scale_name} must be strictly positive.")
     expanded = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     expanded = expanded[:rows, :cols]
     return weight.float() * expanded
@@ -245,8 +278,7 @@ def _load_dense_mlp(
     ps: ParallelState,
 ) -> None:
     out[f"{local_prefix}.mlp.gate_up.linear.layer_norm_weight"] = _get(
-        reader,
-        f"{hf_layer_prefix}.post_attention_layernorm.weight",
+        reader, f"{hf_layer_prefix}.post_attention_layernorm.weight"
     )
     gate_up = torch.cat(
         [
@@ -256,15 +288,10 @@ def _load_dense_mlp(
         dim=0,
     )
     out[f"{local_prefix}.mlp.gate_up.linear.weight"] = _split_gate_up(
-        gate_up,
-        ps.tp_rank,
-        ps.tp_size,
+        gate_up, ps.tp_rank, ps.tp_size
     )
     out[f"{local_prefix}.mlp.down.linear.weight"] = _tp(
-        _get(reader, f"{hf_mlp_prefix}.down_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
-        dim=1,
+        _get(reader, f"{hf_mlp_prefix}.down_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
 
 
@@ -288,15 +315,10 @@ def _load_shared_expert(
         dim=0,
     )
     out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _split_gate_up(
-        gate_up,
-        ps.tp_rank,
-        ps.tp_size,
+        gate_up, ps.tp_rank, ps.tp_size
     )
     out[f"{local_prefix}.moe.shared_expert.down.linear.weight"] = _tp(
-        _get(reader, f"{shared}.down_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
-        dim=1,
+        _get(reader, f"{shared}.down_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
 
 
@@ -336,10 +358,7 @@ def _copy_loaded_state(
     participating_group: dist.ProcessGroup | None = None,
 ) -> None:
     copy_hf_state_atomically(
-        model,
-        loaded,
-        context="GLM-5 HF load",
-        participating_group=participating_group,
+        model, loaded, context="GLM-5 HF load", participating_group=participating_group
     )
 
 
@@ -399,8 +418,7 @@ class Glm5WeightSpec:
             if native_name.endswith(".final_layernorm.weight"):
                 return [(f"{hp}.shared_head.norm.weight", tensor)]
             proxy = native_name.replace(
-                f"mtp.layers.{mtp_idx}.transformer_layer",
-                f"layers.{hf_layer_idx}",
+                f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_layer_idx}"
             )
             return self.native_to_hf(proxy, tensor)
         if native_name == "embed.embedding.weight":
@@ -535,10 +553,7 @@ def _materialize_hf_weights(
         )
     if getattr(base_model, "mtp_embed", None) is not None:
         out["mtp_embed.embedding.weight"] = _load_vocab(
-            reader,
-            f"{prefix}.embed_tokens.weight",
-            config,
-            ps,
+            reader, f"{prefix}.embed_tokens.weight", config, ps
         )
     if getattr(base_model, "norm", None) is not None:
         out["norm.weight"] = _get(reader, f"{prefix}.norm.weight")
@@ -600,9 +615,7 @@ def _materialize_hf_weights(
             out[f"{lp}.enorm.weight"] = _get(reader, f"{hp}.enorm.weight")
             out[f"{lp}.hnorm.weight"] = _get(reader, f"{hp}.hnorm.weight")
             out[f"{lp}.eh_proj.linear.weight"] = _tp(
-                _get(reader, f"{hp}.eh_proj.weight"),
-                ps.tp_rank,
-                ps.tp_size,
+                _get(reader, f"{hp}.eh_proj.weight"), ps.tp_rank, ps.tp_size
             )
             shared_head_norm = f"{hp}.shared_head.norm.weight"
             final_norm = (
@@ -667,8 +680,9 @@ def load_hf_weights(
     path: str,
     config: Glm5Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    participating_group = dist.group.WORLD if dist.is_initialized() else None
     load_hf_model_chunks_atomically(
         model,
         lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
@@ -721,9 +735,7 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
 def save_hf_weights(
     model, path: str, config: Glm5Config, ps: ParallelState, **kwargs
 ) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        save_hf_weight_pairs_distributed,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weight_pairs_distributed
 
     save_hf_weight_pairs_distributed(
         export_hf_weights(model, config, ps, rank0_only=True, **kwargs), path

@@ -130,25 +130,70 @@ def test_glm5_config_ignores_null_hf_optional_fields():
     assert cfg.mlp_layer_types is None
 
 
-def test_glm52_config_fields_append_without_shifting_legacy_positional_slots():
-    from dataclasses import fields
+def test_glm52_config_preserves_public_positional_signature():
+    import inspect
 
     from megatron.lite.model.glm5.config import Glm5Config
 
-    names = [field.name for field in fields(Glm5Config)]
-    legacy_tail = names.index("mlp_layer_types")
-    assert names[legacy_tail + 1 :] == [
+    legacy_names = [
+        "num_hidden_layers",
+        "hidden_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "vocab_size",
+        "max_position_embeddings",
+        "rms_norm_eps",
+        "attention_dropout",
+        "initializer_range",
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_head_dim",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "index_head_dim",
+        "index_n_heads",
+        "index_topk",
+        "indexer_layer_norm_eps",
+        "indexer_rope_interleave",
+        "indexer_rope_first",
+        "indexer_use_hadamard",
+        "dsa_indexer_loss_coeff",
+        "dsa_indexer_use_sparse_loss",
+        "calculate_per_token_loss",
+        "rope_interleave",
+        "rope_theta",
+        "latent_rms_norm_eps",
+        "intermediate_size",
+        "moe_intermediate_size",
+        "first_k_dense_replace",
+        "n_routed_experts",
+        "n_shared_experts",
+        "num_experts_per_tok",
+        "n_group",
+        "topk_group",
+        "routed_scaling_factor",
+        "norm_topk_prob",
+        "num_nextn_predict_layers",
+        "mtp_loss_scaling_factor",
+        "mtp_use_repeated_layer",
+        "mlp_layer_types",
+    ]
+    parameter_names = list(inspect.signature(Glm5Config).parameters)
+    assert parameter_names[: len(legacy_names)] == legacy_names
+    assert parameter_names[len(legacy_names) :] == [
         "index_topk_freq",
         "index_skip_topk_offset",
         "index_topk_pattern",
         "indexer_types",
+        "index_share_for_mtp_iteration",
         "dsa_rope_layout_revision",
     ]
 
 
 def test_glm52_config_uses_explicit_indexer_types_as_canonical_schedule():
     import pytest
-
     from megatron.lite.model.glm5.config import Glm5Config
 
     indexer_types = _glm52_indexer_types()
@@ -274,8 +319,7 @@ def test_glm5_rope_revision_is_inferred_before_schedule_overrides():
     assert glm52_all_full.uses_configured_dsa_rope_layout is True
 
     glm51_with_local_all_full = Glm5Config._from_hf_dict(
-        _tiny_config_kwargs(),
-        indexer_types=["full", "full"],
+        _tiny_config_kwargs(), indexer_types=["full", "full"]
     )
     assert glm51_with_local_all_full.uses_dsa_index_share is False
     assert glm51_with_local_all_full.uses_configured_dsa_rope_layout is False
@@ -294,10 +338,7 @@ def test_glm51_gate_off_preserves_legacy_rope_layout(
 
     monkeypatch.setattr(dsa, "RMSNorm", nn.RMSNorm)
 
-    published_rope_fields = {
-        "rope_interleave": True,
-        "indexer_rope_interleave": True,
-    }
+    published_rope_fields = {"rope_interleave": True, "indexer_rope_interleave": True}
     legacy_cfg = Glm5Config(**_tiny_config_kwargs(), **published_rope_fields)
     glm52_cfg = Glm5Config(
         **_tiny_config_kwargs(),
@@ -305,9 +346,7 @@ def test_glm51_gate_off_preserves_legacy_rope_layout(
         indexer_types=["full", "shared"],
     )
     glm52_all_full_cfg = Glm5Config(
-        **_tiny_config_kwargs(),
-        **published_rope_fields,
-        indexer_types=["full", "full"],
+        **_tiny_config_kwargs(), **published_rope_fields, indexer_types=["full", "full"]
     )
 
     assert legacy_cfg.has_dsa_index_share_schedule is False
@@ -373,11 +412,7 @@ def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
 
     x = torch.zeros(6, 1, 8)
     reset_positions = torch.tensor([[0, 1, 2, 0, 1, 2]], dtype=torch.long)
-    out = attention(
-        x,
-        packed_seq_params=object(),
-        position_ids=reset_positions,
-    )
+    out = attention(x, packed_seq_params=object(), position_ids=reset_positions)
 
     assert out.shape == x.shape
     assert torch.equal(capture.calls[0]["position_ids"], reset_positions)
@@ -447,16 +482,14 @@ def test_glm5_dsa_attention_generates_global_zigzag_positions_for_cp(
     assert torch.equal(capture.position_ids, expected)
 
 
-def test_glm5_threads_positions_through_trunk_and_mtp(
-    transformer_engine_import_stub,
-):
+def test_glm5_threads_positions_through_trunk_and_mtp(transformer_engine_import_stub):
     from types import SimpleNamespace
 
     import torch
     import torch.nn as nn
 
     transformer_engine_import_stub()
-    from megatron.lite.model.glm5.lite.model import Glm5MTPLayer, Glm5Model
+    from megatron.lite.model.glm5.lite.model import Glm5Model, Glm5MTPLayer
     from megatron.lite.primitive.parallel import ParallelState
 
     class RecordingLayer(nn.Module):
@@ -531,17 +564,15 @@ def test_glm5_threads_positions_through_trunk_and_mtp(
         packed_seq_params=packed,
     )
     assert torch.equal(
-        rolled_input_ids,
-        torch.tensor([[4, 5, 0, 7, 8, 0]], dtype=torch.long),
+        rolled_input_ids, torch.tensor([[4, 5, 0, 7, 8, 0]], dtype=torch.long)
     )
     assert torch.equal(
-        rolled_position_ids,
-        torch.tensor([[1, 2, 0, 1, 2, 0]], dtype=torch.long),
+        rolled_position_ids, torch.tensor([[1, 2, 0, 1, 2, 0]], dtype=torch.long)
     )
     assert torch.equal(mtp.transformer_layer.position_ids, positions)
 
 
-def test_glm52_serving_mtp_share_metadata_is_ignored_and_mtp_is_always_full():
+def test_glm52_serving_mtp_share_metadata_is_preserved_but_mtp_is_always_full():
     from megatron.lite.model.glm5.config import Glm5Config
 
     cfg = Glm5Config._from_hf_dict(
@@ -561,7 +592,8 @@ def test_glm52_serving_mtp_share_metadata_is_ignored_and_mtp_is_always_full():
     assert [cfg.dsa_indexer_type(idx) for idx in (4, 5)] == ["full", "full"]
     assert [cfg.dsa_indexer_source_layer(idx) for idx in (4, 5)] == [4, 5]
     assert [cfg.builds_dsa_indexer(idx) for idx in (4, 5)] == [True, True]
-    assert "index_share_for_mtp_iteration" not in cfg.to_dict()
+    assert cfg.index_share_for_mtp_iteration is True
+    assert cfg.to_dict()["index_share_for_mtp_iteration"] is True
 
 
 def test_glm5_config_preserves_mtp_aliases_and_layer_types():
@@ -659,11 +691,10 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
 def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import pytest
     import torch
-
-    from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.modules.attention import (
         DynamicSparseAttention,
         build_rope_cache,
+        dsa,
     )
 
     if not torch.cuda.is_available():
@@ -759,11 +790,10 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
 def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import pytest
     import torch
-
-    from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.modules.attention import (
         DynamicSparseAttention,
         build_rope_cache,
+        dsa,
     )
 
     if not torch.cuda.is_available():
@@ -897,14 +927,13 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
 
 def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     import torch
-    from safetensors import safe_open
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import (
         export_hf_weights,
         save_hf_weights,
     )
     from megatron.lite.primitive.parallel import ParallelState
+    from safetensors import safe_open
 
     cfg = Glm5Config(**_tiny_config_kwargs())
     ps = ParallelState()
@@ -979,7 +1008,6 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
 
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     import torch
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import (
         export_hf_weights,
@@ -1016,9 +1044,9 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
 
 def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
     import importlib.util
+
     import pytest
     import torch
-
     from megatron.lite.model.glm5.config import Glm5Config
 
     pytest.importorskip("safetensors")
@@ -1108,6 +1136,152 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
     assert not any(".indexer." in name for name in out)
 
 
+def test_glm52_fp8_contract_matches_pinned_released_header_authority():
+    """Validate GLM-5.2's production FP8 contract without weight payloads."""
+    import hashlib
+    import json
+    import math
+
+    authority_path = Path(__file__).with_name("glm52_fp8_header_authority.json")
+    authority = json.loads(authority_path.read_text())
+    source = authority["source"]
+
+    assert source["repo"] == "zai-org/GLM-5.2-FP8"
+    assert source["revision"] == "31cba24fb749908a485082bdeed6eb1ac6cffc2f"
+    assert source["config_sha256"] == (
+        "d1539d36be7546a1d827fe9cf74c55874695652efb6a5aaa3e60cde1c76ba819"
+    )
+    assert source["index_sha256"] == (
+        "e0fe7f28c1f853d4824e4d796374e3dacf1fe470988773952c79b063768134bf"
+    )
+    assert source["tensor_count"] == 118629
+    assert source["shard_count"] == 141
+    assert source["config_values"] == {
+        "hidden_size": 6144,
+        "latent_rms_norm_eps": None,
+        "q_a_layernorm_effective_eps": 1e-6,
+        "q_lora_rank": 2048,
+        "rms_norm_eps": 1e-5,
+    }
+
+    shard = source["safetensors"]["model-00001-of-00141.safetensors"]
+    header_prefix = bytes(shard["header_prefix"])
+    assert len(header_prefix) == 8
+    assert int.from_bytes(header_prefix, byteorder="little") == shard["header_bytes"]
+    assert shard["header_bytes"] == 21840
+    assert shard["header_range"] == [8, 21847]
+    assert (
+        shard["header_range"][1] - shard["header_range"][0] + 1 == shard["header_bytes"]
+    )
+    assert shard["header_sha256"] == (
+        "b438c86e0ba40b96525672d31da75756307c723a3a73efc5ea40bd5893411613"
+    )
+
+    tensors = authority["tensors"]
+    canonical = json.dumps(
+        tensors, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    contract_sha256 = hashlib.sha256(canonical).hexdigest()
+    assert authority["canonical_tensor_contract_sha256"] == (
+        "5fbeff826bdf608cb6596de4987d6926df613076ed32ff69803007270183f294"
+    )
+    assert contract_sha256 == authority["canonical_tensor_contract_sha256"]
+
+    weight_name = "model.layers.0.self_attn.q_a_proj.weight"
+    scale_name = f"{weight_name}_scale_inv"
+    norm_name = "model.layers.0.self_attn.q_a_layernorm.weight"
+    assert set(tensors) == {weight_name, scale_name, norm_name}
+
+    weight = tensors[weight_name]
+    scale = tensors[scale_name]
+    norm = tensors[norm_name]
+    assert weight["dtype"] == "F8_E4M3"
+    assert weight["shape"] == [2048, 6144]
+    assert scale["dtype"] == "F32"
+    assert norm == {
+        "data_offsets": [3807130368, 3807134464],
+        "dtype": "BF16",
+        "shape": [2048],
+    }
+
+    quantization = authority["quantization_config"]
+    assert quantization == {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    block_rows, block_cols = quantization["weight_block_size"]
+    rows, cols = weight["shape"]
+    expected_scale_shape = [
+        (rows + block_rows - 1) // block_rows,
+        (cols + block_cols - 1) // block_cols,
+    ]
+    assert scale["shape"] == expected_scale_shape == [16, 48]
+
+    dtype_bytes = {"F8_E4M3": 1, "F32": 4, "BF16": 2}
+    payload_ranges = shard["payload_ranges"]
+    assert payload_ranges.keys() == tensors.keys()
+    data_start = 8 + shard["header_bytes"]
+    for name, tensor in tensors.items():
+        start, end = tensor["data_offsets"]
+        assert end > start >= 0
+        assert end - start == math.prod(tensor["shape"]) * dtype_bytes[tensor["dtype"]]
+        # Safetensors offsets are relative to the data section after the
+        # 8-byte length prefix and JSON header.
+        assert data_start + end <= shard["file_bytes"]
+        assert payload_ranges[name]["file_range"] == [
+            data_start + start,
+            data_start + end - 1,
+        ]
+        assert len(payload_ranges[name]["sha256"]) == 64
+
+
+def test_glm52_fp8_dequant_requires_exact_released_block_scale_contract():
+    import pytest
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch float8_e4m3fn is required for the FP8 checkpoint contract")
+
+    from megatron.lite.model.glm5.lite.checkpoint import _dequant_fp8_weight
+
+    weight = torch.ones((129, 130), dtype=torch.float32).to(torch.float8_e4m3fn)
+
+    class Reader:
+        index = {"w_scale_inv": "fake.safetensors"}
+
+        def __init__(self, scale):
+            self.scale = scale
+
+        def get_tensor(self, name):
+            assert name == "w_scale_inv"
+            return self.scale
+
+    scale = torch.tensor([[0.5, 1.0], [1.5, 2.0]], dtype=torch.float32)
+    actual = _dequant_fp8_weight(Reader(scale), "w", weight)
+    expected_scale = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    expected = weight.float() * expected_scale[:129, :130]
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    class MissingScaleReader:
+        index = {}
+
+    with pytest.raises(KeyError, match="missing required block scale"):
+        _dequant_fp8_weight(MissingScaleReader(), "w", weight)
+    with pytest.raises(ValueError, match=r"expected=\(2, 2\)"):
+        _dequant_fp8_weight(Reader(torch.ones(1, 2)), "w", weight)
+    with pytest.raises(ValueError, match="must be float32"):
+        _dequant_fp8_weight(Reader(torch.ones(2, 2, dtype=torch.bfloat16)), "w", weight)
+    with pytest.raises(ValueError, match="non-finite"):
+        _dequant_fp8_weight(Reader(torch.full((2, 2), float("nan"))), "w", weight)
+    with pytest.raises(ValueError, match="strictly positive"):
+        _dequant_fp8_weight(Reader(torch.zeros(2, 2)), "w", weight)
+
+    int8_weight = torch.ones((2, 2), dtype=torch.int8)
+    assert _dequant_fp8_weight(MissingScaleReader(), "int8", int8_weight) is int8_weight
+
+
 def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp_path):
     import pytest
     import torch
@@ -1168,7 +1342,6 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
 
 def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.model import Glm5SigmoidTopKRouter
 
@@ -1190,7 +1363,6 @@ def test_glm5_router_modules_use_current_names_and_bias_buffers():
 
 def test_glm5_protocol_allows_cp_only_parallel_scope():
     import pytest
-
     from megatron.lite.model.glm5.lite.protocol import _validate_parallel_scope
     from megatron.lite.runtime.contracts import ParallelConfig
 
@@ -1213,10 +1385,7 @@ def test_glm52_protocol_rejects_attention_replay_before_parallel_init(
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite import protocol
 
-    cfg = Glm5Config(
-        **_tiny_config_kwargs(),
-        indexer_types=["full", "shared"],
-    )
+    cfg = Glm5Config(**_tiny_config_kwargs(), indexer_types=["full", "shared"])
 
     def unexpected_parallel_init(*args, **kwargs):
         raise AssertionError(
@@ -1264,7 +1433,6 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
 def test_glm5_lite_tiny_forward_backward(monkeypatch):
     import pytest
     import torch
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.modules.attention import dsa
 

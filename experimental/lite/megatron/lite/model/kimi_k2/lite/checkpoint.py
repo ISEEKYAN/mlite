@@ -6,8 +6,6 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import Replicate, Shard
-
 from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
@@ -23,6 +21,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
+from torch.distributed.tensor import Replicate, Shard
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -186,40 +185,25 @@ def _load_attention(
     ps: ParallelState,
 ) -> None:
     out[f"{local_prefix}.self_attention.linear_q_down_proj.weight"] = _get(
-        reader,
-        f"{hf_prefix}.q_a_proj.weight",
+        reader, f"{hf_prefix}.q_a_proj.weight"
     )
     out[f"{local_prefix}.self_attention.linear_q_up_proj.linear.layer_norm_weight"] = (
-        _get(
-            reader,
-            f"{hf_prefix}.q_a_layernorm.weight",
-        )
+        _get(reader, f"{hf_prefix}.q_a_layernorm.weight")
     )
     out[f"{local_prefix}.self_attention.linear_q_up_proj.linear.weight"] = _tp(
-        _get(reader, f"{hf_prefix}.q_b_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
+        _get(reader, f"{hf_prefix}.q_b_proj.weight"), ps.tp_rank, ps.tp_size
     )
     out[f"{local_prefix}.self_attention.linear_kv_down_proj.weight"] = _get(
-        reader,
-        f"{hf_prefix}.kv_a_proj_with_mqa.weight",
+        reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight"
     )
     out[f"{local_prefix}.self_attention.linear_kv_up_proj.linear.layer_norm_weight"] = (
-        _get(
-            reader,
-            f"{hf_prefix}.kv_a_layernorm.weight",
-        )
+        _get(reader, f"{hf_prefix}.kv_a_layernorm.weight")
     )
     out[f"{local_prefix}.self_attention.linear_kv_up_proj.linear.weight"] = _tp(
-        _get(reader, f"{hf_prefix}.kv_b_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
+        _get(reader, f"{hf_prefix}.kv_b_proj.weight"), ps.tp_rank, ps.tp_size
     )
     out[f"{local_prefix}.self_attention.linear_proj.linear.weight"] = _tp(
-        _get(reader, f"{hf_prefix}.o_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
-        dim=1,
+        _get(reader, f"{hf_prefix}.o_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
 
 
@@ -233,8 +217,7 @@ def _load_dense_mlp(
     ps: ParallelState,
 ) -> None:
     out[f"{local_prefix}.mlp.gate_up.linear.layer_norm_weight"] = _get(
-        reader,
-        f"{hf_layer_prefix}.post_attention_layernorm.weight",
+        reader, f"{hf_layer_prefix}.post_attention_layernorm.weight"
     )
     gate_up = torch.cat(
         [
@@ -244,15 +227,10 @@ def _load_dense_mlp(
         dim=0,
     )
     out[f"{local_prefix}.mlp.gate_up.linear.weight"] = _split_gate_up(
-        gate_up,
-        ps.tp_rank,
-        ps.tp_size,
+        gate_up, ps.tp_rank, ps.tp_size
     )
     out[f"{local_prefix}.mlp.down.linear.weight"] = _tp(
-        _get(reader, f"{hf_mlp_prefix}.down_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
-        dim=1,
+        _get(reader, f"{hf_mlp_prefix}.down_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
 
 
@@ -276,15 +254,10 @@ def _load_shared_expert(
         dim=0,
     )
     out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _split_gate_up(
-        gate_up,
-        ps.tp_rank,
-        ps.tp_size,
+        gate_up, ps.tp_rank, ps.tp_size
     )
     out[f"{local_prefix}.moe.shared_expert.down.linear.weight"] = _tp(
-        _get(reader, f"{shared}.down_proj.weight"),
-        ps.tp_rank,
-        ps.tp_size,
-        dim=1,
+        _get(reader, f"{shared}.down_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
 
 
@@ -369,8 +342,7 @@ class KimiK2WeightSpec:
             if native_name.endswith(".final_layernorm.weight"):
                 return [(f"{hp}.shared_head.norm.weight", tensor)]
             proxy = native_name.replace(
-                f"mtp.layers.{mtp_idx}.transformer_layer",
-                f"layers.{hf_layer_idx}",
+                f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_layer_idx}"
             )
             return self.native_to_hf(proxy, tensor)
         if native_name == "embed.embedding.weight":
@@ -514,10 +486,7 @@ def _materialize_hf_weights(
         )
     if getattr(base_model, "mtp_embed", None) is not None:
         out["mtp_embed.embedding.weight"] = _load_vocab(
-            reader,
-            f"{prefix}.embed_tokens.weight",
-            config,
-            ps,
+            reader, f"{prefix}.embed_tokens.weight", config, ps
         )
     if getattr(base_model, "norm", None) is not None:
         out["norm.weight"] = _get(reader, f"{prefix}.norm.weight")
@@ -533,11 +502,7 @@ def _materialize_hf_weights(
             reader, f"{hp}.input_layernorm.weight"
         )
         _load_attention(
-            out,
-            local_prefix=lp,
-            hf_prefix=f"{hp}.self_attn",
-            reader=reader,
-            ps=ps,
+            out, local_prefix=lp, hf_prefix=f"{hp}.self_attn", reader=reader, ps=ps
         )
         if config.is_moe_layer(global_idx):
             out[f"{lp}.mlp_norm.weight"] = _get(
@@ -578,9 +543,7 @@ def _materialize_hf_weights(
             out[f"{lp}.enorm.weight"] = _get(reader, f"{hp}.enorm.weight")
             out[f"{lp}.hnorm.weight"] = _get(reader, f"{hp}.hnorm.weight")
             out[f"{lp}.eh_proj.linear.weight"] = _tp(
-                _get(reader, f"{hp}.eh_proj.weight"),
-                ps.tp_rank,
-                ps.tp_size,
+                _get(reader, f"{hp}.eh_proj.weight"), ps.tp_rank, ps.tp_size
             )
             shared_head_norm = f"{hp}.shared_head.norm.weight"
             final_norm = (
@@ -593,11 +556,7 @@ def _materialize_hf_weights(
                 reader, f"{hp}.input_layernorm.weight"
             )
             _load_attention(
-                out,
-                local_prefix=tlp,
-                hf_prefix=f"{hp}.self_attn",
-                reader=reader,
-                ps=ps,
+                out, local_prefix=tlp, hf_prefix=f"{hp}.self_attn", reader=reader, ps=ps
             )
             if config.is_moe_layer(global_idx):
                 out[f"{tlp}.mlp_norm.weight"] = _get(
@@ -644,8 +603,9 @@ def load_hf_weights(
     path: str,
     config: KimiK2Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    participating_group = dist.group.WORLD if dist.is_initialized() else None
     load_hf_model_chunks_atomically(
         model,
         lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
@@ -697,9 +657,7 @@ def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
 
 
 def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        save_hf_weight_pairs_distributed,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weight_pairs_distributed
 
     save_hf_weight_pairs_distributed(
         export_hf_weights(model, config, ps, rank0_only=True), path

@@ -224,8 +224,10 @@ COMMAND=(
   verl.trainer.sft_trainer
   "${COMMON_ARGS[@]}"
   "${BACKEND_ARGS[@]}"
-  "${EXTRA_ARGS[@]}"
 )
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+  COMMAND+=("${EXTRA_ARGS[@]}")
+fi
 
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"
 printf '\n' >> "${CMD_FILE}"

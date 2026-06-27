@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
@@ -62,6 +63,7 @@ __all__ = [
     "build_model_config",
     "export_hf_weights",
     "load_hf_weights",
+    "load_hf_weights_many",
     "vocab_size",
 ]
 
@@ -323,12 +325,32 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
 
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
+    chunk: nn.Module | list[nn.Module],
+    hf_path: str,
+    model_cfg: Qwen3MoEConfig,
+    ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
     """Load HF pretrained weights into model chunk."""
     if not hf_path:
         return
-    _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+    _load_hf_weights_impl(
+        chunk, hf_path, model_cfg, ps, participating_group=participating_group
+    )
+
+
+def load_hf_weights_many(
+    chunks: list[nn.Module],
+    hf_path: str,
+    model_cfg: Qwen3MoEConfig,
+    ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
+) -> None:
+    load_hf_weights(
+        chunks, hf_path, model_cfg, ps, participating_group=participating_group
+    )
 
 
 def export_hf_weights(

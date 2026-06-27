@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.model.protocol_utils import (
@@ -261,13 +262,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         ]
     else:
         chunks = [
-            Glm5Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            Glm5Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)
@@ -347,18 +342,27 @@ def load_hf_weights(
     hf_path: str,
     model_cfg: Glm5Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
     if not hf_path:
         return
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights as load_impl
 
-    load_impl(chunk, hf_path, model_cfg, ps)
+    load_impl(chunk, hf_path, model_cfg, ps, participating_group=participating_group)
 
 
 def load_hf_weights_many(
-    chunks: list[nn.Module], hf_path: str, model_cfg: Glm5Config, ps: ParallelState
+    chunks: list[nn.Module],
+    hf_path: str,
+    model_cfg: Glm5Config,
+    ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    load_hf_weights(chunks, hf_path, model_cfg, ps)
+    load_hf_weights(
+        chunks, hf_path, model_cfg, ps, participating_group=participating_group
+    )
 
 
 def export_hf_weights(chunks, model_cfg: Glm5Config, ps: ParallelState, **kwargs):

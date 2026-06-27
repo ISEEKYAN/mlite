@@ -24,7 +24,6 @@ import re
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
@@ -376,8 +375,9 @@ def load_hf_weights(
     path: str,
     config: DeepseekV4Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    participating_group = dist.group.WORLD if dist.is_initialized() else None
     loaded_count = load_hf_model_chunks_atomically(
         model,
         lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
@@ -554,9 +554,7 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
 def save_hf_weights(
     model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs
 ) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        save_hf_weight_pairs_distributed,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weight_pairs_distributed
 
     save_hf_weight_pairs_distributed(
         export_hf_weights(model, config, ps, rank0_only=True, **kwargs), path

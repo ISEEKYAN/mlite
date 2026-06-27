@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
@@ -143,10 +144,7 @@ def _make_aux_loss_hook():
     return hook
 
 
-_FP32_CHECKPOINT_SUFFIXES = (
-    ".linear_attn.A_log",
-    ".linear_attn.norm.weight",
-)
+_FP32_CHECKPOINT_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
 
 
 def _restore_checkpoint_parameter_dtypes(chunks: list[nn.Module]) -> None:
@@ -350,16 +348,27 @@ def load_hf_weights(
     hf_path: str,
     model_cfg: Qwen35Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
     if not hf_path:
         return
-    _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+    _load_hf_weights_impl(
+        chunk, hf_path, model_cfg, ps, participating_group=participating_group
+    )
 
 
 def load_hf_weights_many(
-    chunks: list[nn.Module], hf_path: str, model_cfg: Qwen35Config, ps: ParallelState
+    chunks: list[nn.Module],
+    hf_path: str,
+    model_cfg: Qwen35Config,
+    ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    load_hf_weights(chunks, hf_path, model_cfg, ps)
+    load_hf_weights(
+        chunks, hf_path, model_cfg, ps, participating_group=participating_group
+    )
 
 
 def export_hf_weights(

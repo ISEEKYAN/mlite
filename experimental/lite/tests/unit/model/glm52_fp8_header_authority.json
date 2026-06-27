@@ -1,0 +1,106 @@
+{
+  "canonical_tensor_contract_sha256": "5fbeff826bdf608cb6596de4987d6926df613076ed32ff69803007270183f294",
+  "quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "source": {
+    "config_sha256": "d1539d36be7546a1d827fe9cf74c55874695652efb6a5aaa3e60cde1c76ba819",
+    "config_values": {
+      "hidden_size": 6144,
+      "latent_rms_norm_eps": null,
+      "q_a_layernorm_effective_eps": 1e-06,
+      "q_lora_rank": 2048,
+      "rms_norm_eps": 1e-05
+    },
+    "index_sha256": "e0fe7f28c1f853d4824e4d796374e3dacf1fe470988773952c79b063768134bf",
+    "repo": "zai-org/GLM-5.2-FP8",
+    "revision": "31cba24fb749908a485082bdeed6eb1ac6cffc2f",
+    "safetensors": {
+      "model-00001-of-00141.safetensors": {
+        "etag": "dd4d4ca6ff348add79ad2b803c19dce384edb7a7ff72355c30ddb2b8ebcf363a",
+        "file_bytes": 5363940952,
+        "header_bytes": 21840,
+        "header_prefix": [
+          80,
+          85,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "header_range": [
+          8,
+          21847
+        ],
+        "header_sha256": "b438c86e0ba40b96525672d31da75756307c723a3a73efc5ea40bd5893411613",
+        "payload_ranges": {
+          "model.layers.0.self_attn.q_a_layernorm.weight": {
+            "file_range": [
+              3807152216,
+              3807156311
+            ],
+            "sha256": "ccf89a76bc299fd2c5cf8186cc5203a5a1b9e2ea852675372902898f92c6c7f5"
+          },
+          "model.layers.0.self_attn.q_a_proj.weight": {
+            "file_range": [
+              4162141784,
+              4174724695
+            ],
+            "sha256": "235b20da9f5e0351a234cf154a125e648d7a4e397da706fb4ce08d105e2b2198"
+          },
+          "model.layers.0.self_attn.q_a_proj.weight_scale_inv": {
+            "file_range": [
+              108504,
+              111575
+            ],
+            "sha256": "eb1eadbe663c88e51cdd1d276fc41991bb4b25bd21d3fce15af777abacd7eb6d"
+          }
+        }
+      }
+    },
+    "shard_count": 141,
+    "tensor_count": 118629
+  },
+  "tensors": {
+    "model.layers.0.self_attn.q_a_layernorm.weight": {
+      "data_offsets": [
+        3807130368,
+        3807134464
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2048
+      ]
+    },
+    "model.layers.0.self_attn.q_a_proj.weight": {
+      "data_offsets": [
+        4162119936,
+        4174702848
+      ],
+      "dtype": "F8_E4M3",
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    "model.layers.0.self_attn.q_a_proj.weight_scale_inv": {
+      "data_offsets": [
+        86656,
+        89728
+      ],
+      "dtype": "F32",
+      "shape": [
+        16,
+        48
+      ]
+    }
+  }
+}

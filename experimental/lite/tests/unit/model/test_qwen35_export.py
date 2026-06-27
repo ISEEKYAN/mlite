@@ -1,13 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import hashlib
+import json
 import math
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
     PLACEMENT_FN,
@@ -23,9 +25,12 @@ from megatron.lite.model.registry import (
     resolve_runtime_model_name,
 )
 
-
 _QWEN35_VISION_EXACT_REQUIRED_ENV = "MLITE_REQUIRE_QWEN35_VISION_EXACT"
 _QWEN35_VISION_EXACT_PASS_MARKER = "QWEN35_VISION_EXACT_PASS"
+_QWEN35_MTP_AUTHORITY_REVISION = "59d61f3ce65a6d9863b86d2e96597125219dc754"
+_QWEN35_MTP_SCHEMA_SHA256 = (
+    "54a42a904540f171d00a8296f2cd457dcdf4b167290f8a4455ee58c3dcb36871"
+)
 
 
 def _transformers_5_12_for_vision_exact():
@@ -120,9 +125,7 @@ class _TinyQwen35MTPModule(nn.Module):
         layer.eh_proj = nn.Module()
         layer.eh_proj.linear = nn.Module()
         parameter(
-            layer.eh_proj.linear,
-            "weight",
-            (config.hidden_size, 2 * config.hidden_size),
+            layer.eh_proj.linear, "weight", (config.hidden_size, 2 * config.hidden_size)
         )
 
         transformer = nn.Module()
@@ -131,18 +134,14 @@ class _TinyQwen35MTPModule(nn.Module):
         transformer.full_attn.qkv = nn.Module()
         transformer.full_attn.qkv.linear = nn.Module()
         parameter(
-            transformer.full_attn.qkv.linear,
-            "layer_norm_weight",
-            (config.hidden_size,),
+            transformer.full_attn.qkv.linear, "layer_norm_weight", (config.hidden_size,)
         )
         q_heads_per_group = config.num_attention_heads // config.num_key_value_heads
         qkv_rows = (
             (2 * q_heads_per_group + 2) * config.head_dim * config.num_key_value_heads
         )
         parameter(
-            transformer.full_attn.qkv.linear,
-            "weight",
-            (qkv_rows, config.hidden_size),
+            transformer.full_attn.qkv.linear, "weight", (qkv_rows, config.hidden_size)
         )
         transformer.full_attn.q_norm = nn.Module()
         parameter(transformer.full_attn.q_norm, "weight", (config.head_dim,))
@@ -153,10 +152,7 @@ class _TinyQwen35MTPModule(nn.Module):
         parameter(
             transformer.full_attn.proj.linear,
             "weight",
-            (
-                config.hidden_size,
-                config.num_attention_heads * config.head_dim,
-            ),
+            (config.hidden_size, config.num_attention_heads * config.head_dim),
         )
 
         transformer.mlp_norm = nn.Module()
@@ -186,9 +182,7 @@ class _TinyQwen35MTPModule(nn.Module):
         )
         transformer.moe.shared_expert.shared_gate = nn.Module()
         parameter(
-            transformer.moe.shared_expert.shared_gate,
-            "weight",
-            (1, config.hidden_size),
+            transformer.moe.shared_expert.shared_gate, "weight", (1, config.hidden_size)
         )
 
         transformer.moe.experts = nn.Module()
@@ -217,10 +211,9 @@ def test_qwen35_protocol_registers_vllm_export_entrypoint() -> None:
 
 def test_qwen35_official_vision_checkpoint_load_export_exact(tmp_path) -> None:
     transformers = _transformers_5_12_for_vision_exact()
+    from megatron.lite.model.qwen3_5.lite import checkpoint
     from safetensors.torch import save_file
     from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
-
-    from megatron.lite.model.qwen3_5.lite import checkpoint
 
     vision_cfg = Qwen3_5VisionConfig(
         depth=1,
@@ -423,10 +416,73 @@ def test_qwen35_mtp_hf_schema_exact_and_load_export_roundtrip(monkeypatch) -> No
         )
 
 
-def test_qwen35_mtp_fc_tp2_load_export_shape_roundtrip(monkeypatch) -> None:
-    from torch.distributed.tensor import Replicate, Shard
+def test_qwen35_mtp_schema_matches_pinned_released_header_authority() -> None:
+    """Match production mapping against immutable Hub safetensors headers.
 
+    The compact fixture is an exact expansion of the MTP entries in the two
+    released shards that contain them.  Its canonical digest is pinned here so
+    the authority cannot drift together with test-generated expectations.
+    Meta tensors exercise the real weight mapper at 35B dimensions without
+    allocating the roughly 1.6 GiB predictor payload.
+    """
+    authority_path = Path(__file__).with_name("qwen35_mtp_header_authority.json")
+    authority = json.loads(authority_path.read_text())
+    assert authority["source"]["repo"] == "Qwen/Qwen3.5-35B-A3B"
+    assert authority["source"]["revision"] == _QWEN35_MTP_AUTHORITY_REVISION
+    assert authority["canonical_mtp_schema_sha256"] == _QWEN35_MTP_SCHEMA_SHA256
+
+    dtype = authority["dtype"]
+    expected = {
+        name: {"dtype": dtype, "shape": shape}
+        for name, shape in authority["non_expert_shapes"].items()
+    }
+    for template, shape in authority["expert_templates"].items():
+        for expert_idx in range(authority["num_experts"]):
+            expected[template.format(expert_idx=expert_idx)] = {
+                "dtype": dtype,
+                "shape": shape,
+            }
+    canonical = json.dumps(
+        expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    assert len(expected) == 785
+    assert hashlib.sha256(canonical).hexdigest() == _QWEN35_MTP_SCHEMA_SHA256
+
+    cfg = _tiny_config()
+    cfg.hidden_size = 2048
+    cfg.num_attention_heads = 16
+    cfg.num_key_value_heads = 2
+    cfg.head_dim = 256
+    cfg.num_experts = authority["num_experts"]
+    cfg.moe_intermediate_size = 512
+    cfg.shared_expert_intermediate_size = 512
+    cfg.num_nextn_predict_layers = 1
+    cfg.mtp_layer_types = ["full_attention"]
+    with torch.device("meta"):
+        source = _TinyQwen35MTPModule(cfg).to(dtype=torch.bfloat16)
+
+    spec = Qwen35WeightSpec(cfg)
+    actual: dict[str, dict[str, str | list[int]]] = {}
+    for native_name, tensor in source.named_parameters():
+        for hf_name, hf_tensor in spec.native_to_hf(native_name, tensor):
+            assert hf_name not in actual, f"duplicate mapped MTP key: {hf_name}"
+            assert hf_tensor.dtype == torch.bfloat16
+            actual[hf_name] = {"dtype": "BF16", "shape": list(hf_tensor.shape)}
+
+    assert len(actual) == 785
+    assert actual == expected
+    assert not spec._expert_export_buffers
+    print(
+        "NON_SKIP_QWEN35_PINNED_MTP_HEADER_AUTHORITY_PASSED "
+        f"revision={_QWEN35_MTP_AUTHORITY_REVISION} mtp_keys={len(actual)} "
+        f"dtype={dtype} schema_sha256={_QWEN35_MTP_SCHEMA_SHA256}",
+        flush=True,
+    )
+
+
+def test_qwen35_mtp_fc_tp2_load_export_shape_roundtrip(monkeypatch) -> None:
     from megatron.lite.primitive.ckpt import hf_weights
+    from torch.distributed.tensor import Replicate, Shard
 
     cfg = _tiny_config()
     cfg.num_nextn_predict_layers = 1

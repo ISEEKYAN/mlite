@@ -19,6 +19,7 @@ _HF_FIELDS = frozenset(
         "hidden_size",
         "index_head_dim",
         "index_n_heads",
+        "index_share_for_mtp_iteration",
         "index_skip_topk_offset",
         "index_topk",
         "index_topk_freq",
@@ -61,10 +62,10 @@ _HF_FIELDS = frozenset(
 )
 _SERIALIZED_INTERNAL_FIELDS = frozenset({"dsa_rope_layout_revision"})
 
-# ``index_share_for_mtp_iteration`` is intentionally absent.  It is a serving
-# proposer control (draft step 0 computes; later draft steps reuse), not a
-# backbone architecture field.  MLite does not own that speculative iteration
-# loop, so claiming support here would silently turn metadata into a no-op.
+# ``index_share_for_mtp_iteration`` is preserved as opaque HF/serving metadata
+# for config API and serialization compatibility.  It is not a backbone
+# schedule input: MLite's appended training-time MTP layers always build their
+# own indexers because MLite does not own the speculative serving iteration.
 
 
 _INDEXER_TYPES = frozenset({"full", "shared"})
@@ -76,7 +77,9 @@ _INDEXER_PATTERN_TYPES = {
 }
 
 
-def _infer_dsa_indexer_type(layer_number: int, *, topk_freq: int, skip_topk_offset: int) -> str:
+def _infer_dsa_indexer_type(
+    layer_number: int, *, topk_freq: int, skip_topk_offset: int
+) -> str:
     if topk_freq <= 1:
         return "full"
     skip_topk = (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
@@ -149,11 +152,12 @@ class Glm5Config:
     mlp_layer_types: list[str] | None = None
 
     # GLM-5.2 extension fields stay at the end so positional construction of
-    # every pre-existing Glm5Config field keeps its historical slot.
+    # every field in the pre-PR public config keeps its historical slot.
     index_topk_freq: int = 1
     index_skip_topk_offset: int = 0
     index_topk_pattern: str | list[str] | None = None
     indexer_types: list[str] | None = None
+    index_share_for_mtp_iteration: bool = False
     # Internal compatibility revision. ``None`` infers configured RoPE only
     # for configs carrying GLM-5.2 IndexShare schedule metadata. Persisting the
     # resolved value prevents a later all-full override from silently changing
@@ -291,10 +295,7 @@ class Glm5Config:
             "index_head_dim must be >= qk_rope_head_dim",
         )
         check(self.index_topk_freq >= 1, "index_topk_freq must be >= 1")
-        check(
-            self.index_skip_topk_offset >= 0,
-            "index_skip_topk_offset must be >= 0",
-        )
+        check(self.index_skip_topk_offset >= 0, "index_skip_topk_offset must be >= 0")
         check(
             self.dsa_rope_layout_revision in {"legacy", "configured"},
             "dsa_rope_layout_revision must be 'legacy' or 'configured'",
@@ -305,13 +306,17 @@ class Glm5Config:
             "initial GLM5 native path expects MLA heads to be ungrouped",
         )
         check(self.vocab_size > 0, "vocab_size must be > 0")
-        check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
+        check(
+            self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0"
+        )
         check(self.n_routed_experts >= 1, "n_routed_experts must be >= 1")
         check(
             1 <= self.num_experts_per_tok <= self.n_routed_experts,
             "num_experts_per_tok must be in [1, n_routed_experts]",
         )
-        check(1 <= self.topk_group <= self.n_group, "topk_group must be in [1, n_group]")
+        check(
+            1 <= self.topk_group <= self.n_group, "topk_group must be in [1, n_group]"
+        )
         if self.mlp_layer_types is not None:
             expected_layer_type_lengths = {
                 self.num_hidden_layers,
@@ -420,10 +425,15 @@ class Glm5Config:
             kwargs["dsa_rope_layout_revision"] = (
                 "configured" if source_has_index_share_schedule else "legacy"
             )
-        if "num_nextn_predict_layers" not in kwargs and hf.get("num_nextn_predict") is not None:
+        if (
+            "num_nextn_predict_layers" not in kwargs
+            and hf.get("num_nextn_predict") is not None
+        ):
             kwargs["num_nextn_predict_layers"] = int(hf["num_nextn_predict"])
         rope_parameters = hf.get("rope_parameters")
         if isinstance(rope_parameters, dict) and "rope_theta" not in kwargs:
-            kwargs["rope_theta"] = float(rope_parameters.get("rope_theta", cls.rope_theta))
+            kwargs["rope_theta"] = float(
+                rope_parameters.get("rope_theta", cls.rope_theta)
+            )
         kwargs.update(overrides)
         return cls(**kwargs)

@@ -2,7 +2,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
 
@@ -31,7 +30,9 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
+    *,
+    engine_config: MegatronLiteEngineConfig,
+    optimizer_config: SimpleNamespace | None = None
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
@@ -130,6 +131,7 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
         weight_decay_incr_style="constant",
         lr_wsd_decay_steps=None,
         lr_wsd_decay_style="exponential",
+        use_checkpoint_opt_param_scheduler=False,
     )
 
     scheduler = _build_lr_scheduler(optimizer, opt)

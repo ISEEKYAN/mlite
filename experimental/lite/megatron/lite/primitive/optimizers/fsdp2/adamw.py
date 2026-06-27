@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -28,7 +29,9 @@ def local_grad_sq_sum(
             total = torch.zeros((), device=grad.device, dtype=dtype)
         total += grad.detach().to(dtype).pow(2).sum()
     if total is None:
-        return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
+        return torch.zeros(
+            (), device=default_device or torch.device("cpu"), dtype=dtype
+        )
     return total
 
 
@@ -60,7 +63,9 @@ def is_dtensor_like(tensor: Any) -> bool:
     )
 
 
-def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor) -> None:
+def copy_local_tensor_to_param_(
+    param: nn.Parameter, local_tensor: torch.Tensor
+) -> None:
     if not is_dtensor_like(param):
         param.detach().copy_(local_tensor.to(device=param.device, dtype=param.dtype))
         return
@@ -70,7 +75,9 @@ def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor)
     # local * mesh, e.g. a (3,) param over 8 ranks -> 0 or 8), so copy local->local
     # (master is init'd from this same local shard, so shapes match).
     local_param = to_local_tensor(param)
-    local_param.copy_(local_tensor.to(device=local_param.device, dtype=local_param.dtype))
+    local_param.copy_(
+        local_tensor.to(device=local_param.device, dtype=local_param.dtype)
+    )
 
 
 def all_reduce_grad_(grad: torch.Tensor, *, group: dist.ProcessGroup) -> None:
@@ -108,9 +115,13 @@ class ChainedOptimizer:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         optimizer_states = state_dict.get("optimizers")
-        if not isinstance(optimizer_states, list) or len(optimizer_states) != len(self.optimizers):
+        if not isinstance(optimizer_states, list) or len(optimizer_states) != len(
+            self.optimizers
+        ):
             raise ValueError("Invalid chained torch optimizer state_dict.")
-        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states, strict=True):
+        for optimizer, optimizer_state in zip(
+            self.optimizers, optimizer_states, strict=True
+        ):
             optimizer.load_state_dict(optimizer_state)
 
 
@@ -128,7 +139,9 @@ class FP32AdamW:
         cpu_update: bool = False,
         model_param_dtypes: dict[int, torch.dtype] | None = None,
     ):
-        self.param_groups = normalize_param_groups(params, default_weight_decay=weight_decay)
+        self.param_groups = normalize_param_groups(
+            params, default_weight_decay=weight_decay
+        )
         self.params: list[nn.Parameter] = []
         self.lr = lr
         self.weight_decay = weight_decay
@@ -215,7 +228,9 @@ class FP32AdamW:
                 exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
                 denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
-                master.addcdiv_(exp_avg.to(dtype=torch.float32), denom, value=-group_step_size)
+                master.addcdiv_(
+                    exp_avg.to(dtype=torch.float32), denom, value=-group_step_size
+                )
                 self._copy_master_to_param(param, master)
 
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
@@ -236,53 +251,283 @@ class FP32AdamW:
     def state_dict(self) -> dict[str, Any]:
         return {
             "type": "fp32_adamw",
+            "version": 2,
             "step_count": self.step_count,
-            "master_params": [self.state[param]["master_param"] for param in self.params],
+            "config": {
+                "lr": self.lr,
+                "weight_decay": self.weight_decay,
+                "betas": self.betas,
+                "eps": self.eps,
+                "cpu_update": self.cpu_update,
+            },
+            "master_params": [
+                self.state[param]["master_param"] for param in self.params
+            ],
             "exp_avgs": [self.state[param]["exp_avg"] for param in self.params],
             "exp_avg_sqs": [self.state[param]["exp_avg_sq"] for param in self.params],
             "steps": [int(self.state[param]["step"]) for param in self.params],
-            "weight_decays": [
-                float(group.get("weight_decay", self.weight_decay))
+            "param_groups": [
+                {
+                    "param_count": len(group["params"]),
+                    "options": {
+                        key: value for key, value in group.items() if key != "params"
+                    },
+                }
                 for group in self.param_groups
-                for _param in group["params"]
             ],
         }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if state_dict.get("type") != "fp32_adamw":
-            raise ValueError("Invalid FP32 AdamW state_dict.")
-        self.step_count = int(state_dict.get("step_count", 0))
+    @staticmethod
+    def _validate_option_value(name: str, value: Any, reference: Any) -> None:
+        if isinstance(reference, torch.Tensor):
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"FP32 AdamW option {name} must be a tensor.")
+            if value.shape != reference.shape or value.dtype != reference.dtype:
+                raise ValueError(
+                    f"FP32 AdamW option {name} shape/dtype mismatch: "
+                    f"checkpoint={tuple(value.shape)}/{value.dtype}, "
+                    f"runtime={tuple(reference.shape)}/{reference.dtype}."
+                )
+            if value.is_floating_point() and not torch.isfinite(value).all():
+                raise ValueError(f"FP32 AdamW option {name} must be finite.")
+            return
+        if isinstance(reference, bool):
+            if not isinstance(value, bool):
+                raise TypeError(f"FP32 AdamW option {name} must be bool.")
+            return
+        if isinstance(reference, (int, float)) and not isinstance(reference, bool):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"FP32 AdamW option {name} must be numeric.")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"FP32 AdamW option {name} must be finite.")
+            if (
+                name
+                in {
+                    "lr",
+                    "initial_lr",
+                    "weight_decay",
+                    "eps",
+                    "wd_mult",
+                    "lr_mult",
+                    "max_lr",
+                    "min_lr",
+                    "start_wd",
+                    "end_wd",
+                }
+                and value < 0
+            ):
+                raise ValueError(f"FP32 AdamW option {name} must be non-negative.")
+            return
+        if isinstance(reference, tuple):
+            if not isinstance(value, tuple) or len(value) != len(reference):
+                raise TypeError(f"FP32 AdamW option {name} must be a matching tuple.")
+            for index, (item, expected) in enumerate(
+                zip(value, reference, strict=True)
+            ):
+                FP32AdamW._validate_option_value(f"{name}[{index}]", item, expected)
+            return
+        if value is not None and reference is None:
+            raise TypeError(f"FP32 AdamW option {name} must remain None.")
+        if reference is not None and not isinstance(value, type(reference)):
+            raise TypeError(
+                f"FP32 AdamW option {name} must have type {type(reference).__name__}."
+            )
+
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        expected_keys = {
+            "type",
+            "version",
+            "step_count",
+            "config",
+            "master_params",
+            "exp_avgs",
+            "exp_avg_sqs",
+            "steps",
+            "param_groups",
+        }
+        if not isinstance(state_dict, dict) or set(state_dict) != expected_keys:
+            raise ValueError("Invalid FP32 AdamW v2 state_dict schema.")
+        if state_dict["type"] != "fp32_adamw" or state_dict["version"] != 2:
+            raise ValueError("Unsupported FP32 AdamW state_dict format.")
+        step_count = state_dict["step_count"]
+        if (
+            isinstance(step_count, bool)
+            or not isinstance(step_count, int)
+            or step_count < 0
+        ):
+            raise ValueError("Invalid FP32 AdamW step_count.")
+        config = state_dict["config"]
+        runtime_config = {
+            "lr": self.lr,
+            "weight_decay": self.weight_decay,
+            "betas": self.betas,
+            "eps": self.eps,
+            "cpu_update": self.cpu_update,
+        }
+        if not isinstance(config, dict) or set(config) != set(runtime_config):
+            raise ValueError("Invalid FP32 AdamW config schema.")
+        for name, reference in runtime_config.items():
+            self._validate_option_value(name, config[name], reference)
+        beta1, beta2 = config["betas"]
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0):
+            raise ValueError("FP32 AdamW betas must lie in [0, 1).")
+        if config["cpu_update"] != self.cpu_update:
+            raise ValueError(
+                "FP32 AdamW cpu_update cannot change across checkpoint resume."
+            )
+
         for target_name, key in (
             ("master_params", "master_param"),
             ("exp_avgs", "exp_avg"),
             ("exp_avg_sqs", "exp_avg_sq"),
         ):
-            loaded = state_dict.get(target_name)
+            loaded = state_dict[target_name]
             if not isinstance(loaded, list) or len(loaded) != len(self.params):
                 raise ValueError(f"Invalid FP32 AdamW {target_name} state.")
-            for param, src in zip(self.params, loaded, strict=True):
-                self.state[param][key].copy_(src)
-        loaded_steps = state_dict.get("steps")
-        if loaded_steps is not None:
-            if not isinstance(loaded_steps, list) or len(loaded_steps) != len(self.params):
-                raise ValueError("Invalid FP32 AdamW steps state.")
-            for param, step in zip(self.params, loaded_steps, strict=True):
-                self.state[param]["step"] = int(step)
-        else:
-            for param in self.params:
-                self.state[param]["step"] = self.step_count
-        loaded_weight_decays = state_dict.get("weight_decays")
-        if loaded_weight_decays is not None:
-            if not isinstance(loaded_weight_decays, list) or len(loaded_weight_decays) != len(
-                self.params
+            for index, (param, src) in enumerate(zip(self.params, loaded, strict=True)):
+                target = self.state[param][key]
+                if not isinstance(src, torch.Tensor):
+                    raise TypeError(
+                        f"FP32 AdamW {target_name}[{index}] must be a tensor."
+                    )
+                if src.shape != target.shape or src.dtype != target.dtype:
+                    raise ValueError(
+                        f"FP32 AdamW {target_name}[{index}] shape/dtype mismatch."
+                    )
+        loaded_steps = state_dict["steps"]
+        if (
+            not isinstance(loaded_steps, list)
+            or len(loaded_steps) != len(self.params)
+            or any(
+                isinstance(step, bool) or not isinstance(step, int) or step < 0
+                for step in loaded_steps
+            )
+        ):
+            raise ValueError("Invalid FP32 AdamW steps state.")
+        if any(step > step_count for step in loaded_steps):
+            raise ValueError("FP32 AdamW parameter step exceeds global step_count.")
+
+        saved_groups = state_dict["param_groups"]
+        if not isinstance(saved_groups, list) or len(saved_groups) != len(
+            self.param_groups
+        ):
+            raise ValueError("Invalid FP32 AdamW param-group count.")
+        for index, (saved_group, runtime_group) in enumerate(
+            zip(saved_groups, self.param_groups, strict=True)
+        ):
+            if not isinstance(saved_group, dict) or set(saved_group) != {
+                "param_count",
+                "options",
+            }:
+                raise ValueError(f"Invalid FP32 AdamW param_groups[{index}] schema.")
+            if saved_group["param_count"] != len(runtime_group["params"]):
+                raise ValueError(
+                    f"FP32 AdamW param_groups[{index}] cardinality mismatch."
+                )
+            options = saved_group["options"]
+            runtime_options = {
+                key: value for key, value in runtime_group.items() if key != "params"
+            }
+            if not isinstance(options, dict) or set(options) != set(runtime_options):
+                raise ValueError(
+                    f"FP32 AdamW param_groups[{index}] option schema mismatch."
+                )
+            for name, reference in runtime_options.items():
+                self._validate_option_value(name, options[name], reference)
+            if options.get("max_lr", self.lr) < options.get("min_lr", 0.0):
+                raise ValueError(
+                    f"FP32 AdamW param_groups[{index}] max_lr must be >= min_lr."
+                )
+            if options.get("end_wd", self.weight_decay) < options.get(
+                "start_wd", self.weight_decay
             ):
-                raise ValueError("Invalid FP32 AdamW weight_decay state.")
-            idx = 0
-            for group in self.param_groups:
-                if not group["params"]:
-                    continue
-                group["weight_decay"] = float(loaded_weight_decays[idx])
-                idx += len(group["params"])
+                raise ValueError(
+                    f"FP32 AdamW param_groups[{index}] end_wd must be >= start_wd."
+                )
+
+    def migrate_legacy_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Upgrade the one pre-v2 format using explicitly selected runtime config.
+
+        The legacy payload did not record betas/eps or complete group options, so
+        this is intentionally not part of normal exact resume. The DCP loader may
+        call it only behind its explicit legacy-checkpoint opt-in.
+        """
+
+        legacy_keys = {
+            "type",
+            "step_count",
+            "master_params",
+            "exp_avgs",
+            "exp_avg_sqs",
+            "steps",
+            "weight_decays",
+        }
+        if not isinstance(state_dict, dict) or set(state_dict) != legacy_keys:
+            raise ValueError("Invalid legacy FP32 AdamW state_dict schema.")
+        if state_dict["type"] != "fp32_adamw":
+            raise ValueError("Invalid legacy FP32 AdamW state_dict type.")
+        weight_decays = state_dict["weight_decays"]
+        if not isinstance(weight_decays, list) or len(weight_decays) != len(
+            self.params
+        ):
+            raise ValueError("Invalid legacy FP32 AdamW weight_decays state.")
+
+        migrated = self.state_dict()
+        for name in ("step_count", "master_params", "exp_avgs", "exp_avg_sqs", "steps"):
+            migrated[name] = state_dict[name]
+        offset = 0
+        for group_index, (group, migrated_group) in enumerate(
+            zip(self.param_groups, migrated["param_groups"], strict=True)
+        ):
+            count = len(group["params"])
+            group_weight_decays = weight_decays[offset : offset + count]
+            offset += count
+            if not group_weight_decays:
+                continue
+            first = group_weight_decays[0]
+            if (
+                isinstance(first, bool)
+                or not isinstance(first, (int, float))
+                or not math.isfinite(float(first))
+                or first < 0
+                or any(value != first for value in group_weight_decays[1:])
+            ):
+                raise ValueError(
+                    "Legacy FP32 AdamW weight decay is invalid or inconsistent "
+                    f"within param group {group_index}."
+                )
+            migrated_group["options"]["weight_decay"] = float(first)
+        self.validate_state_dict(migrated)
+        return migrated
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.validate_state_dict(state_dict)
+        self.step_count = state_dict["step_count"]
+        config = state_dict["config"]
+        self.lr = float(config["lr"])
+        self.weight_decay = float(config["weight_decay"])
+        self.betas = tuple(config["betas"])
+        self.eps = float(config["eps"])
+        for target_name, key in (
+            ("master_params", "master_param"),
+            ("exp_avgs", "exp_avg"),
+            ("exp_avg_sqs", "exp_avg_sq"),
+        ):
+            for param, src in zip(self.params, state_dict[target_name], strict=True):
+                self.state[param][key].copy_(src)
+        for param, step in zip(self.params, state_dict["steps"], strict=True):
+            self.state[param]["step"] = step
+        for saved_group, runtime_group in zip(
+            state_dict["param_groups"], self.param_groups, strict=True
+        ):
+            for name, value in saved_group["options"].items():
+                current = runtime_group.get(name)
+                if isinstance(current, torch.Tensor) and isinstance(
+                    value, torch.Tensor
+                ):
+                    current.copy_(value)
+                else:
+                    runtime_group[name] = value
 
 
 def build_adamw_optimizer(
@@ -323,19 +568,33 @@ def build_adamw_optimizer(
             model_param_dtypes=model_param_dtypes,
         )
     if foreach not in {True, False, "auto"}:
-        raise ValueError(f"adamw_foreach must be True, False, or 'auto', got {foreach!r}.")
+        raise ValueError(
+            f"adamw_foreach must be True, False, or 'auto', got {foreach!r}."
+        )
     if foreach is False:
         return torch.optim.AdamW(
-            param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=False
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+            foreach=False,
         )
 
     dtensor_param_groups, tensor_param_groups = split_dtensor_and_tensor_param_groups(
         param_groups, default_weight_decay=weight_decay
     )
-    split_param_groups = [group for group in (dtensor_param_groups, tensor_param_groups) if group]
+    split_param_groups = [
+        group for group in (dtensor_param_groups, tensor_param_groups) if group
+    ]
     if foreach == "auto" and not dtensor_param_groups:
         return torch.optim.AdamW(
-            param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=False
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+            foreach=False,
         )
     if len(split_param_groups) <= 1:
         return torch.optim.AdamW(
@@ -371,7 +630,9 @@ def maybe_build_te_fused_adam_optimizer(
 
     all_param_list = list(all_params)
     master_weights = get_bool_opt(
-        opt, "master_weights", default=use_fp32_master and should_use_master_weights(all_param_list)
+        opt,
+        "master_weights",
+        default=use_fp32_master and should_use_master_weights(all_param_list),
     )
     kwargs = dict(
         lr=lr,
@@ -380,15 +641,23 @@ def maybe_build_te_fused_adam_optimizer(
         eps=eps,
         adam_w_mode=True,
         master_weights=master_weights,
-        master_weight_dtype=get_dtype_opt(opt, "master_weight_dtype", default=torch.float32),
-        store_param_remainders=get_bool_opt(opt, "store_param_remainders", default=master_weights),
+        master_weight_dtype=get_dtype_opt(
+            opt, "master_weight_dtype", default=torch.float32
+        ),
+        store_param_remainders=get_bool_opt(
+            opt, "store_param_remainders", default=master_weights
+        ),
         exp_avg_dtype=get_dtype_opt(opt, "exp_avg_dtype", default=torch.float32),
         exp_avg_sq_dtype=get_dtype_opt(opt, "exp_avg_sq_dtype", default=torch.float32),
     )
-    return FusedAdam(param_groups, **filter_supported_kwargs(FusedAdam.__init__, kwargs))
+    return FusedAdam(
+        param_groups, **filter_supported_kwargs(FusedAdam.__init__, kwargs)
+    )
 
 
-def filter_supported_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+def filter_supported_kwargs(
+    fn: Callable[..., Any], kwargs: dict[str, Any]
+) -> dict[str, Any]:
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
@@ -399,7 +668,10 @@ def filter_supported_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> d
 
 
 def should_use_master_weights(params: Iterable[nn.Parameter]) -> bool:
-    return any(param.is_floating_point() and param.dtype is not torch.float32 for param in params)
+    return any(
+        param.is_floating_point() and param.dtype is not torch.float32
+        for param in params
+    )
 
 
 def get_bool_opt(opt, attr: str, *, default: bool) -> bool:
@@ -443,7 +715,9 @@ def get_opt_value(opt, attr: str):
 
 
 def normalize_param_groups(
-    params: Iterable[nn.Parameter] | Iterable[dict[str, Any]], *, default_weight_decay: float
+    params: Iterable[nn.Parameter] | Iterable[dict[str, Any]],
+    *,
+    default_weight_decay: float,
 ) -> list[dict[str, Any]]:
     items = list(params)
     if not items:

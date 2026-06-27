@@ -12,8 +12,6 @@ import re
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import Replicate, Shard
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
@@ -24,6 +22,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
+from torch.distributed.tensor import Replicate, Shard
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -949,11 +948,7 @@ def _materialize_hf_weights(
             : config.num_experts
         ]
         _load_shared_expert(
-            out,
-            local_prefix=tlp,
-            hf_mlp_prefix=f"{hp}.mlp",
-            ps=ps,
-            reader=reader,
+            out, local_prefix=tlp, hf_mlp_prefix=f"{hp}.mlp", ps=ps, reader=reader
         )
         _load_experts(
             out,
@@ -972,8 +967,9 @@ def load_hf_weights(
     path: str,
     config: Qwen35Config,
     ps: ParallelState,
+    *,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
-    participating_group = dist.group.WORLD if dist.is_initialized() else None
     load_hf_model_chunks_atomically(
         model,
         lambda chunk: _materialize_hf_weights(chunk, path, config, ps),

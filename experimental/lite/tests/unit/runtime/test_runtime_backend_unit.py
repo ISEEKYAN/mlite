@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch.nn as nn
-
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.backends.mlite.runtime import (
@@ -20,7 +19,11 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     _build_impl_cfg,
     _load_hf_chunks,
 )
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
+from megatron.lite.runtime.contracts.config import (
+    OptimizerConfig,
+    ParallelConfig,
+    RuntimeConfig,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 pytestmark = pytest.mark.mlite
@@ -48,7 +51,8 @@ def test_runtime_config_accepts_mlite_backend_cfg():
 
 def test_mlite_config_defaults_and_parallel_fields():
     cfg = MegatronLiteConfig(
-        model_name="qwen3_moe", parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2)
+        model_name="qwen3_moe",
+        parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2),
     )
 
     assert cfg.model_name == "qwen3_moe"
@@ -174,6 +178,39 @@ def test_runtime_allows_single_chunk_protocol_without_bulk_loader() -> None:
     assert calls == [(chunks[0], "/models/single", model_cfg, ps)]
 
 
+@pytest.mark.parametrize("with_bulk_loader", [False, True])
+def test_runtime_forwards_explicit_hf_load_participating_group(
+    with_bulk_loader: bool,
+) -> None:
+    calls = []
+    participating_group = object()
+
+    class Proto:
+        @staticmethod
+        def load_hf_weights(chunk, path, model_cfg, ps, *, participating_group=None):
+            calls.append(("single", participating_group))
+
+    if with_bulk_loader:
+
+        def load_many(chunks, path, model_cfg, ps, *, participating_group=None):
+            calls.append(("many", participating_group))
+
+        Proto.load_hf_weights_many = staticmethod(load_many)
+
+    chunks = [object(), object()] if with_bulk_loader else [object()]
+    _load_hf_chunks(
+        Proto,
+        chunks,
+        "/models/subgroup",
+        object(),
+        object(),
+        participating_group=participating_group,
+    )
+
+    expected_loader = "many" if with_bulk_loader else "single"
+    assert calls == [(expected_loader, participating_group)]
+
+
 def test_runtime_rejects_nonatomic_vpp_loader_without_bulk_contract() -> None:
     class Proto:
         @staticmethod
@@ -184,6 +221,85 @@ def test_runtime_rejects_nonatomic_vpp_loader_without_bulk_contract() -> None:
         NotImplementedError, match="sequential chunk mutation is not atomic"
     ):
         _load_hf_chunks(Proto, [object(), object()], "/models/vpp", object(), object())
+
+
+def _runtime_with_escape_protocol(monkeypatch, proto) -> MegatronLiteRuntime:
+    runtime = MegatronLiteRuntime(
+        "/models/escape",
+        MegatronLiteConfig(model_name="qwen3", hf_path="/models/escape"),
+    )
+    monkeypatch.setattr(runtime, "_load_protocol", lambda _cfg: proto)
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.dist.get_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.torch.cuda.device_count",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.torch.cuda.set_device",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.torch.cuda.manual_seed",
+        lambda _seed: None,
+    )
+    return runtime
+
+
+def test_runtime_escape_hatch_preserves_legacy_build_model_abi(monkeypatch) -> None:
+    expected = object()
+    calls = []
+
+    class NestedRuntime:
+        def build_model(self):
+            calls.append("build")
+            return expected
+
+    nested_runtime = NestedRuntime()
+
+    class Proto:
+        @staticmethod
+        def create_runtime(hf_path, cfg):
+            calls.append((hf_path, cfg))
+            return nested_runtime
+
+    runtime = _runtime_with_escape_protocol(monkeypatch, Proto)
+
+    result = runtime.build_model()
+
+    assert result is expected
+    assert calls == [("/models/escape", runtime._cfg), "build"]
+
+
+def test_runtime_escape_hatch_forwards_explicit_participating_group(
+    monkeypatch,
+) -> None:
+    expected = object()
+    participating_group = object()
+    calls = []
+
+    class NestedRuntime:
+        def build_model(self, *, participating_group):
+            calls.append(participating_group)
+            return expected
+
+    nested_runtime = NestedRuntime()
+
+    class Proto:
+        @staticmethod
+        def create_runtime(_hf_path, _cfg):
+            return nested_runtime
+
+    runtime = _runtime_with_escape_protocol(monkeypatch, Proto)
+
+    result = runtime.build_model(participating_group=participating_group)
+
+    assert result is expected
+    assert calls == [participating_group]
 
 
 @pytest.mark.parametrize(
@@ -227,7 +343,9 @@ class HookedOptimizer:
 
 def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     optimizer = HookedOptimizer()
-    handle = ModelHandle(model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []})
+    handle = ModelHandle(
+        model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []}
+    )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     runtime.to(handle, "cpu", model=False, optimizer=True, grad=False)
@@ -342,7 +460,10 @@ def test_megatron_ddp_detection_accepts_ddp_and_subclasses(monkeypatch):
 
 @pytest.mark.parametrize("model_cls", [_FakeMegatronDDP, _FakeMegatronDDPSubclass])
 def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls):
-    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+    from megatron.lite.runtime.megatron_utils import (
+        load_model_to_gpu,
+        offload_model_to_cpu,
+    )
 
     _install_fake_megatron_ddp(monkeypatch)
     model = model_cls()
@@ -369,7 +490,10 @@ def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls)
 
 
 def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
-    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+    from megatron.lite.runtime.megatron_utils import (
+        load_model_to_gpu,
+        offload_model_to_cpu,
+    )
 
     monkeypatch.setitem(sys.modules, "megatron.core", None)
     monkeypatch.setitem(sys.modules, "megatron.core.distributed", None)
@@ -405,7 +529,9 @@ def test_model_handle_dp_from_parallel_state():
 def test_model_handle_cp_range_and_config_properties():
     cfg = {"tp": 8, "ep": 4}
     default_handle = ModelHandle(model=MagicMock())
-    configured_handle = ModelHandle(model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)})
+    configured_handle = ModelHandle(
+        model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)}
+    )
 
     assert default_handle.cp_range == (1, 1)
     assert configured_handle.cp_range == (1, 8)
@@ -419,7 +545,9 @@ def test_runtime_dispatch_creates_mlite_backend():
 
         runtime = create_runtime(
             RuntimeConfig(
-                backend="mlite", hf_path="/models/test", backend_cfg={"model_name": "qwen3"}
+                backend="mlite",
+                hf_path="/models/test",
+                backend_cfg={"model_name": "qwen3"},
             )
         )
 
@@ -448,7 +576,9 @@ def _run_verl_sft_dry_run(script: Path, tmp_path: Path, **env_overrides: str) ->
         "ETP_SIZE": "1",
         **env_overrides,
     }
-    completed = subprocess.run([str(script)], env=env, text=True, capture_output=True, check=True)
+    completed = subprocess.run(
+        [str(script)], env=env, text=True, capture_output=True, check=True
+    )
     return completed.stdout
 
 
@@ -472,7 +602,9 @@ def test_verl_sft_script_maps_offload_env_to_backend_args(tmp_path):
     assert "engine.param_offload=True" in command
     assert "engine.optimizer_offload=True" in command
     assert "+optim.override_optimizer_config.offload_fraction=0.75" in command
-    assert "+optim.override_optimizer_config.use_precision_aware_optimizer=True" in command
+    assert (
+        "+optim.override_optimizer_config.use_precision_aware_optimizer=True" in command
+    )
 
 
 def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp_path):

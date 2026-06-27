@@ -17,18 +17,34 @@ for root in (REPO_ROOT, LITE_ROOT, VERL_EXAMPLE_ROOT):
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "mlite: mark a test as Megatron Lite validation coverage")
+    config.addinivalue_line(
+        "markers", "mlite: mark a test as Megatron Lite validation coverage"
+    )
     config.addinivalue_line(
         "markers",
         "smoke: mark a Megatron Lite smoke test; skipped unless --mlite-smoke or MLITE_RUN_SMOKE=1 is set",
     )
     config.addinivalue_line("markers", "gpu: mark a test as requiring CUDA")
-    config.addinivalue_line("markers", "distributed: mark a test as requiring torch.distributed")
+    config.addinivalue_line(
+        "markers", "distributed: mark a test as requiring torch.distributed"
+    )
 
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--mlite-smoke", action="store_true", default=False, help="run Megatron Lite smoke tests"
+        "--mlite-smoke",
+        action="store_true",
+        default=False,
+        help="run Megatron Lite smoke tests",
+    )
+    parser.addoption(
+        "--mlite-fail-on-skip",
+        action="store_true",
+        default=False,
+        help=(
+            "fail the test session if any selected test is skipped or xfailed; "
+            "intended for release-acceptance invocations"
+        ),
     )
 
 
@@ -36,10 +52,35 @@ def pytest_collection_modifyitems(config, items):
     run_smoke = config.getoption("--mlite-smoke") or os.getenv("MLITE_RUN_SMOKE") == "1"
     if run_smoke:
         return
-    skip_smoke = pytest.mark.skip(reason="set --mlite-smoke or MLITE_RUN_SMOKE=1 to run")
+    skip_smoke = pytest.mark.skip(
+        reason="set --mlite-smoke or MLITE_RUN_SMOKE=1 to run"
+    )
     for item in items:
         if "smoke" in item.keywords:
             item.add_marker(skip_smoke)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    if not session.config.getoption("--mlite-fail-on-skip"):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    nonexecuted = [
+        *reporter.stats.get("skipped", ()),
+        *reporter.stats.get("xfailed", ()),
+    ]
+    if not nonexecuted:
+        return
+    nodeids = sorted({report.nodeid for report in nonexecuted})
+    reporter.write_sep(
+        "=",
+        "MLite acceptance rejected skipped/xfailed selected tests: "
+        + ", ".join(nodeids),
+        red=True,
+    )
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture
@@ -58,7 +99,9 @@ def transformer_engine_import_stub(monkeypatch):
 
         class _UnavailableTE:
             def __init__(self, *args, **kwargs):
-                raise RuntimeError("Transformer Engine is not installed in this test environment.")
+                raise RuntimeError(
+                    "Transformer Engine is not installed in this test environment."
+                )
 
         root = types.ModuleType("transformer_engine")
         root.__version__ = "0.0.0"
@@ -93,12 +136,16 @@ def transformer_engine_import_stub(monkeypatch):
         root.pytorch = pytorch
         monkeypatch.setitem(sys.modules, "transformer_engine", root)
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
-        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.permutation", permutation)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.permutation", permutation
+        )
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.router", router)
         monkeypatch.setitem(
             sys.modules, "transformer_engine.pytorch.cpp_extensions", cpp_extensions
         )
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module", module)
-        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.base", module_base)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.module.base", module_base
+        )
 
     return install

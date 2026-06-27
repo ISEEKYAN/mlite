@@ -20,8 +20,6 @@ from typing import Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from safetensors import safe_open
-from safetensors.torch import save_file as _safe_save
 
 try:
     from torch.distributed.tensor import DTensor
@@ -104,6 +102,23 @@ class HFWeights(Protocol):
 # ======================================================================
 
 
+def _require_safetensors_io():
+    """Import the optional file-I/O dependency only at an actual I/O boundary.
+
+    Model/config inspection and pure name/shape conversion are useful in CPU
+    build and lint environments that do not install checkpoint codecs.  Real HF
+    reads and writes still fail closed with an actionable dependency error.
+    """
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+    except (ImportError, OSError) as exc:
+        raise ImportError(
+            "Hugging Face checkpoint I/O requires the optional 'safetensors' package."
+        ) from exc
+    return safe_open, save_file
+
+
 class SafeTensorReader:
     """Read individual tensors from an HF safetensors directory."""
 
@@ -123,6 +138,7 @@ class SafeTensorReader:
             filepath = self.path / self.index[name]
         else:
             filepath = self.path / "model.safetensors"
+        safe_open, _save_file = _require_safetensors_io()
         with safe_open(str(filepath), framework="pt", device="cpu") as f:
             return f.get_tensor(name)
 
@@ -163,7 +179,8 @@ def save_safetensors(
     tensors: dict[str, torch.Tensor], path: str, filename: str = "model.safetensors"
 ) -> None:
     os.makedirs(path, exist_ok=True)
-    _safe_save(tensors, os.path.join(path, filename))
+    _safe_open, save_file = _require_safetensors_io()
+    save_file(tensors, os.path.join(path, filename))
 
 
 def _distributed_raise_if_error(
@@ -297,9 +314,7 @@ def _copy_tensor_for_hf_load(target: torch.Tensor, source: torch.Tensor) -> None
 
 
 def _distributed_any_error(
-    local_error: str | None,
-    *,
-    participating_group: dist.ProcessGroup | None,
+    local_error: str | None, *, participating_group: dist.ProcessGroup | None
 ) -> bool:
     if not dist.is_initialized():
         return local_error is not None
@@ -396,9 +411,7 @@ def copy_hf_states_atomically(
         for chunk_idx, (model, loaded) in enumerate(model_states):
             try:
                 chunk_prepared = _prepare_hf_state_copy(
-                    model,
-                    loaded,
-                    allow_missing_parameter=allow_missing_parameter,
+                    model, loaded, allow_missing_parameter=allow_missing_parameter
                 )
             except Exception as exc:
                 raise RuntimeError(f"chunk{chunk_idx}: {exc}") from exc
@@ -511,9 +524,7 @@ def load_hf_model_chunks_atomically(
     )
 
 
-def materialize_hf_weights_distributed(
-    weights,
-) -> dict[str, torch.Tensor]:
+def materialize_hf_weights_distributed(weights) -> dict[str, torch.Tensor]:
     """Materialize an export generator with duplicate and WORLD-safe error handling."""
     items: list[tuple[str, torch.Tensor]] = []
     local_error = None
@@ -785,20 +796,36 @@ def gather_gate_up(
 
 
 def load_hf_weights(
-    model: nn.Module,
+    model: nn.Module | list[nn.Module],
     hf_path: str,
     spec: HFWeights,
     ps,
     *,
     vocab_size: int | None = None,
+    participating_group: dist.ProcessGroup | None = None,
 ) -> None:
     """Load HF safetensors into a Megatron Lite model using HFWeights.
 
     Handles PP layer filtering, TP split, EP shard assignment.
     ``ps`` is a ParallelState (lazy import to avoid GPU dep at module level).
+    Materialization and the final copy are one distributed transaction scoped
+    to ``participating_group``; ``None`` retains the historical WORLD scope.
     """
+    load_hf_model_chunks_atomically(
+        model,
+        lambda chunk: _materialize_generic_hf_weights(
+            chunk, hf_path, spec, ps, vocab_size=vocab_size
+        ),
+        context=f"{type(spec).__name__} HF load",
+        participating_group=participating_group,
+    )
+
+
+def _materialize_generic_hf_weights(
+    model: nn.Module, hf_path: str, spec: HFWeights, ps, *, vocab_size: int | None
+) -> dict[str, torch.Tensor]:
+    """Build a complete native state without mutating the target model."""
     from megatron.lite.primitive.parallel import pad_vocab_for_tp
-    from megatron.lite.primitive.utils import log_rank0
 
     base_model = unwrap_model(model)
     reader = SafeTensorReader(hf_path)
@@ -865,20 +892,12 @@ def load_hf_weights(
         actual = _resolve_param_name(mapped, state)
         if actual:
             loaded[actual] = tensor.to(dtype=torch.bfloat16)
-
-    for name, param in base_model.named_parameters():
-        if name in loaded:
-            source = loaded[name]
-            if param.shape != source.shape:
-                raise ValueError(
-                    f"HF load shape mismatch for {name}: "
-                    f"checkpoint={tuple(source.shape)}, model={tuple(param.shape)}"
-                )
-            param.data.copy_(source)
-        elif "lora" in name.lower() or "adapter" in name.lower():
-            continue
-        else:
-            log_rank0(f"WARNING: {name} not loaded from checkpoint")
+        elif re.search(r"(?:^|\.)layers\.\d+\.", mapped):
+            raise KeyError(
+                f"WeightSpec maps local layer tensor {mapped!r}, but the target "
+                "model has no matching parameter"
+            )
+    return loaded
 
 
 def _load_expert_weight(
