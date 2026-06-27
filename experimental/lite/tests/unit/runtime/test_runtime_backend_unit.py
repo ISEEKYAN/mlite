@@ -18,6 +18,7 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
     _apply_attention_backend_env,
     _build_impl_cfg,
+    _load_hf_chunks,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -133,6 +134,56 @@ def test_build_impl_cfg_preserves_explicit_impl_hf_path():
     impl_cfg = _build_impl_cfg(proto, cfg)
 
     assert impl_cfg.hf_path == "/models/impl"
+
+
+def test_runtime_prefers_atomic_bulk_hf_loader_for_vpp_chunks() -> None:
+    calls = []
+
+    class Proto:
+        @staticmethod
+        def load_hf_weights_many(chunks, path, model_cfg, ps):
+            calls.append(("many", chunks, path, model_cfg, ps))
+
+        @staticmethod
+        def load_hf_weights(*_args):
+            raise AssertionError(
+                "sequential loader must not run when bulk loader exists"
+            )
+
+    chunks = [object(), object()]
+    model_cfg = object()
+    ps = object()
+    _load_hf_chunks(Proto, chunks, "/models/vpp", model_cfg, ps)
+
+    assert calls == [("many", chunks, "/models/vpp", model_cfg, ps)]
+
+
+def test_runtime_allows_single_chunk_protocol_without_bulk_loader() -> None:
+    calls = []
+
+    class Proto:
+        @staticmethod
+        def load_hf_weights(chunk, path, model_cfg, ps):
+            calls.append((chunk, path, model_cfg, ps))
+
+    chunks = [object()]
+    model_cfg = object()
+    ps = object()
+    _load_hf_chunks(Proto, chunks, "/models/single", model_cfg, ps)
+
+    assert calls == [(chunks[0], "/models/single", model_cfg, ps)]
+
+
+def test_runtime_rejects_nonatomic_vpp_loader_without_bulk_contract() -> None:
+    class Proto:
+        @staticmethod
+        def load_hf_weights(*_args):
+            raise AssertionError("must fail before mutating the first VPP chunk")
+
+    with pytest.raises(
+        NotImplementedError, match="sequential chunk mutation is not atomic"
+    ):
+        _load_hf_chunks(Proto, [object(), object()], "/models/vpp", object(), object())
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,10 @@ from megatron.lite.primitive.ckpt.distckpt import (
     attach_model_sharded_state_dict,
 )
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.primitive.protocols import (
+    default_expert_classifier,
+    default_placement_fn,
+)
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
@@ -103,7 +106,9 @@ DISTOPT_METADATA = {
 }
 
 
-def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) -> None:
+def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(
+    monkeypatch, tmp_path
+) -> None:
     model = torch.nn.Linear(4, 2)
     optimizer = FakeDistOpt()
     ps = ParallelState(pp_rank=1, tp_rank=2, dp_cp_rank=3)
@@ -115,7 +120,9 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
         saved["checkpoint_dir"] = checkpoint_dir
         saved["kwargs"] = kwargs
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save
+    )
 
     dcp.save_training_checkpoint(model, optimizer, 5, str(tmp_path), use_dcp=True)
 
@@ -205,14 +212,18 @@ def test_dist_opt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
     assert replica_id == (0, 0, 0)
 
 
-def test_dist_opt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> None:
+def test_dist_opt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> (
+    None
+):
     ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
     model = torch.nn.Linear(4, 2)
     attach_model_sharded_state_dict([model], ps)
 
     model_sd = _model_sharded_state_dict(model)
-    filtered_sd, _flat_mapping, _rename_mapping = _replace_state_dict_keys_with_sharded_keys(
-        model_sd, keep_only_main_replica=True
+    filtered_sd, _flat_mapping, _rename_mapping = (
+        _replace_state_dict_keys_with_sharded_keys(
+            model_sd, keep_only_main_replica=True
+        )
     )
 
     assert set(filtered_sd) == {"model_pp1.weight", "model_pp1.bias"}
@@ -243,6 +254,154 @@ def test_dist_opt_model_state_keys_are_pp_and_vpp_aware() -> None:
     assert _single_or_all_model_state(vpp_sd) is vpp_sd
 
 
+def test_dist_opt_vpp_rejects_duplicate_logical_shards() -> None:
+    ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
+    chunks = [torch.nn.Linear(2, 2, bias=False), torch.nn.Linear(2, 2, bias=False)]
+    for chunk in chunks:
+        chunk._mlite_tied_checkpoint_keys = {"weight": "embed.embedding.weight"}
+    attach_model_sharded_state_dict(chunks, ps)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^distckpt logical shard collision for "
+            r"key='model_pp0\.embed\.embedding\.weight', replica_id=\(1, 0, 0\): "
+            r"model_pp1_vpp0\.weight and model_pp1_vpp1\.weight$"
+        ),
+    ):
+        _model_sharded_state_dict(chunks)
+
+
+def test_dist_opt_vpp_mtp_embedding_replica_uses_canonical_first_stage_key() -> None:
+    class Embedding(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = torch.nn.Embedding(8, 4)
+
+    class EmbeddingOwner(torch.nn.Module):
+        def __init__(self, attr: str) -> None:
+            super().__init__()
+            setattr(self, attr, Embedding())
+
+    first_ps = ParallelState(
+        pp_size=2,
+        pp_rank=0,
+        pp_is_first=True,
+        pp_is_last=False,
+    )
+    first_chunks = [torch.nn.Linear(4, 4), EmbeddingOwner("embed")]
+    attach_model_sharded_state_dict(first_chunks, first_ps)
+    first_state = _model_sharded_state_dict(first_chunks)
+    canonical = first_state["model_pp0_vpp1"]["embed.embedding.weight"]
+
+    last_ps = ParallelState(
+        pp_size=2,
+        pp_rank=1,
+        pp_is_first=False,
+        pp_is_last=True,
+    )
+    last_chunks = [torch.nn.Linear(4, 4), EmbeddingOwner("mtp_embed")]
+    last_chunks[1]._mlite_tied_checkpoint_keys = {
+        "mtp_embed.embedding.weight": "embed.embedding.weight"
+    }
+    attach_model_sharded_state_dict(last_chunks, last_ps)
+    last_state = _model_sharded_state_dict(last_chunks)
+    replica = last_state["model_pp1_vpp1"]["mtp_embed.embedding.weight"]
+
+    assert canonical.key == replica.key == "model_pp0.embed.embedding.weight"
+    assert canonical.replica_id[0] == 0
+    assert replica.replica_id[0] == 1
+
+
+def test_dist_opt_sharded_state_excludes_nonpersistent_buffers() -> None:
+    class BufferedModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2))
+            self.register_buffer("router_bias", torch.arange(2), persistent=True)
+            self.register_buffer("workspace", torch.zeros(4), persistent=False)
+
+    model = BufferedModule()
+    attach_model_sharded_state_dict([model], ParallelState())
+
+    model_sd = _model_sharded_state_dict(model)["model"]
+
+    assert set(model_sd) == {"weight", "router_bias"}
+    assert "workspace" not in model_sd
+
+
+def test_dist_opt_save_wraps_model_preflight_failure_before_mcore(
+    monkeypatch, tmp_path
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    attach_model_sharded_state_dict([model], ParallelState())
+
+    def fail_model_state(_model):
+        raise ValueError("broken VPP metadata")
+
+    def unexpected_save(*_args, **_kwargs):
+        raise AssertionError("MCore save must not run after a preflight failure")
+
+    monkeypatch.setattr(distckpt, "_model_sharded_state_dict", fail_model_state)
+    monkeypatch.setattr(distckpt.dist_checkpointing, "save", unexpected_save)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^distckpt model state construction failed: ValueError: "
+            r"broken VPP metadata$"
+        ),
+    ):
+        distckpt.save_dist_opt_checkpoint(
+            model,
+            optimizer=None,
+            step=3,
+            checkpoint_dir=str(tmp_path),
+            save_model=True,
+            save_optimizer=False,
+        )
+
+
+def test_dist_opt_save_consensus_wraps_checkpoint_directory_failure(
+    monkeypatch, tmp_path
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    attach_model_sharded_state_dict([model], ParallelState())
+
+    def fail_makedirs(*_args, **_kwargs):
+        raise PermissionError("read-only checkpoint root")
+
+    def unexpected_model_state(*_args, **_kwargs):
+        raise AssertionError("model state construction must not run")
+
+    def unexpected_save(*_args, **_kwargs):
+        raise AssertionError("MCore save must not run")
+
+    monkeypatch.setattr(distckpt.os, "makedirs", fail_makedirs)
+    monkeypatch.setattr(distckpt, "_model_sharded_state_dict", unexpected_model_state)
+    monkeypatch.setattr(distckpt.dist_checkpointing, "save", unexpected_save)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^distckpt checkpoint directory creation failed: PermissionError: "
+            r"read-only checkpoint root$"
+        ),
+    ):
+        distckpt.save_dist_opt_checkpoint(
+            model,
+            optimizer=None,
+            step=3,
+            checkpoint_dir=str(tmp_path),
+            save_model=True,
+            save_optimizer=False,
+        )
+
+
 def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
     wrapped_module = torch.nn.Linear(4, 2)
     model = FakeWrapper(wrapped_module)
@@ -263,9 +422,13 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
             "optimizer": {"loaded": True},
         }
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load
+    )
 
-    step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
+    step = dcp.load_training_checkpoint(
+        model, optimizer, str(tmp_path / "step_5"), use_dcp=True
+    )
 
     assert step == 5
     assert not model.wrapper_load_called
@@ -274,11 +437,14 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
     assert optimizer.loaded_state == {"loaded": True}
 
 
-def test_dist_opt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> None:
+def test_dist_opt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> (
+    None
+):
     class FakeTorchOptimizer:
         def __init__(self, steps):
             self.state = {
-                object(): {"step": torch.tensor(step, dtype=torch.int64)} for step in steps
+                object(): {"step": torch.tensor(step, dtype=torch.int64)}
+                for step in steps
             }
 
     class FakeDistOpt:
@@ -316,8 +482,12 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(
         calls["load"] = (model, optimizer, path, config, ps, kwargs)
         return 7
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.save_training_checkpoint", fake_save)
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.load_training_checkpoint", fake_load)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.save_training_checkpoint", fake_save
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.load_training_checkpoint", fake_load
+    )
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     model = torch.nn.Linear(1, 1)

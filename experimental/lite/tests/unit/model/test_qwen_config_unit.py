@@ -5,10 +5,15 @@ import ast
 from pathlib import Path
 
 import pytest
+import torch
+import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.registry import resolve_model_type_from_hf, resolve_runtime_model_name
+from megatron.lite.model.registry import (
+    resolve_model_type_from_hf,
+    resolve_runtime_model_name,
+)
 
 pytestmark = pytest.mark.mlite
 
@@ -89,7 +94,99 @@ def test_qwen35_config_from_text_config_splits_mtp_layer_types():
     assert cfg.mrope_section == [1, 1, 0]
 
 
-def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_import_stub):
+def test_qwen35_protocol_rejects_noncanonical_multi_layer_mtp_before_parallel_init(
+    transformer_engine_import_stub, monkeypatch
+):
+    transformer_engine_import_stub()
+
+    from megatron.lite.model.qwen3_5.lite import protocol
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    hf = _tiny_qwen35_text_config()
+    hf["num_nextn_predict_layers"] = 2
+    hf["layer_types"] = [
+        "linear_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+    ]
+    cfg = Qwen35Config._from_hf_dict(hf)
+    assert cfg.mtp_layer_types == ["full_attention", "full_attention"]
+
+    def unexpected_init_parallel(_parallel):
+        raise AssertionError("multi-layer MTP must fail before init_parallel")
+
+    monkeypatch.setattr(protocol, "init_parallel", unexpected_init_parallel)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"released Qwen3\.5 HF MTP schema supports exactly one predictor layer",
+    ):
+        protocol.build_model(
+            cfg,
+            impl_cfg=protocol.ImplConfig(
+                parallel=ParallelConfig(),
+                optimizer=None,
+                mtp_enable=True,
+            ),
+        )
+
+
+def test_qwen35_protocol_restores_official_gdn_checkpoint_dtypes(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+
+    from megatron.lite.model.qwen3_5.lite import protocol
+
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    linear_attn = nn.Module()
+    model.layers[0].linear_attn = linear_attn
+    linear_attn.register_parameter(
+        "A_log", nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    )
+    linear_attn.register_parameter(
+        "dt_bias", nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    )
+    linear_attn.norm = nn.Module()
+    linear_attn.norm.register_parameter(
+        "weight", nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    )
+
+    protocol._restore_checkpoint_parameter_dtypes([model])
+
+    assert linear_attn.A_log.dtype == torch.float32
+    assert linear_attn.norm.weight.dtype == torch.float32
+    assert linear_attn.dt_bias.dtype == torch.bfloat16
+
+    protocol_path = LITE_ROOT / "megatron/lite/model/qwen3_5/lite/protocol.py"
+    tree = ast.parse(protocol_path.read_text())
+    build_model = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_model"
+    )
+    restore_calls = [
+        node.lineno
+        for node in ast.walk(build_model)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_restore_checkpoint_parameter_dtypes"
+    ]
+    cuda_calls = [
+        node.lineno
+        for node in ast.walk(build_model)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cuda"
+    ]
+    assert len(restore_calls) == 1
+    assert cuda_calls and restore_calls[0] > max(cuda_calls)
+
+
+def test_qwen_lite_protocols_build_configs_from_hf_dicts(
+    transformer_engine_import_stub,
+):
     transformer_engine_import_stub()
 
     from megatron.lite.model.qwen3_5.lite import protocol as qwen35_protocol
@@ -97,7 +194,8 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
 
     qwen3_cfg = qwen3_protocol.build_model_config(_tiny_qwen3_hf_dict(), vocab_size=128)
     qwen35_cfg = qwen35_protocol.build_model_config(
-        {"model_type": "qwen3_5_moe", "text_config": _tiny_qwen35_text_config()}, vocab_size=128
+        {"model_type": "qwen3_5_moe", "text_config": _tiny_qwen35_text_config()},
+        vocab_size=128,
     )
 
     assert qwen3_cfg.vocab_size == 128
@@ -127,11 +225,16 @@ def _string_list_assignment(tree: ast.Module, name: str) -> set[str]:
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+        if not any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
             continue
         if not isinstance(node.value, (ast.List, ast.Tuple)):
             return set()
-        return {item.value for item in node.value.elts if isinstance(item, ast.Constant)}
+        return {
+            item.value for item in node.value.elts if isinstance(item, ast.Constant)
+        }
     return set()
 
 

@@ -219,6 +219,55 @@ def test_grouped_pp_layout_keeps_glm52_indexshare_groups_inside_stage():
         )
 
 
+def test_grouped_pp_layout_uses_explicit_custom_indexer_schedule():
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.primitive.modules.attention.dsa import (
+        validate_dsa_index_share_pipeline_split,
+    )
+
+    cfg = Glm5Config(
+        num_hidden_layers=6,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_head_dim=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=4,
+        index_head_dim=8,
+        index_n_heads=2,
+        index_topk_freq=1,
+        indexer_types=["full", "shared", "full", "shared", "shared", "full"],
+        n_routed_experts=3,
+        num_experts_per_tok=2,
+    )
+    groups = cfg.dsa_index_share_decoder_layer_groups()
+    assert groups == [[0, 1], [2, 3, 4], [5]]
+
+    chunks = [
+        build_pipeline_chunk_layout(
+            cfg.num_hidden_layers,
+            ps,
+            num_mtp_layers=1,
+            decoder_layer_groups=groups,
+        )
+        for ps in _ranks(2)
+    ]
+    indices = [chunk.layer_indices for chunk in chunks]
+    _assert_full_contiguous_cover(indices, cfg.num_hidden_layers)
+    owner = {layer_idx: stage for stage, layers in enumerate(indices) for layer_idx in layers}
+    assert all(len({owner[layer_idx] for layer_idx in group}) == 1 for group in groups)
+    for stage_indices in indices:
+        validate_dsa_index_share_pipeline_split(
+            stage_indices,
+            topk_freq=cfg.index_topk_freq,
+            skip_topk_offset=cfg.index_skip_topk_offset,
+            indexer_types=list(cfg.resolved_dsa_indexer_types),
+        )
+
+
 def test_ungrouped_glm52_auto_layout_would_trip_indexshare_guard():
     from megatron.lite.primitive.modules.attention.dsa import (
         validate_dsa_index_share_pipeline_split,
@@ -366,6 +415,14 @@ def test_plain_thd_batch_is_split_by_protocol_context_parallel_helper():
     assert packed.input_ids.shape == (1, 16)
     assert packed.cp_size == 2
     assert packed.packed_seq_params.local_cp_size is None
+    assert torch.equal(
+        packed.packed_seq_params.cu_seqlens_q,
+        torch.tensor([0, 5, 12], dtype=torch.int32),
+    )
+    assert torch.equal(
+        packed.packed_seq_params.cu_seqlens_q_padded,
+        torch.tensor([0, 8, 16], dtype=torch.int32),
+    )
 
     local_params, local_tensors = prepare_packed_thd_for_context_parallel(
         packed.packed_seq_params,

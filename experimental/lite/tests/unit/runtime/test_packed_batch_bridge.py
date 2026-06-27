@@ -112,8 +112,10 @@ def test_bridge_forward_kwargs_are_context_parallel_correct() -> None:
         assert local["input_ids"].shape == (1, full_padded // 2)
         assert local["position_ids"].shape == (1, full_padded // 2)
         psp = local["packed_seq_params"]
-        # cu_seqlens stays full (CP-aligned), not the unpadded [0, 3, 8].
-        assert torch.equal(psp.cu_seqlens_q, ref.cu_seqlens_padded)
+        assert torch.equal(
+            psp.cu_seqlens_q, torch.tensor([0, 3, 8], dtype=torch.int32)
+        )
+        assert torch.equal(psp.cu_seqlens_q_padded, ref.cu_seqlens_padded)
         assert int(getattr(psp, "local_cp_size", 1)) == 2
 
     # The two rank-local zigzag shards reconstruct the full padded sequence.
