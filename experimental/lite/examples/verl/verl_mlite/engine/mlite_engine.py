@@ -669,8 +669,19 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
+        pp1_forward_outputs = (
+            []
+            if forward_only
+            and self.engine_config.pp == 1
+            and self.is_mp_src_rank_with_outputs()
+            else None
+        )
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, forward_only=forward_only)
+            runtime_loss_fn = self._make_runtime_loss_fn(
+                loss_function,
+                forward_only=forward_only,
+                output_lst=pp1_forward_outputs,
+            )
 
         result = self.runtime.forward_backward(
             self.handle,
@@ -683,6 +694,12 @@ class MegatronLiteEngine(BaseEngine):
             # that must be summed, not averaged again by the runtime.
             loss_fn_already_normalized=runtime_loss_fn is not None,
         )
+        if pp1_forward_outputs is not None:
+            if result.model_output.log_probs is None:
+                raise ValueError("Megatron Lite forward-only result must contain token log_probs.")
+            return postprocess_batch_func(
+                output_lst=pp1_forward_outputs, indices=indices, data=data
+            )
         metrics = dict(result.metrics)
         micro_outputs = metrics.pop("_micro_outputs", None)
         if micro_outputs is not None and self.is_mp_src_rank_with_outputs():
@@ -785,7 +802,13 @@ class MegatronLiteEngine(BaseEngine):
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
-    def _make_runtime_loss_fn(self, loss_function, *, forward_only: bool):
+    def _make_runtime_loss_fn(
+        self,
+        loss_function,
+        *,
+        forward_only: bool,
+        output_lst: list[dict[str, Any]] | None = None,
+    ):
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -814,6 +837,14 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
+            if output_lst is not None:
+                output_lst.append(
+                    {
+                        "model_output": model_output,
+                        "loss": float(loss.detach().item()),
+                        "metrics": metrics,
+                    }
+                )
             return loss, metrics
 
         return _loss_fn
