@@ -9,8 +9,11 @@ from torch import nn
 from megatron.lite.primitive import parallel as parallel_primitives
 from megatron.lite.primitive.parallel import pipeline
 from megatron.lite.primitive.train_step import run_microbatch_loop
+from megatron.lite.runtime.backends.mlite import runtime as runtime_module
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context
 
 
 pytestmark = pytest.mark.mlite
@@ -116,6 +119,53 @@ def test_runtime_aggregates_every_external_loss_metric(num_microbatches):
     assert result.metrics["loss"] == list(map(float, range(1, num_microbatches + 1)))
 
 
+@pytest.mark.parametrize("normalized", [False, True])
+def test_pipeline_runtime_aggregates_every_external_loss(monkeypatch, normalized):
+    micro_losses = [1.0, 2.0, 3.0, 4.0]
+    outputs = [
+        {
+            "loss": value,
+            "metrics": {"plain_metric": index},
+        }
+        for index, value in enumerate(micro_losses, start=1)
+    ]
+    monkeypatch.setattr(
+        pipeline,
+        "forward_backward_pipelining",
+        lambda *_args, **_kwargs: outputs,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_infer_pipeline_tensor_shape",
+        lambda *_args, **_kwargs: (1,),
+    )
+    handle = ModelHandle(
+        model=_ScalarModel(),
+        parallel_state=SimpleNamespace(
+            pp_size=2,
+            pp_group=None,
+            pp_global_ranks=None,
+        ),
+        _extras={
+            "forward_step": lambda _module, _batch: {},
+            "model_cfg": SimpleNamespace(hidden_size=1),
+        },
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    result = runtime.forward_backward(
+        handle,
+        iter([{"value": 0.0}] * len(micro_losses)),
+        lambda *_args: (torch.tensor(0.0), {}),
+        num_microbatches=len(micro_losses),
+        loss_fn_already_normalized=normalized,
+    )
+
+    expected_loss = micro_losses if normalized else sum(micro_losses) / len(micro_losses)
+    assert result.metrics["loss"] == expected_loss
+    assert result.metrics["plain_metric"] == list(range(1, len(micro_losses) + 1))
+
+
 class _PipelineLastStageModel(_ScalarModel):
     def __init__(self):
         super().__init__()
@@ -193,6 +243,70 @@ def test_pipeline_schedule_honors_external_loss_contract(
     assert [item["metrics"]["metric"].values for item in outputs] == [
         [float(index)] for index in range(1, num_microbatches + 1)
     ]
+
+
+def test_pipeline_forward_only_preserves_loss_context(monkeypatch):
+    model = _PipelineLastStageModel()
+    original_empty = torch.empty
+    seen_contexts = []
+
+    def cpu_empty(*args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_empty(*args, **kwargs)
+
+    def fake_send_recv(
+        _send_fwd,
+        _send_bwd,
+        recv_fwd,
+        _recv_bwd,
+        _ps,
+        tensor_shape,
+        **_kwargs,
+    ):
+        activation = torch.full(tensor_shape, 3.0) if recv_fwd else None
+        return activation, None
+
+    monkeypatch.setattr(pipeline.torch, "empty", cpu_empty)
+    monkeypatch.setattr(pipeline, "_send_recv_pipeline", fake_send_recv)
+    ps = SimpleNamespace(
+        pp_size=2,
+        pp_rank=1,
+        pp_is_first=False,
+        pp_is_last=True,
+        pp_cpu_group=None,
+        dp_size=1,
+    )
+    runtime_batch = PackedBatch(
+        input_ids=torch.tensor([1]),
+        labels=torch.tensor([1]),
+        seq_lens=torch.tensor([1]),
+    )
+    loss_context = LossContext(source_batch={"micro": 1})
+
+    def forward_fn(module, batch):
+        assert batch is runtime_batch
+        seen_contexts.append(get_loss_context())
+        return module()
+
+    def loss_fn(output, batch, context):
+        assert batch is runtime_batch
+        assert context is loss_context
+        return output["value"], {"micro": context.source_batch["micro"]}
+
+    outputs = parallel_primitives.forward_backward_pipelining(
+        forward_fn,
+        [model],
+        iter([(runtime_batch, loss_context)]),
+        SimpleNamespace(num_microbatches=1),
+        ps,
+        tensor_shape=(1,),
+        loss_fn=loss_fn,
+        forward_only=True,
+    )
+
+    assert seen_contexts == [loss_context]
+    assert outputs == [{"loss": 3.0, "metrics": {"micro": 1}}]
 
 
 def test_normalized_flag_requires_external_loss():

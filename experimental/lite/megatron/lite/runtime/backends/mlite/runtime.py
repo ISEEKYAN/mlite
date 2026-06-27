@@ -451,6 +451,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 forward_only=forward_only,
                 loss_fn_already_normalized=loss_fn_already_normalized,
             )
+            pipeline_loss_values = [item["loss"] for item in outputs if "loss" in item]
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
@@ -464,6 +465,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
             out = {"loss": loss_t.squeeze(0)}
         else:
+            pipeline_loss_values = []
             out = run_microbatch_loop(
                 handle._model,
                 data_iter,
@@ -483,7 +485,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
-        loss_values = out.get("_loss_fn_losses", []) if out else []
+        loss_values = pipeline_loss_values or (out.get("_loss_fn_losses", []) if out else [])
         if loss_values:
             micro_losses = [
                 value.item() if isinstance(value, torch.Tensor) else float(value)

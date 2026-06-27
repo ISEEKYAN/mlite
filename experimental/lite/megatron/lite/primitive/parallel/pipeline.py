@@ -201,11 +201,12 @@ def _no_pipeline(
     for i in range(num_microbatches):
         if grad_sync_fn and i == num_microbatches - 1:
             grad_sync_fn()
-        batch = next(data_iter)
+        batch, loss_context = split_loss_context(next(data_iter))
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-        output = forward_step_fn(model, batch)
+        with use_loss_context(loss_context):
+            output = forward_step_fn(model, batch)
         if loss_fn is not None:
-            loss, _metrics = _apply_external_loss(output, batch, loss_fn)
+            loss, _metrics = _apply_external_loss(output, batch, loss_fn, loss_context)
             assert loss is not None
         else:
             loss = output["loss"]
@@ -225,10 +226,11 @@ def _forward_only_no_pipeline(
     del ps
     outputs = []
     for _ in range(num_microbatches):
-        batch = next(data_iter)
+        batch, loss_context = split_loss_context(next(data_iter))
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-        output = forward_step_fn(model, batch)
-        _apply_external_loss(output, batch, loss_fn)
+        with use_loss_context(loss_context):
+            output = forward_step_fn(model, batch)
+        _apply_external_loss(output, batch, loss_fn, loss_context)
         outputs.append(_compact_pipeline_output(output))
     return outputs
 
@@ -549,13 +551,15 @@ def _run_pipeline_chunk_forward(
     num_microbatches: int,
     pre_forward_hook=None,
     loss_fn=None,
+    loss_context=None,
 ) -> dict:
     _set_aux_loss_scale(pre_forward_hook, num_microbatches)
     if not is_first_stage:
         model.set_input_tensor(input_tensor)
-    out = forward_step_fn(model, batch)
+    with use_loss_context(loss_context):
+        out = forward_step_fn(model, batch)
     if is_last_stage:
-        _apply_external_loss(out, batch, loss_fn)
+        _apply_external_loss(out, batch, loss_fn, loss_context)
     return out
 
 
@@ -576,7 +580,7 @@ def _forward_only_pipeline_schedule(
     outputs: list[dict] = []
 
     for _mb in range(num_microbatches):
-        batch = next(data_iter)
+        batch, loss_context = split_loss_context(next(data_iter))
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         pending_activation: torch.Tensor | None = None
         last_output: dict | None = None
@@ -602,6 +606,7 @@ def _forward_only_pipeline_schedule(
                     num_microbatches=num_microbatches,
                     pre_forward_hook=None,
                     loss_fn=loss_fn,
+                    loss_context=loss_context,
                 )
                 if is_last_stage:
                     last_output = out
@@ -669,7 +674,7 @@ def _interleaved_1f1b_schedule(
         )
 
     for mb_id in range(num_microbatches):
-        batch = next(data_iter)
+        batch, loss_context = split_loss_context(next(data_iter))
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         saved: dict[
             int, tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict]
@@ -707,6 +712,7 @@ def _interleaved_1f1b_schedule(
                     num_microbatches=num_microbatches,
                     pre_forward_hook=None,
                     loss_fn=loss_fn,
+                    loss_context=loss_context,
                 )
 
                 hidden = out.get("hidden_states")
