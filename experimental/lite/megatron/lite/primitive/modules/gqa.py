@@ -204,8 +204,14 @@ class GQAttention(nn.Module):
         elif is_thd:
             max_q = getattr(packed_seq_params, "max_seqlen_q", None)
             max_kv = getattr(packed_seq_params, "max_seqlen_kv", None)
+            rope_cu_q = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+            if rope_cu_q is None:
+                rope_cu_q = packed_seq_params.cu_seqlens_q
+            rope_cu_kv = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+            if rope_cu_kv is None:
+                rope_cu_kv = packed_seq_params.cu_seqlens_kv
             if max_q is None or max_kv is None:
-                seq_len_for_rope = int(packed_seq_params.cu_seqlens_q[-1])
+                seq_len_for_rope = int(rope_cu_q[-1])
             else:
                 seq_len_for_rope = int(max(max_q, max_kv))
             # Packed THD uses max per-sequence padded length, not total packed tokens.
@@ -213,7 +219,7 @@ class GQAttention(nn.Module):
             freqs = self.rotary(seq_len_for_rope, packed_seq=True)
             q = _apply_rotary_pos_emb_thd(
                 q,
-                packed_seq_params.cu_seqlens_q,
+                rope_cu_q,
                 freqs,
                 rotary_interleaved=False,
                 mscale=1.0,
@@ -221,7 +227,7 @@ class GQAttention(nn.Module):
             )
             k = _apply_rotary_pos_emb_thd(
                 k,
-                packed_seq_params.cu_seqlens_kv,
+                rope_cu_kv,
                 freqs,
                 rotary_interleaved=False,
                 mscale=1.0,

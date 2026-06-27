@@ -7,8 +7,8 @@ keep model config classes out of the primitive layer.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Hashable
 
 import torch
 import torch.nn as nn
@@ -29,7 +29,9 @@ if TYPE_CHECKING:
 
 def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
     try:
-        return _dsa_kernels.fused_indexer_sparse_attn(*args, value_dim=value_dim, **kwargs)
+        return _dsa_kernels.fused_indexer_sparse_attn(
+            *args, value_dim=value_dim, **kwargs
+        )
     except TypeError as exc:
         if "value_dim" not in str(exc):
             raise
@@ -65,7 +67,9 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
                 1.0, device=indexer_loss.device
             )
         indexer_loss_backward_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
-        scaled_indexer_loss_grad = torch.ones_like(indexer_loss) * indexer_loss_backward_scale
+        scaled_indexer_loss_grad = (
+            torch.ones_like(indexer_loss) * indexer_loss_backward_scale
+        )
         return grad_output, scaled_indexer_loss_grad
 
     @staticmethod
@@ -110,12 +114,19 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 def build_rope_cache(
-    *, dim: int, max_position_embeddings: int, rope_theta: float, device: torch.device | None = None
+    *,
+    dim: int,
+    max_position_embeddings: int,
+    rope_theta: float,
+    device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
-        rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        rope_theta
+        ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
     )
-    positions = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
+    positions = torch.arange(
+        max_position_embeddings, dtype=torch.float32, device=device
+    )
     freqs = torch.outer(positions, inv_freq)
     return freqs.cos(), freqs.sin()
 
@@ -126,13 +137,22 @@ def build_rotary_embeddings(
     device = position_ids.device
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(torch.float32) / dim)
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(torch.float32)
+            / dim
+        )
     )
-    inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+    inv_freq_expanded = (
+        inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+    )
     position_ids_expanded = position_ids[:, None, :].float()
-    device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+    device_type = (
+        device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+    )
     with torch.autocast(device_type=device_type, enabled=False):
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
+            1, 2
+        )
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
@@ -147,10 +167,42 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary_pos_emb(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, unsqueeze_dim: int
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    unsqueeze_dim: int,
+    mla_interleaved: bool = False,
 ) -> torch.Tensor:
+    """Apply half-split or MLA-style interleaved RoPE.
+
+    MLA checkpoints lay each frequency pair out as adjacent even/odd values.
+    The reference implementation rotates those pairs and returns the first
+    value from every pair followed by the second value from every pair.  This
+    is deliberately different from merely applying ``rotate_half`` to the
+    checkpoint layout.
+
+    ``mla_interleaved=False`` retains the original half-split implementation
+    byte-for-byte for GLM-5.1 and other existing callers.
+    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+    if mla_interleaved:
+        if x.shape[-1] % 2:
+            raise ValueError(
+                "MLA-style interleaved RoPE requires an even rotary dimension, "
+                f"got {x.shape[-1]}."
+            )
+        # ``cos``/``sin`` come from cat(freqs, freqs); one angle is shared by
+        # each adjacent even/odd pair in the checkpoint layout.
+        pair_dim = x.shape[-1] // 2
+        cos = cos[..., :pair_dim]
+        sin = sin[..., :pair_dim]
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        return torch.cat(
+            (x_even * cos - x_odd * sin, x_odd * cos + x_even * sin), dim=-1
+        )
     return (x * cos) + (rotate_half(x) * sin)
 
 
@@ -208,7 +260,9 @@ def _rotary_embeddings_from_cache(
     return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
-def _all_gather_cp(tensor: torch.Tensor, *, cp_size: int, cp_group) -> list[torch.Tensor]:
+def _all_gather_cp(
+    tensor: torch.Tensor, *, cp_size: int, cp_group
+) -> list[torch.Tensor]:
     if cp_size <= 1:
         return [tensor]
     if cp_group is None:
@@ -218,7 +272,9 @@ def _all_gather_cp(tensor: torch.Tensor, *, cp_size: int, cp_group) -> list[torc
     return list(all_gather(tensor.contiguous(), group=cp_group))
 
 
-def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+def is_dsa_skip_topk_layer(
+    layer_number: int, skip_topk_offset: int, topk_freq: int
+) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA indexer top-k."""
     if layer_number < 1:
         raise ValueError(f"layer_number must be >= 1, got {layer_number}")
@@ -231,7 +287,9 @@ def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: 
     return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
 
 
-def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+def source_dsa_compute_layer(
+    layer_number: int, skip_topk_offset: int, topk_freq: int
+) -> int:
     """Return the 1-indexed full/indexer layer used by ``layer_number``."""
     if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq):
         return layer_number
@@ -244,36 +302,61 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return source_layer
 
 
-def dsa_indexer_type_for_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> str:
-    return "shared" if is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq) else "full"
+def dsa_indexer_type_for_layer(
+    layer_number: int, skip_topk_offset: int, topk_freq: int
+) -> str:
+    return (
+        "shared"
+        if is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq)
+        else "full"
+    )
 
 
 class DSAIndexShareState:
-    """Per-forward top-k holder for DSA cross-layer IndexShare.
+    """Per-forward, bounded top-k holder for DSA cross-layer IndexShare.
 
-    Only one source layer is resident on GPU at a time.  When activation
-    checkpointing needs old source groups during backward recomputation, they
-    are retained on CPU and paged back one group at a time.  This keeps the GPU
-    working set bounded instead of letting checkpoint closures retain every
-    source layer's ``[B, S, topk]`` tensor.
+    ``consumer_counts`` maps each 1-indexed full/source layer to the number of
+    shared-layer executions that consume its top-k indices. Each packed segment
+    gets an independent cache entry and consumer count. The final consumer
+    removes that segment's entry immediately.
     """
 
-    def __init__(self, *, retain_for_recompute: bool = True):
-        self.retain_for_recompute = retain_for_recompute
-        self._resident_source_layer: int | None = None
-        self._resident_topk_by_layer: dict[
-            tuple[int, Hashable | None], torch.Tensor
-        ] = {}
-        self._cpu_topk_by_layer: dict[
-            tuple[int, Hashable | None], torch.Tensor
-        ] = {}
-        self._sealed = False
+    def __init__(self, consumer_counts: Mapping[int, int] | None = None):
+        consumer_counts = {} if consumer_counts is None else consumer_counts
+        self._consumer_counts: dict[int, int] = {}
+        for layer_number, consumer_count in consumer_counts.items():
+            if layer_number < 1:
+                raise ValueError(
+                    f"DSA IndexShare source layer must be >= 1, got {layer_number}"
+                )
+            if consumer_count < 0:
+                raise ValueError(
+                    "DSA IndexShare consumer count must be non-negative, got "
+                    f"{consumer_count} for source layer {layer_number}"
+                )
+            if consumer_count:
+                self._consumer_counts[layer_number] = consumer_count
+        self._topk_by_layer: dict[tuple[int, Hashable | None], torch.Tensor] = {}
+        self._remaining_consumers: dict[tuple[int, Hashable | None], int] = {}
+        self._completed_sources: set[int] = set()
 
     @staticmethod
     def _key(
         layer_number: int, sequence_key: Hashable | None
     ) -> tuple[int, Hashable | None]:
         return layer_number, sequence_key
+
+    def needs_topk(self, source_layer: int) -> bool:
+        """Return whether ``source_layer`` has any local shared consumers."""
+        return (
+            self._consumer_counts.get(source_layer, 0) > 0
+            and source_layer not in self._completed_sources
+        )
+
+    @property
+    def cached_tensor_count(self) -> int:
+        """Number of currently live top-k tensors."""
+        return len(self._topk_by_layer)
 
     def save_topk(
         self,
@@ -282,40 +365,20 @@ class DSAIndexShareState:
         *,
         sequence_key: Hashable | None = None,
     ) -> None:
-        if self._sealed:
-            # A full source layer is being recomputed in backward.  Its shared
-            # consumers have already run in reverse order, so no later layer
-            # needs the newly produced top-k.
-            if self._resident_source_layer == layer_number:
-                self._resident_topk_by_layer.clear()
-                self._resident_source_layer = None
-            return
-
-        if self._resident_source_layer not in (None, layer_number):
-            self._evict_resident(retain=self.retain_for_recompute)
-        self._resident_source_layer = layer_number
-        self._resident_topk_by_layer[self._key(layer_number, sequence_key)] = (
-            topk_indices.detach()
-        )
-
-    def finish_forward(self) -> None:
-        """Evict the final GPU source group before returning model outputs."""
-        if self._sealed:
-            return
-        self._evict_resident(retain=self.retain_for_recompute)
-        self._sealed = True
-
-    def _evict_resident(self, *, retain: bool) -> None:
-        if retain:
-            for key, topk in self._resident_topk_by_layer.items():
-                self._cpu_topk_by_layer[key] = topk.detach().to(device="cpu")
-        self._resident_topk_by_layer.clear()
-        self._resident_source_layer = None
-
-    @property
-    def _topk_by_layer(self) -> dict[tuple[int, Hashable | None], torch.Tensor]:
-        """Private compatibility view used by focused validation harnesses."""
-        return {**self._cpu_topk_by_layer, **self._resident_topk_by_layer}
+        consumer_count = self._consumer_counts.get(layer_number, 0)
+        if consumer_count == 0:
+            raise AssertionError(
+                "DSA IndexShare attempted to save top-k indices for source layer "
+                f"{layer_number}, but no shared consumer is registered."
+            )
+        key = self._key(layer_number, sequence_key)
+        if key in self._topk_by_layer:
+            raise AssertionError(
+                "DSA IndexShare attempted to overwrite live top-k indices for "
+                f"cache key {key}."
+            )
+        self._topk_by_layer[key] = topk_indices.detach()
+        self._remaining_consumers[key] = consumer_count
 
     def get_topk(
         self,
@@ -323,12 +386,9 @@ class DSAIndexShareState:
         source_layer: int,
         *,
         sequence_key: Hashable | None = None,
-        device: torch.device | None = None,
     ) -> torch.Tensor:
         key = self._key(source_layer, sequence_key)
-        if key in self._resident_topk_by_layer:
-            return self._resident_topk_by_layer[key]
-        if key not in self._cpu_topk_by_layer:
+        if key not in self._topk_by_layer:
             available = sorted(self._topk_by_layer)
             raise AssertionError(
                 "DSA IndexShare shared layer "
@@ -337,18 +397,15 @@ class DSAIndexShareState:
                 "Cross-PP top-k sharing is not supported. "
                 f"Available cache keys: {available}."
             )
-
-        if self._resident_source_layer != source_layer:
-            # During backward, groups are consumed in reverse order.  The CPU
-            # copy already remains authoritative, so dropping the previous GPU
-            # group does not require another device-to-host transfer.
-            self._resident_topk_by_layer.clear()
-            self._resident_source_layer = source_layer
-        topk = self._cpu_topk_by_layer[key]
-        if device is not None and topk.device != device:
-            topk = topk.to(device=device)
-        self._resident_topk_by_layer[key] = topk
-        return topk
+        topk_indices = self._topk_by_layer[key]
+        remaining = self._remaining_consumers[key] - 1
+        if remaining == 0:
+            del self._topk_by_layer[key]
+            del self._remaining_consumers[key]
+            self._completed_sources.add(source_layer)
+        else:
+            self._remaining_consumers[key] = remaining
+        return topk_indices
 
 
 def validate_dsa_index_share_pipeline_split(
@@ -367,11 +424,30 @@ def validate_dsa_index_share_pipeline_split(
         if indexer_types is not None and layer_idx < len(indexer_types):
             indexer_type = indexer_types[layer_idx]
         else:
-            indexer_type = dsa_indexer_type_for_layer(layer_idx + 1, skip_topk_offset, topk_freq)
+            indexer_type = dsa_indexer_type_for_layer(
+                layer_idx + 1, skip_topk_offset, topk_freq
+            )
         if indexer_type != "shared":
             continue
 
-        source_idx = source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+        if indexer_types is not None and layer_idx < len(indexer_types):
+            source_idx = next(
+                (
+                    candidate
+                    for candidate in range(layer_idx - 1, -1, -1)
+                    if indexer_types[candidate] == "full"
+                ),
+                None,
+            )
+            if source_idx is None:
+                raise ValueError(
+                    "DSA IndexShare schedule makes layer "
+                    f"{layer_idx} shared before any full source layer."
+                )
+        else:
+            source_idx = (
+                source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+            )
         if source_idx not in positions:
             raise ValueError(
                 "DSA IndexShare cannot cross pipeline stages: layer "
@@ -398,7 +474,7 @@ class DSAIndexer(nn.Module):
         index_n_heads: int,
         index_head_dim: int,
         index_topk: int,
-        rope_interleaved: bool = True,
+        rope_interleaved: bool = False,
         layer_norm_eps: float = 1e-5,
         rope_first: bool = False,
         use_hadamard: bool = True,
@@ -438,20 +514,45 @@ class DSAIndexer(nn.Module):
             )
         batch, seq_len, _ = x.shape
         cos, sin = _rotary_embeddings_from_cache(
-            cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
+            cos,
+            sin,
+            position_ids,
+            device=x.device,
+            dtype=x.dtype,
+            dim=self.qk_rope_head_dim,
         )
 
         q = self.wq_b(q_resid).view(batch, seq_len, self.num_heads, self.head_dim)
 
         k = self.k_norm(self.wk(x))
         if self.rope_first:
-            q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
-            k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
+            q_pe, q_nope = torch.split(
+                q, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1
+            )
+            k_pe, k_nope = torch.split(
+                k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1
+            )
         else:
-            q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            k_nope, k_pe = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
+            q_nope, q_pe = torch.split(
+                q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_nope, k_pe = torch.split(
+                k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+        q_pe = apply_rotary_pos_emb(
+            q_pe,
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        )
+        k_pe = apply_rotary_pos_emb(
+            k_pe.unsqueeze(2),
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        )
         k_pe = k_pe.squeeze(2)
 
         if self.rope_first:
@@ -517,7 +618,7 @@ class DynamicSparseAttention(nn.Module):
         index_head_dim: int,
         index_topk: int,
         rms_norm_eps: float,
-        rope_interleaved: bool = True,
+        rope_interleaved: bool = False,
         latent_rms_norm_eps: float | None = None,
         indexer_layer_norm_eps: float = 1e-5,
         indexer_rope_interleaved: bool | None = None,
@@ -527,6 +628,8 @@ class DynamicSparseAttention(nn.Module):
         index_topk_freq: int = 1,
         index_skip_topk_offset: int = 0,
         indexer_type: str | None = None,
+        index_share_enabled: bool | None = None,
+        index_share_source_layer: int | None = None,
         indexer_loss_coeff: float = 0.0,
         indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
@@ -559,40 +662,73 @@ class DynamicSparseAttention(nn.Module):
         self.layer_number = 1 if layer_number is None else layer_number
         self.index_topk_freq = index_topk_freq
         self.index_skip_topk_offset = index_skip_topk_offset
-        inferred_indexer_type = dsa_indexer_type_for_layer(
-            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
-        )
         if indexer_type is None:
-            indexer_type = inferred_indexer_type
+            indexer_type = dsa_indexer_type_for_layer(
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+            )
         if indexer_type not in {"full", "shared"}:
-            raise ValueError(f"indexer_type must be 'full' or 'shared', got {indexer_type!r}")
-        if indexer_type != inferred_indexer_type:
             raise ValueError(
-                f"indexer_type={indexer_type!r} for layer {self.layer_number} does not match "
-                f"IndexShare schedule {inferred_indexer_type!r}."
+                f"indexer_type must be 'full' or 'shared', got {indexer_type!r}"
             )
         self.indexer_type = indexer_type
-        self.index_share_enabled = self.index_topk_freq > 1
-        self.skip_topk = indexer_type == "shared"
-        self.index_share_source_layer = source_dsa_compute_layer(
-            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+        self.index_share_enabled = (
+            self.index_topk_freq > 1 or indexer_type == "shared"
+            if index_share_enabled is None
+            else bool(index_share_enabled)
         )
-        latent_rms_norm_eps = rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
+        self.skip_topk = indexer_type == "shared"
+        if self.skip_topk and not self.index_share_enabled:
+            raise ValueError("A shared DSA layer requires index_share_enabled=True")
+        if (
+            not self.skip_topk
+            and self.cp_size > 1
+            and self.calculate_per_token_loss
+            and self.indexer_loss_coeff > 0
+        ):
+            raise NotImplementedError(
+                "GLM5 DSA indexer auxiliary loss with context parallelism and "
+                "calculate_per_token_loss=True is not supported until the global-token "
+                "divisor is wired through the replicated-gradient reduction."
+            )
+        if self.skip_topk:
+            if index_share_source_layer is None:
+                index_share_source_layer = source_dsa_compute_layer(
+                    self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+                )
+            if not 1 <= index_share_source_layer < self.layer_number:
+                raise ValueError(
+                    "A shared DSA layer requires an earlier 1-indexed source layer, got "
+                    f"source={index_share_source_layer}, layer={self.layer_number}."
+                )
+        else:
+            index_share_source_layer = self.layer_number
+        self.index_share_source_layer = index_share_source_layer
+        latent_rms_norm_eps = (
+            rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
+        )
         indexer_rope_interleaved = (
-            rope_interleaved if indexer_rope_interleaved is None else indexer_rope_interleaved
+            rope_interleaved
+            if indexer_rope_interleaved is None
+            else indexer_rope_interleaved
         )
 
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=latent_rms_norm_eps)
-        self.q_b_proj = nn.Linear(q_lora_rank, num_attention_heads * self.qk_head_dim, bias=False)
+        self.q_b_proj = nn.Linear(
+            q_lora_rank, num_attention_heads * self.qk_head_dim, bias=False
+        )
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False
         )
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=latent_rms_norm_eps)
         self.kv_b_proj = nn.Linear(
-            kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False
+            kv_lora_rank,
+            num_attention_heads * (qk_nope_head_dim + v_head_dim),
+            bias=False,
         )
-        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            num_attention_heads * v_head_dim, hidden_size, bias=False
+        )
         self.indexer: DSAIndexer | None = None
         if not self.skip_topk:
             self.indexer = DSAIndexer(
@@ -631,8 +767,36 @@ class DynamicSparseAttention(nn.Module):
             )
         if packed_seq_params is not None:
             if self.cp_size > 1:
-                x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
-                cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
+                local_seq = x.shape[1]
+                full_seq = int(
+                    self._packed_cu_seqlens(packed_seq_params, x.device)[-1].item()
+                )
+                self._validate_cp_collective_input_metadata(
+                    x,
+                    position_ids,
+                    cos,
+                    sin,
+                    local_seq=local_seq,
+                    full_seq=full_seq,
+                    packed=True,
+                )
+                if local_seq * self.cp_size != full_seq:
+                    raise ValueError(
+                        "GLM5 packed DynamicSparseAttention CP shards must cover "
+                        "the padded packed sequence exactly: "
+                        f"local_seq={local_seq}, cp_size={self.cp_size}, "
+                        f"padded_full_seq={full_seq}."
+                    )
+                x, position_ids = self._gather_packed_cp_inputs(
+                    x, position_ids, packed_seq_params
+                )
+                cos, sin = self._gather_packed_cp_rotary(
+                    cos,
+                    sin,
+                    packed_seq_params,
+                    x.device,
+                    local_seq=local_seq,
+                )
             out = self._forward_packed_full(
                 x,
                 cos,
@@ -644,7 +808,9 @@ class DynamicSparseAttention(nn.Module):
             if self.cp_size > 1:
                 out = split_packed_to_cp_local(
                     out,
-                    cu_seqlens_padded=self._packed_cu_seqlens(packed_seq_params, x.device),
+                    cu_seqlens_padded=self._packed_cu_seqlens(
+                        packed_seq_params, x.device
+                    ),
                     cp_size=self.cp_size,
                     cp_rank=self.cp_rank,
                     dim=1,
@@ -653,8 +819,25 @@ class DynamicSparseAttention(nn.Module):
 
         cp_restore = self.cp_size > 1
         if cp_restore:
+            local_seq = x.shape[1]
+            self._validate_cp_collective_input_metadata(
+                x,
+                position_ids,
+                cos,
+                sin,
+                local_seq=local_seq,
+                full_seq=local_seq * self.cp_size,
+                packed=False,
+            )
             x, position_ids, attention_mask = self._gather_cp_inputs(
                 x, position_ids, attention_mask
+            )
+            cos, sin = self._gather_cp_rotary(
+                cos,
+                sin,
+                local_seq=local_seq,
+                full_seq=x.shape[1],
+                device=x.device,
             )
 
         out = self._forward_dense_full(
@@ -675,6 +858,9 @@ class DynamicSparseAttention(nn.Module):
         index_share_state: DSAIndexShareState | None,
     ) -> torch.Tensor:
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
+        true_cu_seqlens = self._packed_true_cu_seqlens(
+            packed_seq_params, cu_seqlens, x.device
+        )
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
         if position_ids.shape[-1] != x.shape[1]:
@@ -682,12 +868,51 @@ class DynamicSparseAttention(nn.Module):
                 "GLM5 packed DynamicSparseAttention position_ids must cover the reconstructed packed tokens, "
                 f"got {tuple(position_ids.shape)} for packed length {x.shape[1]}."
             )
+        total_tokens = x.shape[1]
+        packed_tokens = int(cu_seqlens[-1].item())
+        if packed_tokens != total_tokens:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention cu_seqlens must cover the reconstructed "
+                f"packed tokens, got cu_seqlens[-1]={packed_tokens} for length {total_tokens}."
+            )
+        padded_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        true_lengths = true_cu_seqlens[1:] - true_cu_seqlens[:-1]
+        if (
+            int(cu_seqlens[0].item()) != 0
+            or int(true_cu_seqlens[0].item()) != 0
+            or torch.any(padded_lengths < 0)
+            or torch.any(true_lengths < 0)
+            or torch.any(true_lengths > padded_lengths)
+        ):
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention cumulative lengths must start at "
+                "zero, be monotonic, and keep every true length no larger than its "
+                "padded length."
+            )
+        has_alignment_padding = bool(torch.any(true_lengths != padded_lengths).item())
+        if has_alignment_padding and not self.skip_topk and self.indexer_loss_coeff > 0:
+            raise NotImplementedError(
+                "GLM5 packed DSA indexer auxiliary loss does not yet support THD "
+                "alignment padding: a query-valid mask must be wired into the fused "
+                "KL forward/backward before padded rows can be excluded safely."
+            )
+        total_true_tokens = int(true_cu_seqlens[-1].item())
         pieces = []
         for idx in range(int(cu_seqlens.numel()) - 1):
             start = int(cu_seqlens[idx].item())
             end = int(cu_seqlens[idx + 1].item())
             if end <= start:
                 continue
+            true_segment_len = int(true_lengths[idx].item())
+            indexer_loss_weight = (
+                1.0
+                if self.calculate_per_token_loss
+                else (
+                    float(true_segment_len) / float(total_true_tokens)
+                    if total_true_tokens > 0
+                    else 0.0
+                )
+            )
             seg_cos, seg_sin = self._slice_rotary_cache(cos, sin, start, end)
             pieces.append(
                 self._forward_dense_full(
@@ -697,6 +922,7 @@ class DynamicSparseAttention(nn.Module):
                     position_ids[:, start:end],
                     index_share_state=index_share_state,
                     index_share_cache_key=idx,
+                    indexer_loss_weight=indexer_loss_weight,
                 )
             )
         if pieces:
@@ -712,26 +938,54 @@ class DynamicSparseAttention(nn.Module):
         *,
         index_share_state: DSAIndexShareState | None = None,
         index_share_cache_key: Hashable | None = None,
+        indexer_loss_weight: float = 1.0,
     ) -> torch.Tensor:
+        if indexer_loss_weight < 0.0:
+            raise ValueError(
+                f"indexer_loss_weight must be non-negative, got {indexer_loss_weight}."
+            )
 
         batch, seq_len, _ = x.shape
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(q_resid).view(batch, seq_len, self.num_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q = self.q_b_proj(q_resid).view(
+            batch, seq_len, self.num_heads, self.qk_head_dim
+        )
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
         cos, sin = _rotary_embeddings_from_cache(
-            cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
+            cos,
+            sin,
+            position_ids,
+            device=x.device,
+            dtype=x.dtype,
+            dim=self.qk_rope_head_dim,
         )
 
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
+        q_pe = apply_rotary_pos_emb(
+            q_pe,
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        )
         k_up_weight, v_up_weight = self._split_kv_b_weights()
         q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
         query_states = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
 
         kv_latent, k_pe = torch.split(
-            self.kv_a_proj_with_mqa(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            self.kv_a_proj_with_mqa(x),
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
         )
         kv_latent = self.kv_a_layernorm(kv_latent)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
+        k_pe = apply_rotary_pos_emb(
+            k_pe.unsqueeze(2),
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        ).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
         topk_indices: torch.Tensor | None = None
@@ -739,13 +993,13 @@ class DynamicSparseAttention(nn.Module):
         if self.skip_topk:
             if index_share_state is None:
                 raise AssertionError(
-                    "DSA IndexShare shared layers require a per-forward " "DSAIndexShareState."
+                    "DSA IndexShare shared layers require a per-forward "
+                    "DSAIndexShareState."
                 )
             topk_indices = index_share_state.get_topk(
                 self.layer_number,
                 self.index_share_source_layer,
                 sequence_key=index_share_cache_key,
-                device=x.device,
             )
         else:
             assert self.indexer is not None
@@ -753,11 +1007,22 @@ class DynamicSparseAttention(nn.Module):
                 x.detach(), q_resid.detach(), cos, sin, position_ids
             )
         effective_indexer_topk = min(self.index_topk, seq_len)
+        share_topk_with_later_layers = (
+            index_share_state is not None
+            and index_share_state.needs_topk(self.layer_number)
+        )
 
         if self.training and torch.is_grad_enabled() and not self.skip_topk:
-            window_idxs = torch.empty(batch, seq_len, 0, device=x.device, dtype=torch.int32)
-            assert q_indexer is not None and k_indexer is not None and weights_indexer is not None
-            if self.index_share_enabled:
+            window_idxs = torch.empty(
+                batch, seq_len, 0, device=x.device, dtype=torch.int32
+            )
+            assert (
+                q_indexer is not None
+                and k_indexer is not None
+                and weights_indexer is not None
+            )
+            if share_topk_with_later_layers:
+                assert index_share_state is not None
                 out, indexer_loss, topk_indices = _fused_indexer_sparse_attn_with_topk(
                     query_states,
                     kv_full,
@@ -776,12 +1041,11 @@ class DynamicSparseAttention(nn.Module):
                     calculate_per_token_loss=self.calculate_per_token_loss,
                     value_dim=self.kv_lora_rank,
                 )
-                if index_share_state is not None:
-                    index_share_state.save_topk(
-                        self.layer_number,
-                        topk_indices,
-                        sequence_key=index_share_cache_key,
-                    )
+                index_share_state.save_topk(
+                    self.layer_number,
+                    topk_indices,
+                    sequence_key=index_share_cache_key,
+                )
             else:
                 out, indexer_loss = _fused_indexer_sparse_attn(
                     query_states,
@@ -802,11 +1066,15 @@ class DynamicSparseAttention(nn.Module):
                     value_dim=self.kv_lora_rank,
                 )
             if self.indexer_loss_coeff > 0:
+                if indexer_loss_weight != 1.0:
+                    indexer_loss = indexer_loss * indexer_loss_weight
                 out = DSAIndexerLossAutoScaler.apply(out, indexer_loss)
         else:
             if topk_indices is None:
                 assert (
-                    q_indexer is not None and k_indexer is not None and weights_indexer is not None
+                    q_indexer is not None
+                    and k_indexer is not None
+                    and weights_indexer is not None
                 )
                 topk_indices, _ = _dsa_kernels.indexer_topk(
                     q_indexer,
@@ -816,7 +1084,8 @@ class DynamicSparseAttention(nn.Module):
                     1,
                     indexer_softmax_scale=self.indexer_softmax_scale,
                 )
-                if self.index_share_enabled and index_share_state is not None:
+                if share_topk_with_later_layers:
+                    assert index_share_state is not None
                     index_share_state.save_topk(
                         self.layer_number,
                         topk_indices,
@@ -845,10 +1114,16 @@ class DynamicSparseAttention(nn.Module):
         kv_b = self.kv_b_proj.weight.view(
             self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
         )
-        return (kv_b[:, : self.qk_nope_head_dim, :], kv_b[:, self.qk_nope_head_dim :, :])
+        return (
+            kv_b[:, : self.qk_nope_head_dim, :],
+            kv_b[:, self.qk_nope_head_dim :, :],
+        )
 
     def _gather_cp_inputs(
-        self, x: torch.Tensor, position_ids: torch.Tensor, attention_mask: torch.Tensor | None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         local_batch, local_seq = x.shape[:2]
         x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
@@ -856,7 +1131,11 @@ class DynamicSparseAttention(nn.Module):
         full_seq = full_x.shape[1]
 
         full_position_ids = self._full_cp_position_ids(
-            position_ids, batch=local_batch, local_seq=local_seq, full_seq=full_seq, device=x.device
+            position_ids,
+            batch=local_batch,
+            local_seq=local_seq,
+            full_seq=full_seq,
+            device=x.device,
         )
         if attention_mask is not None:
             expected = (full_seq, full_seq)
@@ -866,6 +1145,66 @@ class DynamicSparseAttention(nn.Module):
                     f"full sequence {expected}, got {tuple(attention_mask.shape)}."
                 )
         return full_x, full_position_ids, attention_mask
+
+    def _validate_cp_collective_input_metadata(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        local_seq: int,
+        full_seq: int,
+        packed: bool,
+    ) -> None:
+        """Keep rank-local representation choices from splitting CP collectives.
+
+        Position and rank-3 rotary tensors may be supplied in either CP-local or
+        reconstructed full-sequence form.  The later gather helpers necessarily
+        branch on that choice, so every CP rank must make the same choice.  A
+        fixed-size metadata exchange happens before any conditional gather and
+        turns mixed local/full inputs into a deterministic error on every rank
+        instead of leaving only a subset blocked in NCCL.
+        """
+
+        def shape_metadata(tensor: torch.Tensor) -> list[int]:
+            shape = list(tensor.shape)
+            if len(shape) > 4:
+                shape = shape[:4]
+            dtype_code = sum(
+                (index + 1) * ord(character)
+                for index, character in enumerate(str(tensor.dtype))
+            )
+            return [tensor.dim(), dtype_code, *shape, *([-1] * (4 - len(shape)))]
+
+        metadata = torch.tensor(
+            [
+                int(packed),
+                local_seq,
+                full_seq,
+                *shape_metadata(x),
+                *shape_metadata(position_ids),
+                *shape_metadata(cos),
+                *shape_metadata(sin),
+            ],
+            device=x.device,
+            dtype=torch.int64,
+        )
+        metadata_parts = _all_gather_cp(
+            metadata, cp_size=self.cp_size, cp_group=self.cp_group
+        )
+        if len(metadata_parts) != self.cp_size:
+            raise RuntimeError(
+                "GLM5 DynamicSparseAttention CP group size does not match cp_size: "
+                f"group returned {len(metadata_parts)} ranks, configured cp_size={self.cp_size}."
+            )
+        per_rank = [tuple(part.detach().cpu().tolist()) for part in metadata_parts]
+        if any(item != per_rank[0] for item in per_rank[1:]):
+            raise ValueError(
+                "GLM5 DynamicSparseAttention requires every CP rank to use the same "
+                "local/full position and rotary representation and matching tensor "
+                f"shapes; got per-rank metadata {per_rank}."
+            )
 
     def _full_cp_position_ids(
         self,
@@ -901,6 +1240,13 @@ class DynamicSparseAttention(nn.Module):
         local_seq = x.shape[1]
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
         full_seq = int(cu_seqlens[-1].item())
+        if local_seq * self.cp_size != full_seq:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP shards must cover the "
+                "padded packed sequence exactly: "
+                f"local_seq={local_seq}, cp_size={self.cp_size}, "
+                f"padded_full_seq={full_seq}."
+            )
         x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
         full_x = reconstruct_packed_from_cp_parts(
             x_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
@@ -916,21 +1262,89 @@ class DynamicSparseAttention(nn.Module):
                 "GLM5 packed DynamicSparseAttention CP position_ids must be either local or full packed length, "
                 f"got {tuple(position_ids.shape)} for local_seq={local_seq}, full_seq={full_seq}."
             )
-        pos_parts = _all_gather_cp(position_ids, cp_size=self.cp_size, cp_group=self.cp_group)
+        pos_parts = _all_gather_cp(
+            position_ids, cp_size=self.cp_size, cp_group=self.cp_group
+        )
         full_position_ids = reconstruct_packed_from_cp_parts(
             pos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
         )
         return full_x, full_position_ids
 
-    def _gather_packed_cp_rotary(
-        self, cos: torch.Tensor, sin: torch.Tensor, packed_seq_params, device: torch.device
+    def _gather_cp_rotary(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        local_seq: int,
+        full_seq: int,
+        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if cos.dim() != 3 or sin.dim() != 3:
+        """Reconstruct non-packed rank-3 rotary tensors in zigzag CP order."""
+
+        if cos.dim() != sin.dim():
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP cos/sin ranks must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.dim() != 3:
+            return cos, sin
+        if cos.shape != sin.shape:
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP rank-3 cos/sin shapes must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.shape[1] == full_seq:
+            return cos, sin
+        if cos.shape[1] != local_seq:
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP rank-3 rotary tensors must cover "
+                "either the local or reconstructed full sequence, "
+                f"got {tuple(cos.shape)} for local_seq={local_seq}, full_seq={full_seq}."
+            )
+
+        cos_parts = _all_gather_cp(
+            cos.to(device=device), cp_size=self.cp_size, cp_group=self.cp_group
+        )
+        sin_parts = _all_gather_cp(
+            sin.to(device=device), cp_size=self.cp_size, cp_group=self.cp_group
+        )
+        return (
+            zigzag_reconstruct_from_cp_parts(cos_parts, seq_dim=1),
+            zigzag_reconstruct_from_cp_parts(sin_parts, seq_dim=1),
+        )
+
+    def _gather_packed_cp_rotary(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        packed_seq_params,
+        device: torch.device,
+        *,
+        local_seq: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.dim() != sin.dim():
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP cos/sin ranks must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.shape != sin.shape:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP cos/sin shapes must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.dim() != 3:
             return cos, sin
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, device)
         full_seq = int(cu_seqlens[-1].item())
-        if cos.shape[1] == full_seq and sin.shape[1] == full_seq:
+        if cos.shape[1] == full_seq:
             return cos, sin
+        if cos.shape[1] != local_seq:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP rank-3 rotary tensors "
+                "must cover either the local or padded full packed sequence, "
+                f"got {tuple(cos.shape)} for local_seq={local_seq}, "
+                f"padded_full_seq={full_seq}."
+            )
         cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
         sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
         full_cos = reconstruct_packed_from_cp_parts(
@@ -947,8 +1361,26 @@ class DynamicSparseAttention(nn.Module):
         if cu_seqlens is None:
             cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
         if cu_seqlens is None:
-            raise ValueError("GLM5 packed DynamicSparseAttention requires packed cu_seqlens.")
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention requires packed cu_seqlens."
+            )
         return cu_seqlens.to(device=device, dtype=torch.int32)
+
+    @staticmethod
+    def _packed_true_cu_seqlens(
+        packed_seq_params, padded_cu_seqlens: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        true_cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+        if true_cu_seqlens is None:
+            return padded_cu_seqlens
+        true_cu_seqlens = true_cu_seqlens.to(device=device, dtype=torch.int32)
+        if true_cu_seqlens.shape != padded_cu_seqlens.shape:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention true/padded cu_seqlens must "
+                f"have the same shape, got {tuple(true_cu_seqlens.shape)} and "
+                f"{tuple(padded_cu_seqlens.shape)}."
+            )
+        return true_cu_seqlens
 
     @staticmethod
     def _slice_rotary_cache(

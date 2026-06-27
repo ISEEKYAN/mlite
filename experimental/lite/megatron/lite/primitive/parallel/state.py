@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
@@ -18,12 +18,21 @@ class ParallelState:
     cp_group: dist.ProcessGroup | None = None
     pp_group: dist.ProcessGroup | None = None
     pp_cpu_group: dist.ProcessGroup | None = None
+    embedding_group: dist.ProcessGroup | None = None
     dp_group: dist.ProcessGroup | None = None
     dp_cp_group: dist.ProcessGroup | None = None
     tp_ep_group: dist.ProcessGroup | None = None
     ep_dp_group: dist.ProcessGroup | None = None
     cp_global_ranks: list[int] | None = None
     pp_global_ranks: list[int] | None = None
+    embedding_global_ranks: list[int] | None = None
+    embedding_groups_initialized: bool = False
+    # Populated only after the first/last parameter metadata and initialization
+    # data collective both succeed. Kept opaque here to avoid a state ->
+    # shared_embedding import cycle.
+    mtp_embedding_preflight_cache: object | None = field(
+        default=None, repr=False, compare=False
+    )
 
     tp_size: int = 1
     ep_size: int = 1
@@ -194,4 +203,43 @@ def init_parallel(config) -> ParallelState:
     return ps
 
 
-__all__ = ["ParallelState", "init_parallel"]
+def init_mtp_embedding_group(ps: ParallelState) -> None:
+    """Create first/last PP embedding replica groups only for MTP-enabled models."""
+    if ps.embedding_groups_initialized:
+        return
+    # Any new group generation invalidates a cache tied to the previous group.
+    ps.mtp_embedding_preflight_cache = None
+    if ps.pp_size <= 1:
+        ps.embedding_groups_initialized = True
+        return
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "MTP embedding groups require initialized torch.distributed."
+        )
+
+    expected_world = ps.tp_size * ps.cp_size * ps.pp_size * ps.dp_size
+    if dist.get_world_size() != expected_world:
+        raise RuntimeError(
+            "MTP embedding group rank decomposition does not match world size: "
+            f"world={dist.get_world_size()}, expected={expected_world}."
+        )
+
+    def dense_rank(tp_i: int, cp_i: int, dp_i: int, pp_i: int) -> int:
+        return ((pp_i * ps.dp_size + dp_i) * ps.cp_size + cp_i) * ps.tp_size + tp_i
+
+    rank = dist.get_rank()
+    for dp_i in range(ps.dp_size):
+        for cp_i in range(ps.cp_size):
+            for tp_i in range(ps.tp_size):
+                ranks = [
+                    dense_rank(tp_i, cp_i, dp_i, 0),
+                    dense_rank(tp_i, cp_i, dp_i, ps.pp_size - 1),
+                ]
+                group = dist.new_group(ranks)
+                if rank in ranks:
+                    ps.embedding_group = group
+                    ps.embedding_global_ranks = ranks
+    ps.embedding_groups_initialized = True
+
+
+__all__ = ["ParallelState", "init_mtp_embedding_group", "init_parallel"]

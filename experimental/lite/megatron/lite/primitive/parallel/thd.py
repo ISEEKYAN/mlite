@@ -32,6 +32,7 @@ class PackedTHDBatch:
 
 def _make_packed_seq_params(
     *,
+    cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     max_seqlen: int,
     cp_size: int = 1,
@@ -45,8 +46,8 @@ def _make_packed_seq_params(
             extra_args["cp_group"] = cp_group
     return PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         cu_seqlens_q_padded=cu_seqlens_padded,
@@ -385,7 +386,7 @@ def roll_packed_thd_left(
     cp_rank = 0
     cp_group = None
     if packed_seq_params is not None:
-        cu_seqlens_padded = getattr(packed_seq_params, "cu_seqlens_q", None)
+        cu_seqlens_padded = _packed_cu_seqlens(packed_seq_params)
         cp_size = int(getattr(packed_seq_params, "local_cp_size", None) or 1)
         cp_rank = int(getattr(packed_seq_params, "cp_rank", 0) or 0)
         cp_group = getattr(packed_seq_params, "cp_group", None)
@@ -457,6 +458,8 @@ def pack_nested_thd(
 
     cu_seqlens_padded = torch.zeros(lengths.numel() + 1, dtype=torch.int32, device=device)
     cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
+    cu_seqlens = torch.zeros_like(cu_seqlens_padded)
+    cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
     total_padded = int(cu_seqlens_padded[-1].item())
     total_local = total_padded // cp_size if split_cp else total_padded
     max_seqlen = int(padded_lengths.max().item()) if padded_lengths.numel() else 0
@@ -555,6 +558,7 @@ def pack_nested_thd(
         loss_mask=(packed_loss_mask.unsqueeze(0) if packed_loss_mask is not None else None),
         position_ids=position_ids.unsqueeze(0),
         packed_seq_params=_make_packed_seq_params(
+            cu_seqlens=cu_seqlens,
             cu_seqlens_padded=cu_seqlens_padded,
             max_seqlen=max_seqlen,
             cp_size=cp_size if split_cp else 1,

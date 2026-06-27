@@ -1,23 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DeepSeek V4 (ds4flash) lite native <-> HF checkpoint mapping.
+"""DeepSeek V4 lite native <-> V4-Flash release checkpoint mapping.
 
 Like kimi_k2 / glm5: ``DeepseekV4WeightSpec`` encodes the per-param native -> HF
 name (+ TP/EP shard spec); export/save route through the shared
 ``primitive/ckpt/hf_weights.py`` exporter (its PP ``all_gather_object`` is
 reached by all ranks before any ``rank0_only`` filter, so PP>1 export doesn't
-desync).  Native names are bare ``DeepseekV4Model`` keys; ``self.layers`` is a
-ModuleDict keyed by GLOBAL layer index (kimi uses a local ModuleList), so the
-exporter's local->global remap is an identity here.
+desync). Native decoder names are PP-local and are remapped to global indices.
 
-HF targets are canonical HF DeepSeek (``model.embed_tokens.weight`` /
-``model.norm.weight`` / ``lm_head.weight`` / ``model.layers.<i>.self_attn.*`` /
-``...mlp.experts.<id>.{gate,up,down}_proj.weight``).  DS4 extras:
-  * CSA: ``self_attn.*`` incl. ``compressor.*`` / ``indexer.*``; ``sinks`` ->
-    ``self_attn.attn_sink``.
-  * mHC: ``attn_hc`` / ``ffn_hc`` -> ``...self_attn.hc_*`` / ``...mlp.hc_*``;
-    model-wide ``hc_head`` -> ``model.hc_head.*`` (no HF analogue, kept
-    model.-rooted; fidelity vs Megatron's latest mHC is a TODO).
-  * MTP: folded into the decoder namespace at ``model.layers.<num_hidden+i>``.
+The target is the released V4-Flash / vLLM-style *bare* schema:
+``embed.weight``, ``head.weight``, ``layers.<i>.attn.*``, ``layers.<i>.ffn.*``,
+and ``mtp.<i>.*``. It is intentionally distinct from the Transformers 5.12
+``model.*`` schema used by the separate numeric attention-block oracle; callers
+must not treat the two checkpoint key spaces as interchangeable.
 
 CSA is not TP-capable: DS4 runs TP=ETP=1 (only EP shards experts), like GLM-5.
 """
@@ -36,6 +30,10 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _cast_export_tensor,
     _resolve_export_dtype,
+    copy_hf_state_atomically,
+    gather_pipeline_state_dict,
+    load_hf_model_chunks_atomically,
+    named_persistent_buffers,
     parse_expert_idx,
     to_global_layer_name,
     unwrap_model,
@@ -139,7 +137,9 @@ def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
     return None
 
 
-def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: ParallelState) -> int:
+def _global_expert_idx_from_local(
+    local_idx: int, config: DeepseekV4Config, ps: ParallelState
+) -> int:
     num_local = ensure_divisible(config.n_routed_experts, ps.ep_size)
     return ps.ep_rank * num_local + local_idx
 
@@ -271,20 +271,18 @@ def _dequantize_scaled_tensor(
     return _unpack_fp4_e2m1_if_needed(tensor, shape) * scale_f
 
 
-def _copy_param(
-    param: nn.Parameter | torch.Tensor,
-    tensor: torch.Tensor,
+def _copy_loaded_state(
+    model: nn.Module,
+    loaded: dict[str, torch.Tensor],
     *,
-    scale: torch.Tensor | None = None,
-) -> None:
-    if scale is not None:
-        tensor = _dequantize_scaled_tensor(tensor, scale, param.shape)
-    elif param.dtype.is_floating_point and not tensor.dtype.is_floating_point:
-        raise RuntimeError(
-            f"Refusing to copy quantized tensor with dtype {tensor.dtype} into {tuple(param.shape)} "
-            "without a matching .scale tensor."
-        )
-    param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+    participating_group: dist.ProcessGroup | None = None,
+) -> int:
+    return copy_hf_state_atomically(
+        model,
+        loaded,
+        context="DeepSeek V4 HF load",
+        participating_group=participating_group,
+    )
 
 
 def _read_hf_tensor(
@@ -298,9 +296,9 @@ def _read_hf_tensor(
     return tensor
 
 
-def load_hf_weights(
+def _materialize_hf_weights(
     model: nn.Module, path: str, config: DeepseekV4Config, ps: ParallelState
-) -> None:
+) -> dict[str, torch.Tensor]:
     """Load HF safetensors into the DS4 model.
 
     Kept as DS4's native loader (the inverse of the spec's ``native_to_hf``):
@@ -314,7 +312,9 @@ def load_hf_weights(
     mapping (identity at PP=1); else a non-first stage reads the wrong layer.
     """
     if (ps.tp_size, ps.etp_size) != (1, 1):
-        raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=ETP=1.")
+        raise NotImplementedError(
+            "DeepSeek V4 direct HF load currently supports only TP=ETP=1."
+        )
 
     reader = SafeTensorReader(path)
     base_model = unwrap_model(model)
@@ -325,15 +325,26 @@ def load_hf_weights(
         if hasattr(base_model, "layer_indices")
         else {}
     )
-    loaded = 0
+    out: dict[str, torch.Tensor] = {}
     missing: list[str] = []
     for name, target in state.items():
         if _is_native_metadata_key(name):
             continue
         global_name = to_global_layer_name(name, layer_map)
-        hf_names = _hf_names_for_state_key(_to_global_expert_name(global_name, config, ps), config)
-        if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
-            missing.append(name)
+        mapping_name = (
+            "embed_tokens.embedding.weight"
+            if global_name == "mtp_embed.embedding.weight"
+            else global_name
+        )
+        hf_names = _hf_names_for_state_key(
+            _to_global_expert_name(mapping_name, config, ps), config
+        )
+        if not hf_names:
+            missing.append(f"{name} (no V4-Flash mapping)")
+            continue
+        absent_hf_names = [hf_name for hf_name in hf_names if not _has(reader, hf_name)]
+        if absent_hf_names:
+            missing.append(f"{name} (missing HF keys {absent_hf_names})")
             continue
         if len(hf_names) == 2:
             first = target.shape[0] // 2
@@ -341,24 +352,44 @@ def load_hf_weights(
                 [
                     _read_hf_tensor(reader, hf_names[0], (first, *target.shape[1:])),
                     _read_hf_tensor(
-                        reader, hf_names[1], (target.shape[0] - first, *target.shape[1:])
+                        reader,
+                        hf_names[1],
+                        (target.shape[0] - first, *target.shape[1:]),
                     ),
                 ],
                 dim=0,
             )
-            target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            out[name] = tensor
         else:
-            scale_name = _scale_name_for_hf_name(hf_names[0])
-            scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
-            _copy_param(target, reader.get_tensor(hf_names[0]), scale=scale)
-        loaded += 1
+            out[name] = _read_hf_tensor(reader, hf_names[0], target.shape)
 
-    log_rank0(f"DeepSeek V4 native loaded {loaded} tensors from {path}")
-    for name in missing:
-        log_rank0(f"WARNING: DeepSeek V4 checkpoint tensor missing: {name}")
+    if missing:
+        raise RuntimeError(
+            "DeepSeek V4 checkpoint does not cover local native state: "
+            + "; ".join(missing)
+        )
+    return out
 
 
-def _to_global_expert_name(name: str, config: DeepseekV4Config, ps: ParallelState) -> str:
+def load_hf_weights(
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: DeepseekV4Config,
+    ps: ParallelState,
+) -> None:
+    participating_group = dist.group.WORLD if dist.is_initialized() else None
+    loaded_count = load_hf_model_chunks_atomically(
+        model,
+        lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
+        context="DeepSeek V4 HF load",
+        participating_group=participating_group,
+    )
+    log_rank0(f"DeepSeek V4 native loaded {loaded_count} tensors from {path}")
+
+
+def _to_global_expert_name(
+    name: str, config: DeepseekV4Config, ps: ParallelState
+) -> str:
     """Rewrite an EP-local expert ``weight<local>`` suffix to its global id.
 
     The native ``state_dict`` carries the EP-local expert index; the HF target
@@ -399,7 +430,9 @@ class DeepseekV4WeightSpec:
     def weight_map(self) -> dict[str, list[str]]:
         return {}
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         del native_name
         return hf_tensors[0]
 
@@ -421,7 +454,9 @@ class DeepseekV4WeightSpec:
                 (hf_names[0], first.contiguous()),
                 (hf_names[1], second.contiguous()),
             ]
-        raise AssertionError(f"Unexpected HF name fan-out for {native_name}: {hf_names}")
+        raise AssertionError(
+            f"Unexpected HF name fan-out for {native_name}: {hf_names}"
+        )
 
     def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
         del native_name
@@ -442,6 +477,7 @@ class DeepseekV4WeightSpec:
             return (0, 0)
         if native_name in {
             "embed_tokens.embedding.weight",
+            "mtp_embed.embedding.weight",
             "lm_head.col.linear.weight",
         }:
             return (0, 0)
@@ -474,38 +510,57 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
     spec = DeepseekV4WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
-    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank0_only and rank != 0:
-        return
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
+    local_buffers: dict[str, torch.Tensor] = {}
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
         layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            {
+                i: base_chunk.layer_indices[i]
+                for i in range(len(base_chunk.layer_indices))
+            }
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
-        for name, buffer in base_chunk.named_buffers():
+        for name, buffer in named_persistent_buffers(base_chunk):
             # Persistent router buffers carried into HF: hash-layer ``tid2eid``
             # and the (made-persistent for non-hash layers) ``expert_bias``.
-            if not (name.endswith(".mlp.gate.tid2eid") or name.endswith(".mlp.gate.expert_bias")):
+            if not (
+                name.endswith(".mlp.gate.tid2eid")
+                or name.endswith(".mlp.gate.expert_bias")
+            ):
                 continue
             global_name = to_global_layer_name(name, layer_map)
-            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
-                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
-
-
-def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
-
+            if global_name in local_buffers:
+                raise RuntimeError(
+                    f"duplicate local DeepSeek-V4 router buffer {global_name}"
+                )
+            local_buffers[global_name] = buffer.detach().cpu()
+    gathered_buffers = gather_pipeline_state_dict(
+        local_buffers,
+        ps,
+        participating_group=kwargs.get("participating_group", ps.pp_group),
+    )
+    # Complete every collective before exposing the first generator item.
+    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
     rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(export_hf_weights(model, config, ps, rank0_only=True, **kwargs))
-    if rank == 0 and out:
-        save_safetensors(out, path)
-    if dist.is_initialized():
-        dist.barrier()
+    if rank0_only and rank != 0:
+        return
+    for global_name, buffer in gathered_buffers.items():
+        for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer):
+            yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
+
+
+def save_hf_weights(
+    model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs
+) -> None:
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        save_hf_weight_pairs_distributed,
+    )
+
+    save_hf_weight_pairs_distributed(
+        export_hf_weights(model, config, ps, rank0_only=True, **kwargs), path
+    )
 
 
 __all__ = [

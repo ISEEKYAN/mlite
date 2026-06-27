@@ -133,6 +133,20 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
     )
 
 
+def _load_hf_chunks(proto, chunks, hf_path: str, model_cfg, ps) -> None:
+    """Require an all-chunk transaction whenever VPP owns multiple chunks."""
+    load_many = getattr(proto, "load_hf_weights_many", None)
+    if callable(load_many):
+        load_many(chunks, hf_path, model_cfg, ps)
+        return
+    if len(chunks) != 1:
+        raise NotImplementedError(
+            "VPP HF loading requires the model protocol to implement "
+            "load_hf_weights_many; sequential chunk mutation is not atomic."
+        )
+    proto.load_hf_weights(chunks[0], hf_path, model_cfg, ps)
+
+
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
@@ -190,8 +204,13 @@ class MegatronLiteRuntime(RuntimeBase):
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
         if rt_cfg.load_hf_weights and rt_cfg.hf_path and hasattr(proto, "load_hf_weights"):
-            for chunk in bundle.chunks:
-                proto.load_hf_weights(chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state)
+            _load_hf_chunks(
+                proto,
+                bundle.chunks,
+                rt_cfg.hf_path,
+                model_cfg,
+                bundle.parallel_state,
+            )
             loaded_hf_weights = True
 
         post_load_hook = bundle.extras.pop("post_model_load_hook", None)

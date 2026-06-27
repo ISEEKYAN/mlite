@@ -22,7 +22,16 @@ from megatron.lite.primitive.parallel.sp import (
     gather_from_sequence_parallel,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.shared_embedding import (
+    allreduce_mtp_embedding_grads,
+    synchronize_mtp_embedding_parameters,
+    validate_mtp_embedding_parameter_replicas,
+)
+from megatron.lite.primitive.parallel.state import (
+    ParallelState,
+    init_mtp_embedding_group,
+    init_parallel,
+)
 from megatron.lite.primitive.parallel.thd import (
     PackedSeqParams,
     PackedTHDBatch,
@@ -67,11 +76,13 @@ __all__ = [
     "VocabParallelEmbedding",
     "VocabParallelOutput",
     "build_pipeline_chunk_layout",
+    "allreduce_mtp_embedding_grads",
     "forward_backward_pipelining",
     "gather_for_non_sp_head",
     "gather_from_sequence_parallel",
     "has_packed_thd_params",
     "init_parallel",
+    "init_mtp_embedding_group",
     "pad_vocab_for_tp",
     "pack_nested_thd",
     "parallel_state_from_model",
@@ -82,7 +93,9 @@ __all__ = [
     "scatter_to_sequence_parallel",
     "split_packed_to_cp_local",
     "split_packed_for_cp",
+    "synchronize_mtp_embedding_parameters",
     "unpack_packed_thd_to_nested",
+    "validate_mtp_embedding_parameter_replicas",
     "zigzag_position_ids_for_cp",
     "zigzag_reconstruct_from_cp_parts",
     "zigzag_slice_for_cp",

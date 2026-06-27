@@ -377,10 +377,16 @@ class MultiLatentAttention(nn.Module):
         if is_thd:
             max_q = getattr(packed_seq_params, "max_seqlen_q", None)
             max_kv = getattr(packed_seq_params, "max_seqlen_kv", None)
+            rope_cu_q = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+            if rope_cu_q is None:
+                rope_cu_q = packed_seq_params.cu_seqlens_q
+            rope_cu_kv = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+            if rope_cu_kv is None:
+                rope_cu_kv = packed_seq_params.cu_seqlens_kv
             seq_len = (
                 int(max(max_q, max_kv))
                 if max_q is not None and max_kv is not None
-                else int(packed_seq_params.cu_seqlens_q[-1])
+                else int(rope_cu_q[-1])
             )
             freqs = self.rotary(seq_len, packed_seq=True)
             if isinstance(freqs, tuple):
@@ -389,14 +395,14 @@ class MultiLatentAttention(nn.Module):
                 mscale = 1.0
             q_pos = _apply_mla_rope_thd(
                 q_pos,
-                packed_seq_params.cu_seqlens_q,
+                rope_cu_q,
                 freqs,
                 mscale=mscale,
                 cp_group=self.ps.cp_group,
             )
             k_pos = _apply_mla_rope_thd(
                 k_pos,
-                packed_seq_params.cu_seqlens_kv,
+                rope_cu_kv,
                 freqs,
                 mscale=mscale,
                 cp_group=self.ps.cp_group,

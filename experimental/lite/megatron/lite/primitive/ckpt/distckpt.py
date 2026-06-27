@@ -14,6 +14,10 @@ import torch.nn as nn
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.lite.primitive.ckpt.hf_weights import (
+    _distributed_raise_if_error,
+    named_persistent_buffers,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -46,10 +50,14 @@ def attach_model_sharded_state_dict(
         chunk._mlite_dist_opt_parallel_state = ps  # type: ignore[attr-defined]
 
 
-def supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer: Any) -> bool:
+def supports_dist_opt_distckpt(
+    model: nn.Module | Iterable[nn.Module], optimizer: Any
+) -> bool:
     """Return whether this model/optimizer pair can use mcore dist_checkpointing."""
 
-    if optimizer is not None and not callable(getattr(optimizer, "sharded_state_dict", None)):
+    if optimizer is not None and not callable(
+        getattr(optimizer, "sharded_state_dict", None)
+    ):
         return False
     return all(
         bool(getattr(chunk, "_mlite_dist_opt_sharded_state_dict", False))
@@ -69,26 +77,64 @@ def save_dist_opt_checkpoint(
 ) -> None:
     """Save model and DistributedOptimizer state through mcore dist_checkpointing."""
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    model_sd = _model_sharded_state_dict(model) if save_model or save_optimizer else {}
+    local_error = None
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt checkpoint directory creation failed"
+    )
+    chunks = _model_chunks(model)
+    ps = _chunk_parallel_state(chunks[0]) if chunks else None
+    if ps is not None and ps.embedding_groups_initialized:
+        from megatron.lite.primitive.parallel import (
+            validate_mtp_embedding_parameter_replicas,
+        )
+
+        validate_mtp_embedding_parameter_replicas(chunks, ps, enabled=True)
+    model_sd: dict[str, Any] = {}
+    local_error = None
+    if save_model or save_optimizer:
+        try:
+            model_sd = _model_sharded_state_dict(model)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt model state construction failed"
+    )
     state_dict: dict[str, Any] = {"step": int(step)}
     if save_model:
         state_dict.update(model_sd)
+    local_error = None
     if save_optimizer and optimizer is not None:
-        _synchronize_native_optimizer_steps(optimizer)
-        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=step)
         try:
-            state_dict["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd), metadata=_DISTOPT_METADATA
+            _synchronize_native_optimizer_steps(optimizer)
+            patches = _patch_empty_native_optimizer_state_dicts(
+                optimizer, fallback_step=step
             )
-        finally:
-            _restore_state_dict_patches(patches)
-    dist_checkpointing.save(
-        state_dict,
-        checkpoint_dir,
-        validate_access_integrity=False,
-        content_metadata=_DISTOPT_METADATA,
+            try:
+                state_dict["optimizer"] = optimizer.sharded_state_dict(
+                    _single_or_all_model_state(model_sd), metadata=_DISTOPT_METADATA
+                )
+            finally:
+                _restore_state_dict_patches(patches)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt optimizer state construction failed"
     )
+    local_error = None
+    try:
+        dist_checkpointing.save(
+            state_dict,
+            checkpoint_dir,
+            validate_access_integrity=False,
+            content_metadata=_DISTOPT_METADATA,
+        )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(local_error, context="distckpt checkpoint save failed")
 
 
 def load_dist_opt_checkpoint(
@@ -101,18 +147,38 @@ def load_dist_opt_checkpoint(
 ) -> int:
     """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
 
-    model_sd = _model_sharded_state_dict(model) if load_model or load_optimizer else {}
+    model_sd: dict[str, Any] = {}
+    local_error = None
+    if load_model or load_optimizer:
+        try:
+            model_sd = _model_sharded_state_dict(model)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt model state construction failed"
+    )
     load_sd: dict[str, Any] = {"step": 0}
     if load_model:
         load_sd.update(model_sd)
+    local_error = None
     if load_optimizer and optimizer is not None:
-        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
         try:
-            load_sd["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd), is_loading=True, metadata=_DISTOPT_METADATA
+            patches = _patch_empty_native_optimizer_state_dicts(
+                optimizer, fallback_step=0
             )
-        finally:
-            _restore_state_dict_patches(patches)
+            try:
+                load_sd["optimizer"] = optimizer.sharded_state_dict(
+                    _single_or_all_model_state(model_sd),
+                    is_loading=True,
+                    metadata=_DISTOPT_METADATA,
+                )
+            finally:
+                _restore_state_dict_patches(patches)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt optimizer state construction failed"
+    )
     # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
     # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
     # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
@@ -123,25 +189,45 @@ def load_dist_opt_checkpoint(
         return _orig_torch_load(*args, **kwargs)
 
     torch.load = _trusted_torch_load
+    state_dict: dict[str, Any] = {}
+    local_error = None
     try:
-        state_dict = dist_checkpointing.load(
-            load_sd, checkpoint_dir, validate_access_integrity=False
-        )
+        try:
+            state_dict = dist_checkpointing.load(
+                load_sd, checkpoint_dir, validate_access_integrity=False
+            )
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
     finally:
         torch.load = _orig_torch_load
+    _distributed_raise_if_error(local_error, context="distckpt checkpoint load failed")
+    local_error = None
     if load_model:
-        _load_model_state_dict(model, state_dict)
-    if load_optimizer and optimizer is not None and "optimizer" in state_dict:
-        load_patches = _patch_native_optimizer_step_load(optimizer)
         try:
-            optimizer.load_state_dict(state_dict["optimizer"])
-        finally:
-            _restore_set_state_patches(load_patches)
-        _synchronize_native_optimizer_steps(optimizer)
-    elif load_model and optimizer is not None:
-        reload_model_params = getattr(optimizer, "reload_model_params", None)
-        if callable(reload_model_params):
-            reload_model_params()
+            _load_model_state_dict(model, state_dict)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt model state application failed"
+    )
+    local_error = None
+    try:
+        if load_optimizer and optimizer is not None and "optimizer" in state_dict:
+            load_patches = _patch_native_optimizer_step_load(optimizer)
+            try:
+                optimizer.load_state_dict(state_dict["optimizer"])
+            finally:
+                _restore_set_state_patches(load_patches)
+            _synchronize_native_optimizer_steps(optimizer)
+        elif load_model and optimizer is not None:
+            reload_model_params = getattr(optimizer, "reload_model_params", None)
+            if callable(reload_model_params):
+                reload_model_params()
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="distckpt optimizer state application failed"
+    )
     return int(state_dict.get("step", 0))
 
 
@@ -178,7 +264,9 @@ def _patch_empty_native_optimizer_state_dicts(
         original_state_dict = dist_opt.state_dict
 
         def patched_state_dict(
-            original_state_dict=original_state_dict, dist_opt=dist_opt, fallback_step=fallback_step
+            original_state_dict=original_state_dict,
+            dist_opt=dist_opt,
+            fallback_step=fallback_step,
         ):
             try:
                 return original_state_dict()
@@ -201,9 +289,14 @@ def _patch_native_optimizer_step_load(optimizer: Any) -> list[tuple[Any, Any]]:
         original_set_state = dist_opt._set_main_param_and_optimizer_states
 
         def patched_set_state(
-            model_param, tensors, dist_opt=dist_opt, original_set_state=original_set_state
+            model_param,
+            tensors,
+            dist_opt=dist_opt,
+            original_set_state=original_set_state,
         ):
-            removed_step = _pop_optimizer_step_for_model_param(dist_opt, model_param, tensors)
+            removed_step = _pop_optimizer_step_for_model_param(
+                dist_opt, model_param, tensors
+            )
             try:
                 return original_set_state(model_param, tensors)
             finally:
@@ -261,7 +354,9 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
     yield from visit(optimizer)
 
 
-def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:
+def _iter_optimizer_children(
+    obj: Any, *, known_inner: Any | None = None
+) -> Iterable[Any]:
     chained = getattr(obj, "chained_optimizers", None)
     if isinstance(chained, Iterable):
         yield from chained
@@ -284,7 +379,9 @@ def _safe_inner_optimizer(obj: Any) -> Any | None:
     return getattr(obj, "optimizer", None)
 
 
-def _empty_native_optimizer_state_dict(dist_opt: Any, fallback_step: int) -> dict[str, Any]:
+def _empty_native_optimizer_state_dict(
+    dist_opt: Any, fallback_step: int
+) -> dict[str, Any]:
     inner_state_dict = dist_opt.optimizer.state_dict()
     optimizer_state = {
         key: ([group.copy() for group in value] if key == "param_groups" else value)
@@ -367,7 +464,12 @@ def _module_sharded_state_dict(
             expert=is_expert(name),
             sharded_offsets=sharded_offsets,
         )
-    for name, buffer in module.named_buffers():
+    # ``named_buffers`` also returns entries registered with
+    # ``persistent=False``. Those are runtime caches and are deliberately absent
+    # from ``state_dict``; putting them into a distributed checkpoint both
+    # violates the PyTorch contract and can make rank-local cache shapes look
+    # like checkpoint corruption on restore.
+    for name, buffer in named_persistent_buffers(module):
         state[f"{prefix}{name}"] = _make_sharded_tensor(
             f"{prefix}{name}",
             buffer,
@@ -388,7 +490,9 @@ def _make_sharded_tensor(
     expert: bool,
     sharded_offsets: tuple[tuple[int, int, int], ...] = (),
 ) -> ShardedTensor:
-    rank_offsets, replica_id = _rank_offsets_and_replica_id(placements, ps, expert=expert)
+    rank_offsets, replica_id = _rank_offsets_and_replica_id(
+        placements, ps, expert=expert
+    )
     return ShardedTensor.from_rank_offsets(
         key, tensor, *sharded_offsets, *rank_offsets, replica_id=replica_id
     )
@@ -403,14 +507,20 @@ def _rank_offsets_and_replica_id(
         if _is_shard_placement(placement):
             dim = _shard_dim(placement)
             if dim is None:
-                raise ValueError(f"Unsupported Shard placement without dim: {placement!r}.")
+                raise ValueError(
+                    f"Unsupported Shard placement without dim: {placement!r}."
+                )
             prev_rank, prev_size = axis_fragments.get(dim, (0, 1))
             axis_fragments[dim] = (prev_rank * size + rank, prev_size * size)
-    rank_offsets = tuple((dim, rank, size) for dim, (rank, size) in axis_fragments.items())
+    rank_offsets = tuple(
+        (dim, rank, size) for dim, (rank, size) in axis_fragments.items()
+    )
     return rank_offsets, _replica_id(placements, ps, expert=expert)
 
 
-def _replica_id(placements: list, ps: ParallelState, *, expert: bool) -> tuple[int, int, int]:
+def _replica_id(
+    placements: list, ps: ParallelState, *, expert: bool
+) -> tuple[int, int, int]:
     # PP stages own different parameters. They are not replicas of one
     # another, so PP rank must not make a shard non-main.
     if expert:
@@ -435,7 +545,9 @@ def _placement_is_sharded(placements: list, axis: int) -> bool:
     return axis < len(placements) and _is_shard_placement(placements[axis])
 
 
-def _mesh_ranks_and_sizes(ps: ParallelState, *, expert: bool) -> tuple[list[int], list[int]]:
+def _mesh_ranks_and_sizes(
+    ps: ParallelState, *, expert: bool
+) -> tuple[list[int], list[int]]:
     if expert:
         return (
             [ps.pp_rank, ps.expert_dp_rank, ps.ep_rank, ps.etp_rank],
@@ -461,12 +573,32 @@ def _shard_dim(placement: Any) -> int | None:
 def _model_sharded_state_dict(model: nn.Module | Iterable[nn.Module]) -> dict[str, Any]:
     chunks = _model_chunks(model)
     ps = _chunk_parallel_state(chunks[0]) if chunks else None
-    return {
-        _model_chunk_key(ps, idx, len(chunks)): _chunk_sharded_state_dict(
+    model_state: dict[str, Any] = {}
+    logical_shard_owners: dict[tuple[str, Any, tuple[int, ...]], str] = {}
+    for idx, chunk in enumerate(chunks):
+        chunk_key = _model_chunk_key(ps, idx, len(chunks))
+        chunk_state = _chunk_sharded_state_dict(
             chunk, _model_chunk_sharded_key_prefix(ps, idx, len(chunks))
         )
-        for idx, chunk in enumerate(chunks)
-    }
+        for local_key, value in chunk_state.items():
+            if not isinstance(value, ShardedTensor):
+                continue
+            replica_id = value.replica_id
+            # The same logical tensor may legitimately have multiple local
+            # fragments on one rank. Only an identical key/replica/offset is a
+            # duplicate shard that would be overwritten during flattening.
+            identity = (value.key, replica_id, value.global_offset)
+            owner = f"{chunk_key}.{local_key}"
+            previous_owner = logical_shard_owners.get(identity)
+            if previous_owner is not None:
+                raise RuntimeError(
+                    "distckpt logical shard collision for "
+                    f"key={value.key!r}, replica_id={replica_id!r}: "
+                    f"{previous_owner} and {owner}"
+                )
+            logical_shard_owners[identity] = owner
+        model_state[chunk_key] = chunk_state
+    return model_state
 
 
 def _model_chunk_key(ps: ParallelState | None, idx: int, num_chunks: int) -> str:
@@ -480,7 +612,9 @@ def _model_chunk_key(ps: ParallelState | None, idx: int, num_chunks: int) -> str
     return f"model{idx}"
 
 
-def _model_chunk_sharded_key_prefix(ps: ParallelState | None, idx: int, num_chunks: int) -> str:
+def _model_chunk_sharded_key_prefix(
+    ps: ParallelState | None, idx: int, num_chunks: int
+) -> str:
     if ps is None and num_chunks == 1:
         return ""
     if ps is not None and ps.pp_size <= 1 and num_chunks == 1:
@@ -488,18 +622,48 @@ def _model_chunk_sharded_key_prefix(ps: ParallelState | None, idx: int, num_chun
     return f"{_model_chunk_key(ps, idx, num_chunks)}."
 
 
-def _chunk_sharded_state_dict(chunk: nn.Module, sharded_key_prefix: str) -> dict[str, Any]:
+def _chunk_sharded_state_dict(
+    chunk: nn.Module, sharded_key_prefix: str
+) -> dict[str, Any]:
     chunk_sd = chunk.sharded_state_dict()  # type: ignore[attr-defined]
     if not sharded_key_prefix:
         return chunk_sd
-    return {
-        key: (
-            replace(value, key=f"{sharded_key_prefix}{value.key}")
-            if isinstance(value, ShardedTensor)
-            else value
+    tied_keys = getattr(_wrapped_module(chunk), "_mlite_tied_checkpoint_keys", {})
+    out: dict[str, Any] = {}
+    seen_tied: set[str] = set()
+    for key, value in chunk_sd.items():
+        if not isinstance(value, ShardedTensor):
+            out[key] = value
+            continue
+        logical_key = f"{sharded_key_prefix}{value.key}"
+        replica_id = value.replica_id
+        # VPP normally includes the local chunk id in every logical checkpoint
+        # key. The canonical input embedding is the exception: an MTP replica
+        # on the last PP stage must point at one stable first-stage key without
+        # knowing which VPP chunk owns the embedding. Normalize that one key to
+        # the existing non-VPP spelling; duplicate ownership is still rejected
+        # by ``_model_sharded_state_dict`` below.
+        if sharded_key_prefix.startswith("model_pp0_vpp") and key in {
+            "embed.embedding.weight",
+            "embed_tokens.embedding.weight",
+        }:
+            logical_key = f"model_pp0.{value.key}"
+        if key in tied_keys:
+            if not sharded_key_prefix.startswith("model_pp"):
+                raise RuntimeError(
+                    "PP-tied MTP embedding checkpoint metadata requires a model_pp prefix; "
+                    f"got {sharded_key_prefix!r}."
+                )
+            logical_key = f"model_pp0.{tied_keys[key]}"
+            replica_id = (1, *tuple(replica_id)[1:])
+            seen_tied.add(key)
+        out[key] = replace(value, key=logical_key, replica_id=replica_id)
+    missing_tied = set(tied_keys) - seen_tied
+    if missing_tied:
+        raise RuntimeError(
+            f"PP-tied checkpoint parameters were not found: {sorted(missing_tied)}"
         )
-        for key, value in chunk_sd.items()
-    }
+    return out
 
 
 def _single_or_all_model_state(model_sd: dict[str, Any]) -> dict[str, Any]:

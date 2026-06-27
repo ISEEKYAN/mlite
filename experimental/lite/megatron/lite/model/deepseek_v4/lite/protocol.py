@@ -121,7 +121,10 @@ def _infer_cp_local_seq_len(
     seq_len = input_ids.size(1)
     if cp_size <= 1:
         return seq_len
-    if position_ids is not None and position_ids.size(-1) in (seq_len, seq_len * cp_size):
+    if position_ids is not None and position_ids.size(-1) in (
+        seq_len,
+        seq_len * cp_size,
+    ):
         return seq_len
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
@@ -141,7 +144,9 @@ def _nested_from_packed_tensor(tensor, seq_lens):
         pieces.append(tensor.narrow(0, offset, length))
         offset += length
     if offset != tensor.numel():
-        raise ValueError(f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens.")
+        raise ValueError(
+            f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens."
+        )
     return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
 
 
@@ -163,7 +168,11 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         "loss_mask": packed.loss_mask,
         "position_ids": packed.position_ids,
         "packed_seq_params": packed.packed_seq_params,
-        "enable_mtp": False,
+        # DS4's MTP target rolling is not yet segment-aware, so multiple THD
+        # sequences (or CP shards) must remain disabled to avoid crossing a
+        # physical sequence boundary. A single packed sequence at CP=1 has no
+        # such boundary and is the supported PP+MTP training path.
+        "enable_mtp": ps.cp_size == 1 and seq_lens.numel() == 1,
     }
     add_loss_context_kwargs(kwargs)
     _prepare_packed_contiguous_cp_kwargs(model, kwargs)
@@ -191,7 +200,9 @@ def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
     for key in ("input_ids", "labels", "loss_mask", "position_ids"):
         tensor = kwargs.get(key)
         if tensor is not None:
-            kwargs[key] = contiguous_slice_for_cp(tensor, ps.cp_rank, ps.cp_size, seq_dim=1)
+            kwargs[key] = contiguous_slice_for_cp(
+                tensor, ps.cp_rank, ps.cp_size, seq_dim=1
+            )
     return kwargs
 
 
@@ -244,7 +255,9 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
     # split per row under contiguous CP, where contiguous_position_ids_for_cp rebuilds
     # the per-rank global position ids.
     input_ids = batch.input_ids
-    is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
+    is_thd_packed = input_ids.dim() == 1 or (
+        input_ids.dim() == 2 and input_ids.size(0) == 1
+    )
     if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
     kwargs = _base_model_forward_kwargs(batch)
@@ -274,11 +287,15 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
         override = impl_cfg.mtp_num_layers
     if override is not None:
         if override < 0:
-            raise ValueError(f"DeepSeek V4 MTP layer count must be >=0, got {override}.")
+            raise ValueError(
+                f"DeepSeek V4 MTP layer count must be >=0, got {override}."
+            )
         model_cfg.num_nextn_predict_layers = int(override)
     if impl_cfg.mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but DeepSeek V4 config has no MTP layers.")
+            raise ValueError(
+                "mtp_enable=True but DeepSeek V4 config has no MTP layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
     else:
         model_cfg.num_nextn_predict_layers = 0
@@ -310,7 +327,9 @@ def _optimizer_backend_name(optimizer: Any) -> str | None:
     return optimizer
 
 
-def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None) -> None:
+def _configure_attention_backend(
+    chunks: list[nn.Module], *, backend: str | None
+) -> None:
     backend_name = backend or "torch"
     for chunk in chunks:
         for module in chunk.modules():
@@ -354,7 +373,23 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     _apply_mtp_config(model_cfg, impl_cfg)
     mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
+    if (
+        _optimizer_backend_name(impl_cfg.optimizer) == "fsdp2"
+        and mtp_enable
+        and p.pp > 1
+    ):
+        raise NotImplementedError(
+            "FSDP2 does not yet synchronize the PP-replicated MTP input embedding; "
+            "use dist_opt for PP+MTP training."
+        )
     ps = init_parallel(impl_cfg.parallel)
+    from megatron.lite.primitive.parallel import (
+        init_mtp_embedding_group,
+        synchronize_mtp_embedding_parameters,
+    )
+
+    if mtp_enable:
+        init_mtp_embedding_group(ps)
     vpp = None if p.vpp == 1 else p.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
@@ -387,6 +422,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         )
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
+    synchronize_mtp_embedding_parameters(chunks, ps, enabled=mtp_enable)
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
@@ -420,6 +456,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             model_name="deepseek_v4",
             is_expert=is_expert_param,
             deterministic=impl_cfg.deterministic,
+            mtp_enabled=mtp_enable,
         )
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
@@ -431,7 +468,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         def _post_model_load_hook():
             from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -469,11 +508,23 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
 
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: DeepseekV4Config, ps: ParallelState
+    chunk: nn.Module | list[nn.Module],
+    hf_path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
 ) -> None:
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+
+
+def load_hf_weights_many(
+    chunks: list[nn.Module],
+    hf_path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+) -> None:
+    load_hf_weights(chunks, hf_path, model_cfg, ps)
 
 
 def export_hf_weights(
@@ -483,7 +534,11 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: DeepseekV4Config, ps: ParallelState, **kwargs
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    **kwargs,
 ) -> None:
     _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
 

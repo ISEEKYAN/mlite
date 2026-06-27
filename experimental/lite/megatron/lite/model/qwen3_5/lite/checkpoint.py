@@ -15,9 +15,15 @@ import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, unwrap_model
+from megatron.lite.primitive.ckpt.hf_weights import (
+    SafeTensorReader,
+    copy_hf_state_atomically,
+    load_hf_model_chunks_atomically,
+    named_persistent_buffers,
+    unwrap_model,
+)
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.utils import ensure_divisible, log_rank0
+from megatron.lite.primitive.utils import ensure_divisible
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -25,12 +31,22 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    if "experts" in param_name and "router" not in param_name and "shared" not in param_name:
+    if param_name.startswith("vision_model."):
+        # The mounted HF vision tower is replicated across the language-model
+        # TP domain; its gradients are averaged by the model hook.
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
+    if (
+        "experts" in param_name
+        and "router" not in param_name
+        and "shared" not in param_name
+    ):
         if "fc1" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(0)]
         if "fc2" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(1)]
         return [Replicate(), Replicate(), Replicate(), Replicate()]
+    if "eh_proj.linear.weight" in param_name:
+        return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "in_proj" in param_name and "layer_norm" not in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "qkv" in param_name and "layer_norm" not in param_name:
@@ -155,8 +171,12 @@ def _load_full_attn(
     out[f"{local_prefix}.full_attn.qkv.linear.weight"] = _tp(
         _merge_full_attn_qkvg(q, k, v, cfg=cfg), ps.tp_rank, ps.tp_size
     )
-    out[f"{local_prefix}.full_attn.q_norm.weight"] = _get(reader, f"{hf_prefix}.q_norm.weight")
-    out[f"{local_prefix}.full_attn.k_norm.weight"] = _get(reader, f"{hf_prefix}.k_norm.weight")
+    out[f"{local_prefix}.full_attn.q_norm.weight"] = _get(
+        reader, f"{hf_prefix}.q_norm.weight"
+    )
+    out[f"{local_prefix}.full_attn.k_norm.weight"] = _get(
+        reader, f"{hf_prefix}.k_norm.weight"
+    )
     out[f"{local_prefix}.full_attn.proj.linear.weight"] = _tp(
         _get(reader, f"{hf_prefix}.o_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
@@ -169,9 +189,15 @@ def _merge_full_attn_qkvg(
     head_dim = cfg.head_dim
     hidden = q_gate.shape[1]
     q_gate = q_gate.reshape(cfg.num_attention_heads, 2 * head_dim, hidden)
-    query = q_gate.narrow(1, 0, head_dim).reshape(cfg.num_attention_heads * head_dim, hidden)
-    gate = q_gate.narrow(1, head_dim, head_dim).reshape(cfg.num_attention_heads * head_dim, hidden)
-    q_heads_per_group = ensure_divisible(cfg.num_attention_heads, cfg.num_key_value_heads)
+    query = q_gate.narrow(1, 0, head_dim).reshape(
+        cfg.num_attention_heads * head_dim, hidden
+    )
+    gate = q_gate.narrow(1, head_dim, head_dim).reshape(
+        cfg.num_attention_heads * head_dim, hidden
+    )
+    q_heads_per_group = ensure_divisible(
+        cfg.num_attention_heads, cfg.num_key_value_heads
+    )
     q_group_width = q_heads_per_group * head_dim
     query = query.reshape(kv_heads, q_group_width, hidden)
     gate = gate.reshape(kv_heads, q_group_width, hidden)
@@ -184,7 +210,9 @@ def _unmerge_full_attn_qkvg(
     tensor: torch.Tensor, *, cfg: Qwen35Config
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Invert Qwen35 lite's full-attention q/g/k/v packing."""
-    q_heads_per_group = ensure_divisible(cfg.num_attention_heads, cfg.num_key_value_heads)
+    q_heads_per_group = ensure_divisible(
+        cfg.num_attention_heads, cfg.num_key_value_heads
+    )
     group_width = (2 * q_heads_per_group + 2) * cfg.head_dim
     hidden = tensor.shape[-1]
     packed = tensor.reshape(cfg.num_key_value_heads, group_width, hidden)
@@ -209,11 +237,20 @@ def _unmerge_full_attn_qkvg(
 
 def _split_linear_attn_in_proj(
     tensor: torch.Tensor, *, cfg: Qwen35Config
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
     v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
     return tensor.split(
-        [qk_dim, qk_dim, v_dim, v_dim, cfg.linear_num_value_heads, cfg.linear_num_value_heads],
+        [
+            qk_dim,
+            qk_dim,
+            v_dim,
+            v_dim,
+            cfg.linear_num_value_heads,
+            cfg.linear_num_value_heads,
+        ],
         dim=0,
     )
 
@@ -222,15 +259,21 @@ def _merge_linear_attn_in_proj_tp_shards(
     shards: list[torch.Tensor], *, cfg: Qwen35Config
 ) -> torch.Tensor:
     world_size = len(shards)
-    qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
-    v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
+    qk_dim = ensure_divisible(
+        cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size
+    )
+    v_dim = ensure_divisible(
+        cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size
+    )
     value_heads = ensure_divisible(cfg.linear_num_value_heads, world_size)
 
     parts: list[list[torch.Tensor]] = [[] for _ in range(6)]
     for shard in shards:
         for bucket, part in zip(
             parts,
-            shard.split([qk_dim, qk_dim, v_dim, v_dim, value_heads, value_heads], dim=0),
+            shard.split(
+                [qk_dim, qk_dim, v_dim, v_dim, value_heads, value_heads], dim=0
+            ),
             strict=True,
         ):
             bucket.append(part)
@@ -242,12 +285,18 @@ def _merge_linear_attn_conv1d_tp_shards(
     shards: list[torch.Tensor], *, cfg: Qwen35Config
 ) -> torch.Tensor:
     world_size = len(shards)
-    qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
-    v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
+    qk_dim = ensure_divisible(
+        cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size
+    )
+    v_dim = ensure_divisible(
+        cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size
+    )
 
     parts: list[list[torch.Tensor]] = [[] for _ in range(3)]
     for shard in shards:
-        for bucket, part in zip(parts, shard.split([qk_dim, qk_dim, v_dim], dim=0), strict=True):
+        for bucket, part in zip(
+            parts, shard.split([qk_dim, qk_dim, v_dim], dim=0), strict=True
+        ):
             bucket.append(part)
 
     return torch.cat([torch.cat(bucket, dim=0) for bucket in parts], dim=0).contiguous()
@@ -260,7 +309,9 @@ def _merge_gate_up_tp_shards(shards: list[torch.Tensor]) -> torch.Tensor:
         gate, up = shard.chunk(2, dim=0)
         gates.append(gate)
         ups.append(up)
-    return torch.cat([torch.cat(gates, dim=0), torch.cat(ups, dim=0)], dim=0).contiguous()
+    return torch.cat(
+        [torch.cat(gates, dim=0), torch.cat(ups, dim=0)], dim=0
+    ).contiguous()
 
 
 def _allgather_tp_shards(tensor: torch.Tensor, ps: ParallelState) -> list[torch.Tensor]:
@@ -286,7 +337,9 @@ class Qwen35WeightSpec:
     def weight_map(self) -> dict[str, list[str]]:
         return {}
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         del native_name
         return hf_tensors[0]
 
@@ -308,15 +361,33 @@ class Qwen35WeightSpec:
         return None
 
     def packed_expert_group_name(self, native_name: str) -> str | None:
-        if re.fullmatch(r"layers\.\d+\.moe\.experts\.fc[12]\.weight\d+", native_name) is None:
+        if (
+            re.fullmatch(r"layers\.\d+\.moe\.experts\.fc[12]\.weight\d+", native_name)
+            is None
+        ):
             return None
         return re.sub(r"\.weight\d+$", ".packed", native_name)
 
     def native_to_hf(
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
+        if native_name.startswith("vision_model."):
+            if self.target != "hf":
+                raise NotImplementedError(
+                    "Qwen3.5 mounted vision export is supported only for the HF target."
+                )
+            suffix = native_name.removeprefix("vision_model.")
+            return [(f"model.visual.{suffix}", tensor)]
         if self.target == "vllm":
             return self._native_to_vllm(native_name, tensor)
+
+        if native_name == "mtp_embed.embedding.weight":
+            # Qwen3.5 shares the canonical text embedding with its MTP head.
+            # Under PP the loss stage owns a physical replica, but the HF
+            # schema carries only model.language_model.embed_tokens.weight.
+            return []
+        if native_name.startswith("mtp.layers."):
+            return self._mtp_native_to_hf(native_name, tensor)
 
         if native_name == "embed.embedding.weight":
             return [("model.language_model.embed_tokens.weight", tensor)]
@@ -324,9 +395,6 @@ class Qwen35WeightSpec:
             return [("model.language_model.norm.weight", tensor)]
         if native_name == "head.col.linear.weight":
             return [("lm_head.weight", tensor)]
-        if native_name == "mtp_embed.embedding.weight" or native_name.startswith("mtp."):
-            return []
-
         match = re.match(r"layers\.(\d+)\.(.*)", native_name)
         if match is None:
             return []
@@ -415,6 +483,66 @@ class Qwen35WeightSpec:
 
         return []
 
+    def _mtp_native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Map the released Qwen3.5 MTP head without folding it into the trunk.
+
+        Qwen/Qwen3.5-35B-A3B stores the predictor under a root ``mtp``
+        namespace.  Its routed experts deliberately use per-expert tensors,
+        unlike the packed expert tensors in ``model.language_model.layers``.
+        """
+        match = re.fullmatch(r"mtp\.layers\.(\d+)\.(.*)", native_name)
+        if match is None:
+            return []
+        mtp_idx = int(match.group(1))
+        if mtp_idx != 0:
+            raise NotImplementedError(
+                "The released Qwen3.5 HF MTP schema has one predictor layer; "
+                f"cannot export mtp.layers.{mtp_idx}."
+            )
+        suffix = match.group(2)
+        prefix = f"mtp.layers.{mtp_idx}"
+
+        root_names = {
+            "enorm.weight": "mtp.pre_fc_norm_embedding.weight",
+            "hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
+            "eh_proj.linear.weight": "mtp.fc.weight",
+            "final_layernorm.weight": "mtp.norm.weight",
+        }
+        root_name = root_names.get(suffix)
+        if root_name is not None:
+            return [(root_name, tensor)]
+
+        transformer_prefix = "transformer_layer."
+        if not suffix.startswith(transformer_prefix):
+            return []
+        layer_suffix = suffix.removeprefix(transformer_prefix)
+
+        expert_match = re.fullmatch(
+            r"moe\.experts\.fc([12])\.weight(\d+)", layer_suffix
+        )
+        if expert_match is not None:
+            kind, expert_idx = expert_match.groups()
+            expert_prefix = f"{prefix}.mlp.experts.{int(expert_idx)}"
+            if kind == "1":
+                gate, up = tensor.chunk(2, dim=0)
+                return [
+                    (f"{expert_prefix}.gate_proj.weight", gate.contiguous()),
+                    (f"{expert_prefix}.up_proj.weight", up.contiguous()),
+                ]
+            return [(f"{expert_prefix}.down_proj.weight", tensor)]
+
+        # Reuse the trunk conversion for attention, norms, router, and shared
+        # expert tensors, then replace only its layer namespace.
+        trunk_layer_idx = self.config.num_hidden_layers + mtp_idx
+        proxy_name = f"layers.{trunk_layer_idx}.{layer_suffix}"
+        trunk_prefix = f"model.language_model.layers.{trunk_layer_idx}"
+        return [
+            (hf_name.replace(trunk_prefix, prefix, 1), hf_tensor)
+            for hf_name, hf_tensor in self.native_to_hf(proxy_name, tensor)
+        ]
+
     def _native_to_vllm(
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
@@ -424,7 +552,9 @@ class Qwen35WeightSpec:
             return [("language_model.model.norm.weight", tensor)]
         if native_name == "head.col.linear.weight":
             return [("language_model.lm_head.weight", tensor)]
-        if native_name == "mtp_embed.embedding.weight" or native_name.startswith("mtp."):
+        if native_name == "mtp_embed.embedding.weight" or native_name.startswith(
+            "mtp."
+        ):
             return []
 
         match = re.match(r"layers\.(\d+)\.(.*)", native_name)
@@ -520,13 +650,21 @@ class Qwen35WeightSpec:
         return None
 
     def tp_spec(self, native_name: str) -> tuple[int, int] | None:
+        if native_name.startswith("mtp.layers.") and native_name.endswith(
+            ".eh_proj.linear.weight"
+        ):
+            return (0, 0)
         if self.is_expert(native_name):
             if ".fc1." in native_name:
                 return (0, 1)
             if ".fc2." in native_name:
                 return (1, 1)
             return None
-        if native_name in {"embed.embedding.weight", "head.col.linear.weight"}:
+        if native_name in {
+            "embed.embedding.weight",
+            "mtp_embed.embedding.weight",
+            "head.col.linear.weight",
+        }:
             return (0, 0)
         if native_name.endswith(".full_attn.qkv.linear.weight"):
             return (0, 0)
@@ -616,7 +754,10 @@ def _load_shared_expert(
 ) -> None:
     shared = f"{hf_mlp_prefix}.shared_expert"
     gate_up = torch.cat(
-        [_get(reader, f"{shared}.gate_proj.weight"), _get(reader, f"{shared}.up_proj.weight")],
+        [
+            _get(reader, f"{shared}.gate_proj.weight"),
+            _get(reader, f"{shared}.up_proj.weight"),
+        ],
         dim=0,
     )
     out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _split_gate_up(
@@ -661,7 +802,11 @@ def _load_experts(
         global_idx = local_start + local_idx
         ep = f"{hf_mlp_prefix}.experts.{global_idx}"
         fc1 = torch.cat(
-            [_get(reader, f"{ep}.gate_proj.weight"), _get(reader, f"{ep}.up_proj.weight")], dim=0
+            [
+                _get(reader, f"{ep}.gate_proj.weight"),
+                _get(reader, f"{ep}.up_proj.weight"),
+            ],
+            dim=0,
         )
         fc2 = _get(reader, f"{ep}.down_proj.weight")
         if ps.etp_size > 1:
@@ -671,47 +816,49 @@ def _load_experts(
         out[f"{local_prefix}.moe.experts.fc2.weight{local_idx}"] = fc2
 
 
-def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> None:
-    state = model.state_dict()
-    resolved: dict[str, torch.Tensor] = {}
-    for name, tensor in loaded.items():
-        actual = name if name in state else None
-        if actual is None:
-            for key in state:
-                if name in key:
-                    actual = key
-                    break
-        if actual is not None:
-            resolved[actual] = tensor
-        else:
-            log_rank0(f"WARNING: lite checkpoint tensor has no target param: {name}")
-
-    fp32_names = ("A_log", "dt_bias")
-    for name, param in model.named_parameters():
-        if name not in resolved:
-            log_rank0(f"WARNING: {name} not loaded from checkpoint")
-            continue
-        tensor = resolved[name].to(device=param.device)
-        if any(k in name for k in fp32_names):
-            param.data.copy_(tensor.float())
-        else:
-            param.data.copy_(tensor.to(dtype=param.dtype))
+def _copy_loaded_state(
+    model: nn.Module,
+    loaded: dict[str, torch.Tensor],
+    *,
+    participating_group: dist.ProcessGroup | None = None,
+) -> None:
+    copy_hf_state_atomically(
+        model,
+        loaded,
+        context="Qwen3.5 HF load",
+        participating_group=participating_group,
+    )
 
 
-def load_hf_weights(model: nn.Module, path: str, config: Qwen35Config, ps: ParallelState) -> None:
+def _materialize_hf_weights(
+    model: nn.Module, path: str, config: Qwen35Config, ps: ParallelState
+) -> dict[str, torch.Tensor]:
     base_model = unwrap_model(model)
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
+
+    vision_model = getattr(base_model, "vision_model", None)
+    if vision_model is not None:
+        for name, _target in vision_model.named_parameters():
+            out[f"vision_model.{name}"] = _get(reader, f"model.visual.{name}")
+        for name, _target in named_persistent_buffers(vision_model):
+            out[f"vision_model.{name}"] = _get(reader, f"model.visual.{name}")
 
     prefix = "model.language_model"
     if getattr(base_model, "embed", None) is not None:
         out["embed.embedding.weight"] = _load_vocab(
             reader, f"{prefix}.embed_tokens.weight", config, ps
         )
+    if getattr(base_model, "mtp_embed", None) is not None:
+        out["mtp_embed.embedding.weight"] = _load_vocab(
+            reader, f"{prefix}.embed_tokens.weight", config, ps
+        )
     if getattr(base_model, "norm", None) is not None:
         out["norm.weight"] = _get(reader, f"{prefix}.norm.weight")
     if getattr(base_model, "head", None) is not None:
-        out["head.col.linear.weight"] = _load_vocab(reader, "lm_head.weight", config, ps)
+        out["head.col.linear.weight"] = _load_vocab(
+            reader, "lm_head.weight", config, ps
+        )
 
     for local_idx, global_idx in enumerate(base_model.layer_indices):
         lp = f"layers.{local_idx}"
@@ -737,20 +884,109 @@ def load_hf_weights(model: nn.Module, path: str, config: Qwen35Config, ps: Paral
                 ps=ps,
                 reader=reader,
             )
-        out[f"{lp}.mlp_norm.weight"] = _get(reader, f"{hp}.post_attention_layernorm.weight")
+        out[f"{lp}.mlp_norm.weight"] = _get(
+            reader, f"{hp}.post_attention_layernorm.weight"
+        )
         out[f"{lp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")[
             : config.num_experts
         ]
-        _load_shared_expert(out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", ps=ps, reader=reader)
+        _load_shared_expert(
+            out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", ps=ps, reader=reader
+        )
         _load_experts(
-            out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", cfg=config, ps=ps, reader=reader
+            out,
+            local_prefix=lp,
+            hf_mlp_prefix=f"{hp}.mlp",
+            cfg=config,
+            ps=ps,
+            reader=reader,
         )
 
-    _copy_loaded_state(base_model, out)
+    mtp = getattr(base_model, "mtp", None)
+    if mtp is not None:
+        physical_layers = list(mtp.layers)
+        if len(physical_layers) != 1:
+            raise NotImplementedError(
+                "The released Qwen3.5 HF MTP schema has one physical predictor "
+                f"layer; got {len(physical_layers)} local MTP layers. Use "
+                "mtp_use_repeated_layer=True for multiple prediction depths."
+            )
+        lp = "mtp.layers.0"
+        hp = "mtp.layers.0"
+        tlp = f"{lp}.transformer_layer"
+        out[f"{lp}.enorm.weight"] = _get(reader, "mtp.pre_fc_norm_embedding.weight")
+        out[f"{lp}.hnorm.weight"] = _get(reader, "mtp.pre_fc_norm_hidden.weight")
+        out[f"{lp}.eh_proj.linear.weight"] = _tp(
+            _get(reader, "mtp.fc.weight"), ps.tp_rank, ps.tp_size
+        )
+        out[f"{lp}.final_layernorm.weight"] = _get(reader, "mtp.norm.weight")
+
+        input_ln = _get(reader, f"{hp}.input_layernorm.weight")
+        if config.layer_type_at(config.num_hidden_layers) == "full_attention":
+            _load_full_attn(
+                out,
+                local_prefix=tlp,
+                hf_prefix=f"{hp}.self_attn",
+                input_ln=input_ln,
+                cfg=config,
+                ps=ps,
+                reader=reader,
+            )
+        else:
+            _load_linear_attn(
+                out,
+                local_prefix=tlp,
+                hf_prefix=f"{hp}.linear_attn",
+                input_ln=input_ln,
+                cfg=config,
+                ps=ps,
+                reader=reader,
+            )
+        out[f"{tlp}.mlp_norm.weight"] = _get(
+            reader, f"{hp}.post_attention_layernorm.weight"
+        )
+        out[f"{tlp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")[
+            : config.num_experts
+        ]
+        _load_shared_expert(
+            out,
+            local_prefix=tlp,
+            hf_mlp_prefix=f"{hp}.mlp",
+            ps=ps,
+            reader=reader,
+        )
+        _load_experts(
+            out,
+            local_prefix=tlp,
+            hf_mlp_prefix=f"{hp}.mlp",
+            cfg=config,
+            ps=ps,
+            reader=reader,
+        )
+
+    return out
+
+
+def load_hf_weights(
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: Qwen35Config,
+    ps: ParallelState,
+) -> None:
+    participating_group = dist.group.WORLD if dist.is_initialized() else None
+    load_hf_model_chunks_atomically(
+        model,
+        lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
+        context="Qwen3.5 HF load",
+        participating_group=participating_group,
+    )
 
 
 def export_hf_weights(
-    model: nn.Module | list[nn.Module], config: Qwen35Config, ps: ParallelState, **kwargs
+    model: nn.Module | list[nn.Module],
+    config: Qwen35Config,
+    ps: ParallelState,
+    **kwargs,
 ):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
@@ -759,13 +995,28 @@ def export_hf_weights(
     target = kwargs.pop("target", "hf")
     if include_mtp_only:
         return
+    chunks = list(model) if isinstance(model, nn.ModuleList | list) else [model]
+    if target != "hf" and any(
+        getattr(unwrap_model(chunk), "vision_model", None) is not None
+        for chunk in chunks
+    ):
+        raise NotImplementedError(
+            "Qwen3.5 mounted vision export is supported only for the HF target."
+        )
     yield from _export(
-        model, Qwen35WeightSpec(config, target=target), ps, vocab_size=config.vocab_size, **kwargs
+        model,
+        Qwen35WeightSpec(config, target=target),
+        ps,
+        vocab_size=config.vocab_size,
+        **kwargs,
     )
 
 
 def save_hf_weights(
-    model: nn.Module | list[nn.Module], path: str, config: Qwen35Config, ps: ParallelState
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: Qwen35Config,
+    ps: ParallelState,
 ) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 

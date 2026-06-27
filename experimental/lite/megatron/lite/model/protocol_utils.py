@@ -23,7 +23,6 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
-from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.loss import get_loss_context
 
@@ -73,16 +72,16 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         loss_mask=nested_from_packed(batch.loss_mask, seq_lens),
         roll_loss_mask=batch.loss_mask is not None,
     )
-    max_seqlen = int(packed.padded_lengths.max().item()) if packed.padded_lengths.numel() else 0
     # pack_nested_thd already returns [1, T] token rows; do not unsqueeze again.
     kwargs: dict[str, Any] = {
         "input_ids": packed.input_ids,
         "labels": packed.labels,
         "loss_mask": packed.loss_mask,
         "position_ids": packed.position_ids,
-        "packed_seq_params": PackedSeqParams.from_cu_seqlens(
-            packed.cu_seqlens_padded, max_seqlen=max_seqlen
-        ),
+        # Preserve both true and padded cumulative lengths. Reconstructing
+        # from the padded offsets would silently classify THD alignment
+        # padding as real tokens for auxiliary losses.
+        "packed_seq_params": packed.packed_seq_params,
     }
     prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
     return kwargs
