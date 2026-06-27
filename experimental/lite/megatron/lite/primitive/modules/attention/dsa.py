@@ -656,6 +656,7 @@ class DynamicSparseAttention(nn.Module):
             x, position_ids, attention_mask = self._gather_cp_inputs(
                 x, position_ids, attention_mask
             )
+            cos, sin = self._gather_dense_cp_rotary(cos, sin, full_seq=x.shape[1])
 
         out = self._forward_dense_full(
             x, cos, sin, position_ids, index_share_state=index_share_state
@@ -866,6 +867,27 @@ class DynamicSparseAttention(nn.Module):
                     f"full sequence {expected}, got {tuple(attention_mask.shape)}."
                 )
         return full_x, full_position_ids, attention_mask
+
+    def _gather_dense_cp_rotary(
+        self, cos: torch.Tensor, sin: torch.Tensor, *, full_seq: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.dim() != 3 or sin.dim() != 3:
+            return cos, sin
+        if cos.shape[1] == full_seq and sin.shape[1] == full_seq:
+            return cos, sin
+        expected_local_seq = full_seq // self.cp_size
+        if cos.shape[1] != expected_local_seq or sin.shape[1] != expected_local_seq:
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP rotary caches must be either local or full sequence "
+                f"length, got cos={tuple(cos.shape)} sin={tuple(sin.shape)} for "
+                f"local_seq={expected_local_seq}, full_seq={full_seq}."
+            )
+        cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
+        sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
+        return (
+            zigzag_reconstruct_from_cp_parts(cos_parts, seq_dim=1),
+            zigzag_reconstruct_from_cp_parts(sin_parts, seq_dim=1),
+        )
 
     def _full_cp_position_ids(
         self,
