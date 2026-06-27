@@ -11,12 +11,18 @@ import torch.distributed as dist
 from megatron.lite.primitive.parallel import (
     PackedSeqParams,
     contiguous_to_zigzag_chunks,
+    init_mtp_embedding_group,
     init_parallel,
     zigzag_split_for_cp,
     zigzag_to_contiguous_chunks,
 )
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.mlite,
+    pytest.mark.smoke,
+    pytest.mark.gpu,
+    pytest.mark.distributed,
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -73,6 +79,8 @@ def test_parallel_state_builds_expected_primitive_groups():
             continue
 
         ps = init_parallel(cfg)
+        if cfg.pp > 1:
+            init_mtp_embedding_group(ps)
         dense_dp = world_size // (cfg.tp * cfg.cp * cfg.pp)
         expert_dp = world_size // (cfg.etp * cfg.ep * cfg.pp)
 
@@ -100,6 +108,15 @@ def test_parallel_state_builds_expected_primitive_groups():
         if cfg.pp > 1:
             assert ps.pp_next_rank in ps.pp_global_ranks
             assert ps.pp_prev_rank in ps.pp_global_ranks
+            if ps.pp_rank in {0, cfg.pp - 1}:
+                _assert_group_size(ps.embedding_group, 2)
+                assert ps.embedding_global_ranks == [
+                    ps.pp_global_ranks[0],
+                    ps.pp_global_ranks[-1],
+                ]
+            else:
+                assert ps.embedding_group is None
+                assert ps.embedding_global_ranks is None
 
 
 def test_cp_zigzag_contiguous_chunk_swap_roundtrip():
@@ -107,7 +124,10 @@ def test_cp_zigzag_contiguous_chunk_swap_roundtrip():
         pytest.skip("CP chunk swap smoke requires at least 2 ranks.")
 
     ps = init_parallel(SimpleNamespace(tp=1, ep=1, etp=1, cp=2, pp=1))
-    full = torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 8, 1) + 100 * ps.dp_rank
+    full = (
+        torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 8, 1)
+        + 100 * ps.dp_rank
+    )
     local_zigzag = zigzag_split_for_cp(full, ps.cp_rank, cp_size=2, seq_dim=1)
 
     local_contiguous = zigzag_to_contiguous_chunks(local_zigzag, ps.cp_group, seq_dim=1)

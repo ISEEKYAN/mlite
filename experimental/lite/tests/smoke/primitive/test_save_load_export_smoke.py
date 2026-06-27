@@ -18,6 +18,7 @@ with -k (qwen3_5 needs the qwen3.5 canary site; the four deepseek/qwen3_moe
 models need the DSA overlay). Models gate themselves with importorskip so a
 wrong-env invocation skips rather than errors.
 """
+
 from __future__ import annotations
 
 import os
@@ -34,7 +35,12 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConf
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.mlite,
+    pytest.mark.smoke,
+    pytest.mark.gpu,
+    pytest.mark.distributed,
+]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -175,7 +181,9 @@ def _glm5():
 
 
 def _deepseek_v4():
-    pytest.importorskip("cudnn", reason="deepseek_v4 fused DSA needs the cudnn DSA stack.")
+    pytest.importorskip(
+        "cudnn", reason="deepseek_v4 fused DSA needs the cudnn DSA stack."
+    )
     _require_te()
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
     from megatron.lite.model.deepseek_v4.lite import protocol
@@ -340,12 +348,20 @@ def _build_handle(
     torch.cuda.manual_seed_all(seed)
 
     parallel = topology or _topology(model_name, backend)
+    # PP-replicated MTP embeddings need first/last-stage gradient summation.
+    # dist_opt provides that protocol; FSDP2 currently does not, so its DS4
+    # checkpoint lane intentionally validates the backbone without mounting
+    # MTP. The dist_opt lane enables and trains DS4 MTP so its parameters,
+    # optimizer state, shared embedding, and resumed next step are all covered.
+    train_mtp = model_name == "deepseek_v4" and backend == "dist_opt"
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
         optimizer=backend,
         optimizer_config=_optimizer_config(offload_fraction),
         use_deepep=False,
         deterministic=True,
+        mtp_enable=train_mtp,
+        mtp_enable_train=train_mtp,
     )
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
     chunks = bundle.chunks
@@ -395,12 +411,23 @@ def _random_packed_batch(vocab_size: int) -> PackedBatch:
     )
 
 
-def _train_step(handle: ModelHandle, backend: str, cfg) -> None:
+def _train_step(
+    handle: ModelHandle,
+    backend: str,
+    cfg,
+    *,
+    batch: PackedBatch | None = None,
+    seed: int | None = None,
+) -> None:
     # Unified path for both backends: the runtime routes pp>1 through the
     # pipeline schedule regardless of optimizer backend, so fsdp2 also exercises
     # pipeline parallelism here (not just pure DP).
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    batch = _random_packed_batch(cfg.vocab_size)
+    if batch is None:
+        batch = _random_packed_batch(cfg.vocab_size)
     runtime.zero_grad(handle)
     runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
     runtime.optimizer_step(handle)
@@ -413,7 +440,9 @@ def _local_named_params(handle: ModelHandle) -> dict[str, torch.Tensor]:
     params: dict[str, torch.Tensor] = {}
     for chunk_idx, chunk in enumerate(handle._extras["model_chunks"]):
         for name, param in chunk.named_parameters():
-            params[f"{chunk_idx}.{name}"] = to_local_tensor(param.detach()).cpu().float().clone()
+            params[f"{chunk_idx}.{name}"] = (
+                to_local_tensor(param.detach()).cpu().clone()
+            )
     return params
 
 
@@ -424,10 +453,21 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
     assert lhs_params, "expected at least one local parameter to compare."
     mismatches = []
     for name in lhs_params:
-        if not torch.equal(lhs_params[name], rhs_params[name]):
-            diff = (lhs_params[name] - rhs_params[name]).abs().max().item()
+        lhs_tensor, rhs_tensor = lhs_params[name], rhs_params[name]
+        if (
+            lhs_tensor.shape != rhs_tensor.shape
+            or lhs_tensor.dtype != rhs_tensor.dtype
+            or not torch.equal(lhs_tensor, rhs_tensor)
+        ):
+            diff = (
+                (lhs_tensor.float() - rhs_tensor.float()).abs().max().item()
+                if lhs_tensor.shape == rhs_tensor.shape
+                else float("inf")
+            )
             mismatches.append(f"{name} (max_abs_diff={diff})")
-    assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(mismatches)
+    assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(
+        mismatches
+    )
 
 
 def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
@@ -449,28 +489,35 @@ def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
     return key.startswith("model.") or key in ("lm_head.weight",)
 
 
-def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str) -> None:
+def _export_and_reload(
+    handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str
+) -> None:
     """Export HF weights (bf16) and assert the reloaded shards are valid.
 
-    Prefer the model's ``save_hf_weights`` wrapper; some models only expose the
-    ``export_hf_weights`` generator, so fall back to gathering it and writing
-    the safetensors ourselves (rank 0). Every supported model must offer one of
-    the two — otherwise it has no export path at all, which is a hard failure.
+    The integration gate deliberately requests BF16 from the canonical export
+    generator. Materialization uses the production distributed writer so
+    duplicate keys, generator errors, empty rank-0 output, and write failures
+    are propagated to every rank instead of being hidden by ``dict(generator)``.
     """
     chunks = handle._extras["model_chunks"]
     ps = handle._parallel_state
 
-    if hasattr(protocol, "save_hf_weights"):
-        protocol.save_hf_weights(chunks, out_dir, cfg, ps)
-    elif hasattr(protocol, "export_hf_weights"):
-        from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
-
-        weights = dict(protocol.export_hf_weights(chunks, cfg, ps, rank0_only=True))
-        if dist.get_rank() == 0 and weights:
-            save_safetensors(weights, out_dir)
-    else:
+    if not hasattr(protocol, "export_hf_weights"):
         raise AssertionError(f"{protocol.__name__} exposes no HF export path.")
-    dist.barrier()
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        save_hf_weight_pairs_distributed,
+    )
+
+    save_hf_weight_pairs_distributed(
+        protocol.export_hf_weights(
+            chunks,
+            cfg,
+            ps,
+            rank0_only=True,
+            export_dtype=torch.bfloat16,
+        ),
+        out_dir,
+    )
 
     if dist.get_rank() != 0:
         dist.barrier()
@@ -499,7 +546,9 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
                     assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
                         f"{key} exported as unexpected non-float dtype {tensor.dtype}"
                     )
-                assert torch.isfinite(tensor.float()).all(), f"{key} has non-finite values"
+                assert torch.isfinite(tensor.float()).all(), (
+                    f"{key} has non-finite values"
+                )
                 assert _is_valid_hf_export_key(key, model_name), (
                     f"unexpected non-HF export key: {key}"
                 )
@@ -547,6 +596,66 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     loaded, _cfg2, _proto2 = _build_handle(model_name, backend, seed=9999)
     assert runtime.load_checkpoint(loaded, ckpt_dir) == 1
     _assert_params_bitwise_equal(saved, loaded)
+
+    # A checkpoint is not resume-ready merely because model tensors reload.
+    # Require non-empty optimizer moments/steps and, where the backend exposes
+    # them, non-empty distributed-optimizer master weights to match before the
+    # resumed update. Then prove the exact next batch remains bitwise identical.
+    _assert_nonempty_named_bitwise_equal(
+        _opt_state_snapshot(saved, backend),
+        _opt_state_snapshot(loaded, backend),
+        f"{model_name}/{backend} optimizer state after load",
+    )
+    saved_master = _optimizer_master_snapshot(saved, backend)
+    loaded_master = _optimizer_master_snapshot(loaded, backend)
+    if backend == "dist_opt":
+        _assert_nonempty_named_bitwise_equal(
+            saved_master,
+            loaded_master,
+            f"{model_name}/{backend} optimizer master weights after load",
+        )
+        master_weights_evidence = "nonempty_exact"
+    else:
+        assert saved_master == loaded_master == {}
+        master_weights_evidence = "not_applicable"
+    resume_batch = _random_packed_batch(cfg.vocab_size)
+    _train_step(saved, backend, cfg, batch=resume_batch, seed=20260628)
+    _train_step(loaded, backend, cfg, batch=resume_batch, seed=20260628)
+    _assert_params_bitwise_equal(saved, loaded)
+    _assert_nonempty_named_bitwise_equal(
+        _opt_state_snapshot(saved, backend),
+        _opt_state_snapshot(loaded, backend),
+        f"{model_name}/{backend} optimizer state after resumed step",
+    )
+    resumed_saved_master = _optimizer_master_snapshot(saved, backend)
+    resumed_loaded_master = _optimizer_master_snapshot(loaded, backend)
+    if backend == "dist_opt":
+        _assert_nonempty_named_bitwise_equal(
+            resumed_saved_master,
+            resumed_loaded_master,
+            f"{model_name}/{backend} optimizer master weights after resumed step",
+        )
+    else:
+        assert resumed_saved_master == resumed_loaded_master == {}
+    from megatron.lite.primitive.parallel import (
+        validate_mtp_embedding_parameter_replicas,
+    )
+
+    for handle in (saved, loaded):
+        ps = handle._parallel_state
+        validate_mtp_embedding_parameter_replicas(
+            handle._extras["model_chunks"],
+            ps,
+            enabled=bool(ps.embedding_groups_initialized),
+        )
+    if dist.get_rank() == 0:
+        print(
+            "NON_SKIP_DISTRIBUTED_CHECKPOINT_RESUME_EXACT "
+            f"model={model_name} backend={backend} model_params=nonempty_exact "
+            "optimizer_state=nonempty_exact "
+            f"master_weights={master_weights_evidence} next_step=bitwise_exact "
+            "mtp_embedding_replicas=validated_when_enabled"
+        )
 
 
 @pytest.mark.parametrize("model_name", list(MODELS))
@@ -627,15 +736,31 @@ def _iter_opt_state_tensors(handle: ModelHandle, backend: str):
 def _opt_state_devices(handle: ModelHandle, backend: str) -> set[str]:
     from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
 
-    return {to_local_tensor(v).device.type for _, v in _iter_opt_state_tensors(handle, backend)}
+    return {
+        to_local_tensor(v).device.type
+        for _, v in _iter_opt_state_tensors(handle, backend)
+    }
 
 
 def _opt_state_snapshot(handle: ModelHandle, backend: str) -> dict[str, torch.Tensor]:
     from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
 
     return {
-        k: to_local_tensor(v.detach()).cpu().float().clone()
+        k: to_local_tensor(v.detach()).cpu().clone()
         for k, v in _iter_opt_state_tensors(handle, backend)
+    }
+
+
+def _optimizer_master_snapshot(
+    handle: ModelHandle, backend: str
+) -> dict[str, torch.Tensor]:
+    if backend != "dist_opt":
+        return {}
+    parameters = list(handle._optimizer.get_parameters())
+    assert parameters, "distributed optimizer exposes no local master parameters"
+    return {
+        str(index): parameter.detach().cpu().clone()
+        for index, parameter in enumerate(parameters)
     }
 
 
@@ -653,10 +778,27 @@ def _assert_named_bitwise_equal(lhs: dict, rhs: dict, label: str) -> None:
     assert lhs.keys() == rhs.keys(), f"{label} keys differ across offload roundtrip."
     mismatches = []
     for name in lhs:
-        if not torch.equal(lhs[name], rhs[name]):
-            diff = (lhs[name] - rhs[name]).abs().max().item()
+        lhs_tensor, rhs_tensor = lhs[name], rhs[name]
+        if (
+            lhs_tensor.shape != rhs_tensor.shape
+            or lhs_tensor.dtype != rhs_tensor.dtype
+            or not torch.equal(lhs_tensor, rhs_tensor)
+        ):
+            diff = (
+                (lhs_tensor.float() - rhs_tensor.float()).abs().max().item()
+                if lhs_tensor.shape == rhs_tensor.shape
+                else float("inf")
+            )
             mismatches.append(f"{name} (max_abs_diff={diff})")
-    assert not mismatches, f"{label} not bitwise after offload/onload:\n" + "\n".join(mismatches)
+    assert not mismatches, f"{label} not bitwise after offload/onload:\n" + "\n".join(
+        mismatches
+    )
+
+
+def _assert_nonempty_named_bitwise_equal(lhs: dict, rhs: dict, label: str) -> None:
+    assert lhs, f"{label} left snapshot is empty; exactness would be vacuous."
+    assert rhs, f"{label} right snapshot is empty; exactness would be vacuous."
+    _assert_named_bitwise_equal(lhs, rhs, label)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -680,18 +822,24 @@ def test_offload_onload_roundtrip(model_name, backend, tmp_path):
     assert _opt_state_devices(handle, backend) == {"cuda"}
 
     runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
-    assert _opt_state_devices(handle, backend) == {"cpu"}, "optimizer state not offloaded to CPU."
+    assert _opt_state_devices(handle, backend) == {"cpu"}, (
+        "optimizer state not offloaded to CPU."
+    )
     if backend == "fsdp2":
         # fsdp2 moves params to CPU directly; dist_opt instead frees the GPU
         # buffer storage (params keep a 0-size cuda handle), so assert only fsdp2.
         assert _local_param_devices(handle) == {"cpu"}, "params not offloaded to CPU."
 
     runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
-    assert _opt_state_devices(handle, backend) == {"cuda"}, "optimizer state not back on GPU."
+    assert _opt_state_devices(handle, backend) == {"cuda"}, (
+        "optimizer state not back on GPU."
+    )
     assert _local_param_devices(handle) == {"cuda"}, "params not back on GPU."
 
     _assert_named_bitwise_equal(params_before, _local_named_params(handle), "param")
-    _assert_named_bitwise_equal(opt_before, _opt_state_snapshot(handle, backend), "optimizer-state")
+    _assert_named_bitwise_equal(
+        opt_before, _opt_state_snapshot(handle, backend), "optimizer-state"
+    )
 
     _train_step(handle, backend, cfg)  # continues training after onload
 
