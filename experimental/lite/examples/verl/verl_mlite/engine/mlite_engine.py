@@ -678,20 +678,26 @@ class MegatronLiteEngine(BaseEngine):
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
+            # VERL's PPO/SFT loss is already normalized with the logical
+            # batch's global token count. Each micro loss is a contribution
+            # that must be summed, not averaged again by the runtime.
+            loss_fn_already_normalized=runtime_loss_fn is not None,
         )
         metrics = dict(result.metrics)
         micro_outputs = metrics.pop("_micro_outputs", None)
         if micro_outputs is not None and self.is_mp_src_rank_with_outputs():
             return postprocess_batch_func(output_lst=micro_outputs, indices=indices, data=data)
-        loss = float(metrics.get("loss", 0.0))
+        loss = metrics.get("loss", 0.0)
+        losses = [float(value) for value in loss] if isinstance(loss, list) else [float(loss)]
         return {
             "model_output": {},
-            "loss": [loss],
+            "loss": losses,
             # Pass Metric aggregators through unchanged (reduce_metrics folds them);
             # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
                 key: value
-                if (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                if isinstance(value, list)
+                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
                 else [value]
                 for key, value in metrics.items()
             },

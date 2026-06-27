@@ -79,12 +79,18 @@ class Runtime(ABC):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        loss_fn_already_normalized: bool = False,
     ) -> ForwardResult:
         """Forward + backward pass over data.
 
         Args:
             num_microbatches: Number of microbatches to accumulate inside one
                 logical training step.
+            loss_fn_already_normalized: Whether each external ``loss_fn`` result
+                is already a contribution to the logical batch loss (for example,
+                a VERL PPO loss divided by the global token count). Such losses
+                are summed across microbatches during backward. The default keeps
+                ordinary per-microbatch losses averaged by ``num_microbatches``.
             loss_fn: Optional external loss function with signature::
 
                 loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)

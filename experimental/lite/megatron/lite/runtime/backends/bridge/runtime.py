@@ -694,12 +694,15 @@ class BridgeRuntime(RuntimeBase):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        loss_fn_already_normalized: bool = False,
     ) -> ForwardResult:
         from megatron.core import parallel_state as mpu
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
         if num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
+        if loss_fn_already_normalized and loss_fn is None:
+            raise ValueError("loss_fn_already_normalized requires an external loss_fn")
 
         model_list = handle._extras["model_list"]
         data_iter = _as_data_iter(data)
@@ -765,7 +768,8 @@ class BridgeRuntime(RuntimeBase):
                 else:
                     loss = output_tensor.mean()
                 last_loss[0] = float(loss.detach().item())
-                return loss, {}
+                backward_loss = loss * num_microbatches if loss_fn_already_normalized else loss
+                return backward_loss, {}
 
             return output_tensor, _bridge_loss_fn
 

@@ -22,6 +22,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    loss_fn_already_normalized: bool = False,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -45,8 +46,18 @@ def run_microbatch_loop(
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
             pipeline path, which already threads ``forward_only`` to skip backward.
+        loss_fn_already_normalized: If True, each external loss is already a
+            contribution to the logical batch loss and is not divided by the
+            number of microbatches again. The default averages ordinary
+            per-microbatch losses. This does not change the independent
+            ``1 / num_microbatches`` scale used for auxiliary losses.
     """
+    if loss_fn_already_normalized and loss_fn is None:
+        raise ValueError("loss_fn_already_normalized requires an external loss_fn")
+
+    external_loss_scale = 1.0 if loss_fn_already_normalized else 1.0 / num_microbatches
     last_out = None
+    all_losses: list[torch.Tensor] = []
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
@@ -63,13 +74,15 @@ def run_microbatch_loop(
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
-                (loss / num_microbatches).backward()
+                (loss * external_loss_scale).backward()
             out["loss"] = loss.detach()
+            all_losses.append(loss.detach())
             all_metrics.append(metrics)
         elif not forward_only:
             (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:
+        last_out["_loss_fn_losses"] = all_losses
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
 
