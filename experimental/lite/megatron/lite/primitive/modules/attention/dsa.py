@@ -7,12 +7,13 @@ keep model config classes out of the primitive layer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Hashable
+from collections.abc import Hashable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
+from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.parallel.cp import (
     zigzag_reconstruct_from_cp_parts,
     zigzag_slice_for_cp,
@@ -21,8 +22,6 @@ from megatron.lite.primitive.parallel.thd import (
     reconstruct_packed_from_cp_parts,
     split_packed_to_cp_local,
 )
-
-from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
@@ -250,13 +249,30 @@ def dsa_indexer_type_for_layer(layer_number: int, skip_topk_offset: int, topk_fr
 
 
 class DSAIndexShareState:
-    """Per-forward top-k holder for DSA cross-layer IndexShare."""
+    """Per-forward top-k holder for DSA cross-layer IndexShare.
 
-    def __init__(self):
-        self._topk_by_layer: dict[tuple[int, Hashable | None], torch.Tensor] = {}
+    Only one source layer is resident on GPU at a time.  When activation
+    checkpointing needs old source groups during backward recomputation, they
+    are retained on CPU and paged back one group at a time.  This keeps the GPU
+    working set bounded instead of letting checkpoint closures retain every
+    source layer's ``[B, S, topk]`` tensor.
+    """
+
+    def __init__(self, *, retain_for_recompute: bool = True):
+        self.retain_for_recompute = retain_for_recompute
+        self._resident_source_layer: int | None = None
+        self._resident_topk_by_layer: dict[
+            tuple[int, Hashable | None], torch.Tensor
+        ] = {}
+        self._cpu_topk_by_layer: dict[
+            tuple[int, Hashable | None], torch.Tensor
+        ] = {}
+        self._sealed = False
 
     @staticmethod
-    def _key(layer_number: int, sequence_key: Hashable | None) -> tuple[int, Hashable | None]:
+    def _key(
+        layer_number: int, sequence_key: Hashable | None
+    ) -> tuple[int, Hashable | None]:
         return layer_number, sequence_key
 
     def save_topk(
@@ -266,7 +282,40 @@ class DSAIndexShareState:
         *,
         sequence_key: Hashable | None = None,
     ) -> None:
-        self._topk_by_layer[self._key(layer_number, sequence_key)] = topk_indices.detach()
+        if self._sealed:
+            # A full source layer is being recomputed in backward.  Its shared
+            # consumers have already run in reverse order, so no later layer
+            # needs the newly produced top-k.
+            if self._resident_source_layer == layer_number:
+                self._resident_topk_by_layer.clear()
+                self._resident_source_layer = None
+            return
+
+        if self._resident_source_layer not in (None, layer_number):
+            self._evict_resident(retain=self.retain_for_recompute)
+        self._resident_source_layer = layer_number
+        self._resident_topk_by_layer[self._key(layer_number, sequence_key)] = (
+            topk_indices.detach()
+        )
+
+    def finish_forward(self) -> None:
+        """Evict the final GPU source group before returning model outputs."""
+        if self._sealed:
+            return
+        self._evict_resident(retain=self.retain_for_recompute)
+        self._sealed = True
+
+    def _evict_resident(self, *, retain: bool) -> None:
+        if retain:
+            for key, topk in self._resident_topk_by_layer.items():
+                self._cpu_topk_by_layer[key] = topk.detach().to(device="cpu")
+        self._resident_topk_by_layer.clear()
+        self._resident_source_layer = None
+
+    @property
+    def _topk_by_layer(self) -> dict[tuple[int, Hashable | None], torch.Tensor]:
+        """Private compatibility view used by focused validation harnesses."""
+        return {**self._cpu_topk_by_layer, **self._resident_topk_by_layer}
 
     def get_topk(
         self,
@@ -274,9 +323,12 @@ class DSAIndexShareState:
         source_layer: int,
         *,
         sequence_key: Hashable | None = None,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         key = self._key(source_layer, sequence_key)
-        if key not in self._topk_by_layer:
+        if key in self._resident_topk_by_layer:
+            return self._resident_topk_by_layer[key]
+        if key not in self._cpu_topk_by_layer:
             available = sorted(self._topk_by_layer)
             raise AssertionError(
                 "DSA IndexShare shared layer "
@@ -285,7 +337,18 @@ class DSAIndexShareState:
                 "Cross-PP top-k sharing is not supported. "
                 f"Available cache keys: {available}."
             )
-        return self._topk_by_layer[key]
+
+        if self._resident_source_layer != source_layer:
+            # During backward, groups are consumed in reverse order.  The CPU
+            # copy already remains authoritative, so dropping the previous GPU
+            # group does not require another device-to-host transfer.
+            self._resident_topk_by_layer.clear()
+            self._resident_source_layer = source_layer
+        topk = self._cpu_topk_by_layer[key]
+        if device is not None and topk.device != device:
+            topk = topk.to(device=device)
+        self._resident_topk_by_layer[key] = topk
+        return topk
 
 
 def validate_dsa_index_share_pipeline_split(
@@ -682,6 +745,7 @@ class DynamicSparseAttention(nn.Module):
                 self.layer_number,
                 self.index_share_source_layer,
                 sequence_key=index_share_cache_key,
+                device=x.device,
             )
         else:
             assert self.indexer is not None
