@@ -372,7 +372,8 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     input_ids = zigzag_slice_for_cp(full_ids, rank, world, seq_dim=1).contiguous()
 
     output = model(input_ids=input_ids)
-    assert output["hidden_states"].shape == (batch, seq // world, cfg.hidden_size)
+    # The model contract keeps hidden states in sequence-major (SBH) layout.
+    assert output["hidden_states"].shape == (seq // world, batch, cfg.hidden_size)
     assert torch.isfinite(output["hidden_states"].float()).all()
     loss = output["hidden_states"].float().square().mean()
     assert loss.ndim == 0
