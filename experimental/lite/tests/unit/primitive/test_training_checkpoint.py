@@ -1137,6 +1137,239 @@ def test_real_mcore_full_checkpoint_roundtrips_all_partial_component_loads(
             dist.destroy_process_group()
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="MCore distckpt requires CUDA"
+)
+def test_real_mcore_legacy_model_only_ignores_nonpersistent_buffer(tmp_path) -> None:
+    from megatron.core import dist_checkpointing
+
+    class BufferedModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0, 2.0], device="cuda"))
+            self.register_buffer(
+                "router_bias", torch.tensor([3.0, 4.0], device="cuda"), persistent=True
+            )
+            self.register_buffer(
+                "workspace", torch.tensor([5.0, 6.0], device="cuda"), persistent=False
+            )
+
+    initialized_here = False
+    if not dist.is_initialized():
+        dist.init_process_group(
+            "nccl", init_method=f"file://{tmp_path / 'nccl-init'}", rank=0, world_size=1
+        )
+        initialized_here = True
+    try:
+        model = BufferedModule()
+        attach_model_sharded_state_dict([model], ParallelState())
+        current = _model_sharded_state_dict(model)
+        source = next(
+            entry for entry in _iter_sharded_bases(current) if entry.key == "weight"
+        )
+        legacy_model = dict(current["model"])
+        legacy_model["workspace"] = replace(
+            source, key="workspace", data=model.workspace
+        )
+        checkpoint_dir = tmp_path / "legacy-distckpt"
+        checkpoint_dir.mkdir()
+        dist_checkpointing.save(
+            {"step": 31, "model": legacy_model},
+            str(checkpoint_dir),
+            validate_access_integrity=False,
+        )
+
+        with torch.no_grad():
+            model.weight.zero_()
+            model.router_bias.zero_()
+            model.workspace.fill_(99)
+
+        assert (
+            load_dist_opt_checkpoint(
+                model,
+                None,
+                str(checkpoint_dir),
+                load_model=True,
+                load_optimizer=False,
+                allow_legacy_checkpoint=True,
+            )
+            == 31
+        )
+        torch.testing.assert_close(
+            model.weight, torch.tensor([1.0, 2.0], device="cuda")
+        )
+        torch.testing.assert_close(
+            model.router_bias, torch.tensor([3.0, 4.0], device="cuda")
+        )
+        torch.testing.assert_close(
+            model.workspace, torch.tensor([99.0, 99.0], device="cuda")
+        )
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
+@pytest.fixture
+def legacy_dist_opt_nonpersistent_fixture():
+    class BufferedModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2))
+            self.register_buffer("router_bias", torch.arange(2.0), persistent=True)
+            self.register_buffer("workspace", torch.full((2,), -7.0), persistent=False)
+
+    model = BufferedModule()
+    attach_model_sharded_state_dict([model], ParallelState())
+    model_sd = _model_sharded_state_dict(model)
+    checkpoint_metadata = _fake_checkpoint_metadata(model_sd)
+    source = next(
+        entry for entry in checkpoint_metadata.values() if entry.key == "weight"
+    )
+    # This is the metadata shape emitted by the pre-fix writer, which traversed
+    # all named_buffers() instead of honoring persistent=False.
+    checkpoint_metadata["legacy_workspace"] = replace(source, key="workspace")
+    return model, checkpoint_metadata
+
+
+def test_mcore_raise_unexpected_ignores_checkpoint_only_legacy_buffer(
+    legacy_dist_opt_nonpersistent_fixture,
+) -> None:
+    from megatron.core.dist_checkpointing.validation import (
+        StrictHandling,
+        validate_integrity_and_strict_load,
+    )
+
+    model, checkpoint_metadata = legacy_dist_opt_nonpersistent_fixture
+    load_sd = _model_sharded_state_dict(model)
+
+    validated, missing, unexpected = validate_integrity_and_strict_load(
+        load_sd,
+        StrictHandling.RAISE_UNEXPECTED,
+        validate_access_integrity=False,
+        ckpt_sharded_metadata=checkpoint_metadata,
+    )
+
+    assert _sharded_logical_keys(validated) == {"weight", "router_bias"}
+    assert missing == set()
+    assert unexpected == set()
+
+
+def test_dist_opt_legacy_model_only_allows_declared_nonpersistent_buffer_preflight(
+    monkeypatch, tmp_path, legacy_dist_opt_nonpersistent_fixture
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+    from megatron.core.dist_checkpointing.validation import StrictHandling
+
+    model, checkpoint_metadata = legacy_dist_opt_nonpersistent_fixture
+    expected_weight = torch.full_like(model.weight, 5)
+    expected_router_bias = torch.full_like(model.router_bias, 3)
+    workspace_before = model.workspace.clone()
+
+    monkeypatch.setattr(
+        distckpt, "_load_checkpoint_sharded_metadata", lambda _path: checkpoint_metadata
+    )
+    _mock_distckpt_common_state(monkeypatch, {"step": 8})
+
+    def fake_load(load_sd, _checkpoint_dir, **kwargs):
+        assert _sharded_logical_keys(load_sd) == {"weight", "router_bias"}
+        assert kwargs["strict"] is StrictHandling.RAISE_UNEXPECTED
+        return {
+            "step": 8,
+            "model": {"weight": expected_weight, "router_bias": expected_router_bias},
+        }
+
+    monkeypatch.setattr(distckpt.dist_checkpointing, "load", fake_load)
+
+    assert (
+        load_dist_opt_checkpoint(
+            model,
+            None,
+            str(tmp_path),
+            load_model=True,
+            load_optimizer=False,
+            allow_legacy_checkpoint=True,
+        )
+        == 8
+    )
+    torch.testing.assert_close(model.weight, expected_weight)
+    torch.testing.assert_close(model.router_bias, expected_router_bias)
+    torch.testing.assert_close(model.workspace, workspace_before)
+
+
+def test_dist_opt_nonpersistent_legacy_key_requires_explicit_opt_in(
+    monkeypatch, tmp_path, legacy_dist_opt_nonpersistent_fixture
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    model, checkpoint_metadata = legacy_dist_opt_nonpersistent_fixture
+    before = copy.deepcopy(model.state_dict())
+    workspace_before = model.workspace.clone()
+    monkeypatch.setattr(
+        distckpt, "_load_checkpoint_sharded_metadata", lambda _path: checkpoint_metadata
+    )
+    monkeypatch.setattr(
+        distckpt.dist_checkpointing,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("MCore load must not run"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"saved_but_unrequested_for_requested_components=\['workspace'\]",
+    ):
+        load_dist_opt_checkpoint(
+            model,
+            None,
+            str(tmp_path),
+            load_model=True,
+            load_optimizer=False,
+            allow_legacy_checkpoint=False,
+        )
+
+    _assert_state_equal(model.state_dict(), before)
+    torch.testing.assert_close(model.workspace, workspace_before)
+
+
+def test_dist_opt_legacy_model_only_rejects_unknown_model_tensor_before_mcore_load(
+    monkeypatch, tmp_path, legacy_dist_opt_nonpersistent_fixture
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    model, checkpoint_metadata = legacy_dist_opt_nonpersistent_fixture
+    source = next(iter(checkpoint_metadata.values()))
+    checkpoint_metadata["unknown"] = replace(source, key="removed_parameter")
+    before = copy.deepcopy(model.state_dict())
+    workspace_before = model.workspace.clone()
+    monkeypatch.setattr(
+        distckpt, "_load_checkpoint_sharded_metadata", lambda _path: checkpoint_metadata
+    )
+    monkeypatch.setattr(
+        distckpt.dist_checkpointing,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("MCore load must not run"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"saved_but_unrequested_for_requested_components="
+            r"\['removed_parameter'\]"
+        ),
+    ):
+        load_dist_opt_checkpoint(
+            model,
+            None,
+            str(tmp_path),
+            load_model=True,
+            load_optimizer=False,
+            allow_legacy_checkpoint=True,
+        )
+
+    _assert_state_equal(model.state_dict(), before)
+    torch.testing.assert_close(model.workspace, workspace_before)
+
+
 def test_dist_opt_saved_stale_model_key_fails_metadata_preflight_before_load(
     monkeypatch, tmp_path
 ) -> None:

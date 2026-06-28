@@ -208,8 +208,10 @@ def load_dist_opt_checkpoint(
         load_sd,
         model_sd,
         checkpoint_dir,
+        model=model,
         load_model=load_model,
         load_optimizer=load_optimizer,
+        allow_legacy_checkpoint=allow_legacy_checkpoint,
     )
     preloaded_common_state, common_state_fingerprint = _preflight_distckpt_common_state(
         load_sd,
@@ -911,6 +913,32 @@ def _gather_world_metadata_contracts(
     return merged
 
 
+def _gather_world_key_set(local_keys: set[str], *, context: str) -> set[str]:
+    """Union rank-local logical keys after validating their wire representation."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return set(local_keys)
+    gathered: list[set[str] | None] = [None] * dist.get_world_size()
+    local_error = None
+    try:
+        dist.all_gather_object(gathered, local_keys)
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(local_error, context=f"{context} exchange failed")
+
+    merged: set[str] = set()
+    local_error = None
+    for rank, rank_keys in enumerate(gathered):
+        if not isinstance(rank_keys, set) or any(
+            not isinstance(key, str) or not key for key in rank_keys
+        ):
+            local_error = f"rank {rank} reported invalid logical keys: {rank_keys!r}"
+            break
+        merged.update(rank_keys)
+    _distributed_raise_if_error(local_error, context=context)
+    return merged
+
+
 def _validate_requested_checkpoint_contracts(
     requested: Mapping[str, tuple[str, tuple[int, ...], str | None, bool]],
     checkpoint: Mapping[str, tuple[str, tuple[int, ...], str | None, bool]],
@@ -939,8 +967,10 @@ def _preflight_distckpt_checkpoint_metadata(
     model_sd: Mapping[str, Any],
     checkpoint_dir: str,
     *,
+    model: nn.Module | Iterable[nn.Module],
     load_model: bool,
     load_optimizer: bool,
+    allow_legacy_checkpoint: bool,
 ) -> tuple[set[str], set[str]]:
     """Reject component-aware key mismatches before MCore can mutate live tensors."""
 
@@ -971,9 +1001,31 @@ def _preflight_distckpt_checkpoint_metadata(
 
     requested_but_absent = sorted(requested_keys - checkpoint_keys)
     saved_but_unrequested = checkpoint_keys - requested_keys
+    legacy_nonpersistent_buffer_keys: set[str] = set()
+    if allow_legacy_checkpoint and load_model and not load_optimizer:
+        local_nonpersistent_buffer_keys: set[str] = set()
+        local_error = None
+        try:
+            local_nonpersistent_buffer_keys = _model_nonpersistent_buffer_keys(model)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+        _distributed_raise_if_error(
+            local_error,
+            context="distckpt legacy nonpersistent buffer metadata construction failed",
+        )
+        declared_nonpersistent_buffer_keys = _gather_world_key_set(
+            local_nonpersistent_buffer_keys,
+            context="distckpt legacy nonpersistent buffer metadata",
+        )
+        legacy_nonpersistent_buffer_keys = {
+            key
+            for key in declared_nonpersistent_buffer_keys
+            if key in checkpoint_contracts and checkpoint_contracts[key][0] == "tensor"
+        }
     required_saved_but_unrequested = sorted(
         key
         for key in saved_but_unrequested
+        if key not in legacy_nonpersistent_buffer_keys
         if (load_optimizer and key.startswith("optimizer."))
         or (load_model and not key.startswith("optimizer."))
     )
@@ -1384,6 +1436,49 @@ def _model_chunk_sharded_key_prefix(
     if ps is not None and ps.pp_size <= 1 and num_chunks == 1:
         return ""
     return f"{_model_chunk_key(ps, idx, num_chunks)}."
+
+
+def _model_nonpersistent_buffer_keys(
+    model: nn.Module | Iterable[nn.Module],
+) -> set[str]:
+    """Return legacy logical keys backed by currently nonpersistent buffers.
+
+    Older MLite distckpt writers traversed ``named_buffers()`` and therefore
+    serialized runtime-only buffers despite their ``persistent=False``
+    declaration.  Derive the migration allowlist from the live modules rather
+    than from checkpoint-controlled names.
+    """
+
+    chunks = _model_chunks(model)
+    ps = _chunk_parallel_state(chunks[0]) if chunks else None
+    logical_keys: set[str] = set()
+    for idx, chunk in enumerate(chunks):
+        module = _wrapped_module(chunk)
+        sharded_key_prefix = _model_chunk_sharded_key_prefix(ps, idx, len(chunks))
+        tied_keys = getattr(module, "_mlite_tied_checkpoint_keys", {})
+        for name, _buffer in module.named_buffers():
+            module_name, _, local_name = name.rpartition(".")
+            owner = module.get_submodule(module_name) if module_name else module
+            if local_name not in owner._non_persistent_buffers_set:
+                continue
+
+            logical_key = f"{sharded_key_prefix}{name}"
+            # Mirror the legacy path through ``_chunk_sharded_state_dict`` so
+            # PP/VPP checkpoints are matched by their on-disk logical key.
+            if sharded_key_prefix.startswith("model_pp0_vpp") and name in {
+                "embed.embedding.weight",
+                "embed_tokens.embedding.weight",
+            }:
+                logical_key = f"model_pp0.{name}"
+            if name in tied_keys:
+                if not sharded_key_prefix.startswith("model_pp"):
+                    raise RuntimeError(
+                        "PP-tied nonpersistent checkpoint buffer requires a "
+                        f"model_pp prefix; got {sharded_key_prefix!r}."
+                    )
+                logical_key = f"model_pp0.{tied_keys[name]}"
+            logical_keys.add(logical_key)
+    return logical_keys
 
 
 def _chunk_sharded_state_dict(
