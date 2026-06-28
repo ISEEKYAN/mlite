@@ -669,8 +669,19 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
+        reduced_outputs = (
+            []
+            if (loss_function is not None or forward_only)
+            and self.is_mp_src_rank_with_outputs()
+            else None
+        )
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, forward_only=forward_only)
+            runtime_loss_fn = self._make_runtime_loss_fn(
+                loss_function,
+                forward_only=forward_only,
+                num_microbatches=num_micro_batches,
+                output_lst=reduced_outputs,
+            )
 
         result = self.runtime.forward_backward(
             self.handle,
@@ -679,19 +690,29 @@ class MegatronLiteEngine(BaseEngine):
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
         )
+        if reduced_outputs is not None:
+            if (
+                forward_only
+                and self.engine_config.pp == 1
+                and result.model_output.log_probs is None
+            ):
+                raise ValueError("Megatron Lite forward-only result must contain token log_probs.")
+            return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
         micro_outputs = metrics.pop("_micro_outputs", None)
         if micro_outputs is not None and self.is_mp_src_rank_with_outputs():
             return postprocess_batch_func(output_lst=micro_outputs, indices=indices, data=data)
-        loss = float(metrics.get("loss", 0.0))
+        loss = metrics.pop("loss", 0.0)
+        losses = [float(value) for value in loss] if isinstance(loss, list) else [float(loss)]
         return {
             "model_output": {},
-            "loss": [loss],
+            "loss": losses,
             # Pass Metric aggregators through unchanged (reduce_metrics folds them);
             # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
                 key: value
-                if (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                if isinstance(value, list)
+                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
                 else [value]
                 for key, value in metrics.items()
             },
@@ -779,7 +800,14 @@ class MegatronLiteEngine(BaseEngine):
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
-    def _make_runtime_loss_fn(self, loss_function, *, forward_only: bool):
+    def _make_runtime_loss_fn(
+        self,
+        loss_function,
+        *,
+        forward_only: bool,
+        num_microbatches: int,
+        output_lst: list[dict[str, Any]] | None = None,
+    ):
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -808,7 +836,21 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
-            return loss, metrics
+            if output_lst is not None:
+                output_lst.append(
+                    {
+                        "model_output": model_output,
+                        "loss": float(loss.detach().item()),
+                        "metrics": metrics,
+                    }
+                )
+            # Megatron schedules always average the backward tensor across
+            # microbatches. VERL losses are already contributions normalized
+            # against the logical global batch, so mirror VERL's Megatron
+            # postprocess hook: compensate the schedule while reporting the
+            # original loss and metrics through ``output_lst`` above.
+            backward_loss = loss * num_microbatches if loss_function is not None else loss
+            return backward_loss, metrics
 
         return _loss_fn
 

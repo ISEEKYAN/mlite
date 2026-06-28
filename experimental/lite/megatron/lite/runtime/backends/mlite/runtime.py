@@ -133,6 +133,25 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
     )
 
 
+def _merge_microbatch_metrics(metrics_by_microbatch: list[dict]) -> dict:
+    """Preserve every microbatch value while honoring metric accumulator objects."""
+    merged: dict = {}
+    for micro_metrics in metrics_by_microbatch:
+        for key, value in micro_metrics.items():
+            if key not in merged:
+                init_list = getattr(value, "init_list", None)
+                if callable(init_list):
+                    accumulator = init_list()
+                    accumulator.append(value)
+                    merged[key] = accumulator
+                else:
+                    merged[key] = [value]
+                continue
+            accumulator = merged[key]
+            accumulator.append(value)
+    return merged
+
+
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
@@ -428,6 +447,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 loss_fn=loss_fn,
                 forward_only=forward_only,
             )
+            pipeline_loss_values = [item["loss"] for item in outputs if "loss" in item]
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
@@ -441,6 +461,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
             out = {"loss": loss_t.squeeze(0)}
         else:
+            pipeline_loss_values = []
             out = run_microbatch_loop(
                 handle._model,
                 data_iter,
@@ -459,21 +480,28 @@ class MegatronLiteRuntime(RuntimeBase):
                 finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
-        loss_val = (
-            loss_tensor.item()
-            if isinstance(loss_tensor, torch.Tensor)
-            else float(loss_tensor or 0.0)
-        )
-        metrics: dict = {"loss": loss_val}
-        for m in out.get("_loss_fn_metrics", []) if out else []:
-            for k, v in m.items():
-                if k not in metrics:
-                    metrics[k] = v
+        loss_values = pipeline_loss_values or (out.get("_loss_fn_losses", []) if out else [])
+        if loss_values:
+            micro_losses = [
+                value.item() if isinstance(value, torch.Tensor) else float(value)
+                for value in loss_values
+            ]
+            loss_metric: float | list[float] = sum(micro_losses) / num_microbatches
+        else:
+            loss_metric = (
+                loss_tensor.item()
+                if isinstance(loss_tensor, torch.Tensor)
+                else float(loss_tensor or 0.0)
+            )
+        metrics: dict = {"loss": loss_metric}
+        all_loss_fn_metrics = out.get("_loss_fn_metrics", []) if out else []
+        metrics.update(_merge_microbatch_metrics(all_loss_fn_metrics))
         if ps.pp_size > 1:
-            for item in outputs:
-                for k, v in item.get("metrics", {}).items():
-                    if k not in metrics:
-                        metrics[k] = v
+            metrics.update(
+                _merge_microbatch_metrics(
+                    [item["metrics"] for item in outputs if item.get("metrics")]
+                )
+            )
             metrics["_micro_outputs"] = outputs
 
         return ForwardResult(

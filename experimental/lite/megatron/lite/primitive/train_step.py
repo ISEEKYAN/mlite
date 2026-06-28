@@ -47,6 +47,7 @@ def run_microbatch_loop(
             pipeline path, which already threads ``forward_only`` to skip backward.
     """
     last_out = None
+    all_losses: list[torch.Tensor] = []
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
@@ -65,11 +66,13 @@ def run_microbatch_loop(
             if not forward_only:
                 (loss / num_microbatches).backward()
             out["loss"] = loss.detach()
+            all_losses.append(loss.detach())
             all_metrics.append(metrics)
         elif not forward_only:
             (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:
+        last_out["_loss_fn_losses"] = all_losses
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
 
