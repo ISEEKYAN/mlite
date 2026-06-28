@@ -407,6 +407,12 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     loaded_optimizer.load_state_dict(state)
     loaded_state = loaded_optimizer.state_dict()
 
+    torch.testing.assert_close(
+        loaded_param,
+        state["master_params"][0].to(dtype=torch.bfloat16),
+        atol=0.0,
+        rtol=0.0,
+    )
     assert loaded_state["step_count"] == state["step_count"]
     for key in ("master_params", "exp_avgs", "exp_avg_sqs", "steps"):
         assert len(loaded_state[key]) == len(state[key])
