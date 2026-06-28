@@ -339,34 +339,178 @@ def _configure_attention_backend(
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    model = getattr(chunk, "model", None)
+    """Return the trunk and MTP transformer units owned by one model chunk.
+
+    ``build_model`` constructs bare :class:`DeepseekV4Model` chunks, while
+    older callers may still provide the former ``chunk.model`` wrapper.  The
+    wrapper-only lookup used here previously made every configured activation
+    recompute/offload policy a silent no-op for the native bare-model path.
+    """
+
+    model = getattr(chunk, "model", chunk)
     if model is None:
-        return []
-    layers = list(getattr(model, "layers", {}).values())
-    mtp_layers = list(getattr(model, "mtp", []))
+        model = chunk
+
+    def _modules(value: Any, *, field_name: str) -> list[nn.Module]:
+        if value is None:
+            return []
+        if isinstance(value, nn.ModuleDict):
+            modules = list(value.values())
+        elif isinstance(value, (nn.ModuleList, list, tuple)):
+            modules = list(value)
+        else:
+            raise TypeError(
+                "DeepSeek V4 activation memory controls require "
+                f"{field_name} to be a ModuleDict/ModuleList/sequence, got "
+                f"{type(value).__name__}."
+            )
+        if not all(isinstance(module, nn.Module) for module in modules):
+            raise TypeError(f"DeepSeek V4 {field_name} contains a non-module entry.")
+        return modules
+
+    if not hasattr(model, "layers"):
+        raise TypeError(
+            "DeepSeek V4 activation memory controls require every chunk to "
+            "expose a layers container."
+        )
+    layers = _modules(model.layers, field_name="layers")
+    mtp_layers = _modules(getattr(model, "mtp", None), field_name="mtp")
     return [*layers, *mtp_layers]
+
+
+def _validate_activation_module_names(
+    module_names: list[str], *, control: str, allow_full: bool
+) -> None:
+    if not isinstance(module_names, list) or not all(
+        isinstance(module_name, str) and module_name for module_name in module_names
+    ):
+        raise TypeError(
+            f"DeepSeek V4 {control} selectors must be a list of non-empty strings."
+        )
+    if len(module_names) != len(set(module_names)):
+        raise ValueError(
+            f"DeepSeek V4 {control} contains duplicate module selectors: "
+            f"{module_names}."
+        )
+    allowed = set(MODULE_MAP)
+    if allow_full:
+        allowed.add("full")
+    unknown = sorted(set(module_names) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Unsupported DeepSeek V4 {control} module selectors {unknown}; "
+            f"supported selectors are {sorted(allowed)}."
+        )
+    if "full" in module_names and len(module_names) != 1:
+        raise ValueError(f"DeepSeek V4 {control} selector 'full' must be used alone.")
+    if {"attn", "core_attn"}.issubset(module_names):
+        raise ValueError(
+            f"DeepSeek V4 {control} selectors 'attn' and 'core_attn' target "
+            "the same module and cannot be combined."
+        )
+    nested_moe = sorted({"experts", "router"} & set(module_names))
+    if "moe" in module_names and nested_moe:
+        raise ValueError(
+            f"DeepSeek V4 {control} selector 'moe' contains {nested_moe}; "
+            "parent and child selectors cannot be combined."
+        )
+
+
+def _is_valid_empty_pipeline_chunk(chunk: nn.Module) -> bool:
+    model = getattr(chunk, "model", chunk)
+    if model is None:
+        model = chunk
+    layer_indices = getattr(model, "layer_indices", None)
+    ps = getattr(model, "ps", None)
+    pp_size = getattr(ps, "pp_size", 1)
+    return (
+        isinstance(layer_indices, (list, tuple))
+        and not layer_indices
+        and isinstance(pp_size, int)
+        and pp_size > 1
+    )
+
+
+def _apply_activation_memory_controls(
+    chunks: list[nn.Module], *, recompute_spec: list[str], offload_spec: list[str]
+) -> None:
+    """Apply DS4 activation policies, failing closed instead of silently no-oping."""
+
+    _validate_activation_module_names(
+        recompute_spec, control="recompute", allow_full=True
+    )
+    # The shared primitive named ``apply_offload`` currently performs
+    # recomputation rather than CPU offload.  Keep DS4 fail-closed until a real
+    # implementation has numerical and memory evidence.
+    _validate_activation_module_names(offload_spec, control="offload", allow_full=True)
+    if offload_spec:
+        raise NotImplementedError(
+            "DeepSeek V4 activation offload is not implemented: the shared "
+            "primitive currently performs activation recompute rather than "
+            "CPU offload. Use recompute or leave offload empty."
+        )
+    if not recompute_spec and not offload_spec:
+        return
+    if not chunks:
+        raise RuntimeError(
+            "DeepSeek V4 activation recompute was requested with no model chunks."
+        )
+
+    units_by_chunk = [_iter_transformer_units(chunk) for chunk in chunks]
+    for chunk, units in zip(chunks, units_by_chunk, strict=True):
+        if not units and not _is_valid_empty_pipeline_chunk(chunk):
+            raise RuntimeError(
+                "DeepSeek V4 activation recompute was requested, but a non-pipeline-empty "
+                "model chunk exposes no transformer or MTP units."
+            )
+
+    if recompute_spec:
+        for units in units_by_chunk:
+            if units:
+                apply_recompute(units, recompute_spec, MODULE_MAP)
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
     """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
 
-    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
-    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
+    PP / EP / CP are inherited from the Kimi skeleton and work; TP>1 / ETP>1
+    and VPP are unsupported.  Mirrors GLM-5's tensor-parallel gate while
+    making the shared pipeline-layout restriction explicit before init.
     """
     etp = 1 if p.etp is None else p.etp
     if p.tp > 1:
         raise NotImplementedError(
             "DeepSeek V4 native CSA attention does not support tensor parallelism; "
-            f"got tp={p.tp}. Use tp=1 (PP/VPP/EP/CP are supported)."
+            f"got tp={p.tp}. Use tp=1 (PP/EP/CP are supported)."
         )
     if etp > 1:
         raise NotImplementedError(
             "DeepSeek V4 native CSA attention does not support expert tensor parallelism; "
             f"got etp={etp}. Use etp=1 (EP is supported)."
         )
+    if p.vpp != 1:
+        raise NotImplementedError(
+            "DeepSeek V4 virtual pipeline parallelism is not supported; "
+            f"got vpp={p.vpp}. Use vpp=1."
+        )
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+    offload_spec = parse_recompute_spec(impl_cfg.offload)
+    # Reject invalid policies before distributed initialization or CUDA model
+    # allocation.  The application helper validates again for direct callers.
+    _validate_activation_module_names(
+        recompute_spec, control="recompute", allow_full=True
+    )
+    _validate_activation_module_names(offload_spec, control="offload", allow_full=True)
+    if offload_spec:
+        raise NotImplementedError(
+            "DeepSeek V4 activation offload is not implemented: the shared "
+            "primitive currently performs activation recompute rather than "
+            "CPU offload. Use recompute or leave offload empty."
+        )
+
     from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
 
     p = impl_cfg.parallel
@@ -426,16 +570,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     synchronize_mtp_embedding_parameters(chunks, ps, enabled=mtp_enable)
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
 
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
-    if recompute_spec:
-        for chunk in chunks:
-            apply_recompute(_iter_transformer_units(chunk), recompute_spec, MODULE_MAP)
-
-    if impl_cfg.offload:
-        from megatron.lite.primitive.recompute import apply_offload
-
-        for chunk in chunks:
-            apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
+    _apply_activation_memory_controls(
+        chunks, recompute_spec=recompute_spec, offload_spec=offload_spec
+    )
 
     optimizer = None
     finalize_grads = None
