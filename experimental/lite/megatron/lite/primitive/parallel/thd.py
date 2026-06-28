@@ -9,7 +9,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
 
 
@@ -57,20 +56,29 @@ def _make_packed_seq_params(
     )
 
 
-def _slice_along_dim(tensor: torch.Tensor, dim: int, start: int, end: int) -> torch.Tensor:
+def _slice_along_dim(
+    tensor: torch.Tensor, dim: int, start: int, end: int
+) -> torch.Tensor:
     index = [slice(None)] * tensor.dim()
     index[dim] = slice(start, end)
     return tensor[tuple(index)]
 
 
-def _assign_along_dim(dst: torch.Tensor, dim: int, start: int, src: torch.Tensor) -> None:
+def _assign_along_dim(
+    dst: torch.Tensor, dim: int, start: int, src: torch.Tensor
+) -> None:
     index = [slice(None)] * dst.dim()
     index[dim] = slice(start, start + src.size(dim))
     dst[tuple(index)] = src
 
 
 def _split_full_to_cp_local(
-    tensor: torch.Tensor, *, cu_seqlens_padded: torch.Tensor, cp_size: int, cp_rank: int, dim: int
+    tensor: torch.Tensor,
+    *,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    dim: int,
 ) -> torch.Tensor:
     if cp_size <= 1:
         return tensor
@@ -90,7 +98,10 @@ def _split_full_to_cp_local(
         local_start = full_start // cp_size
 
         first = _slice_along_dim(
-            tensor, dim, full_start + cp_rank * chunk, full_start + (cp_rank + 1) * chunk
+            tensor,
+            dim,
+            full_start + cp_rank * chunk,
+            full_start + (cp_rank + 1) * chunk,
         )
         second = _slice_along_dim(
             tensor, dim, full_end - (cp_rank + 1) * chunk, full_end - cp_rank * chunk
@@ -102,7 +113,11 @@ def _split_full_to_cp_local(
 
 
 def _reconstruct_full_from_cp_parts(
-    parts: list[torch.Tensor], *, cu_seqlens_padded: torch.Tensor, cp_size: int, dim: int
+    parts: list[torch.Tensor],
+    *,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    dim: int,
 ) -> torch.Tensor:
     if cp_size <= 1:
         return parts[0]
@@ -123,7 +138,9 @@ def _reconstruct_full_from_cp_parts(
 
         for rank, part in enumerate(parts):
             first = _slice_along_dim(part, dim, local_start, local_start + chunk)
-            second = _slice_along_dim(part, dim, local_start + chunk, local_start + 2 * chunk)
+            second = _slice_along_dim(
+                part, dim, local_start + chunk, local_start + 2 * chunk
+            )
             _assign_along_dim(full, dim, full_start + rank * chunk, first)
             _assign_along_dim(full, dim, full_end - (rank + 1) * chunk, second)
 
@@ -131,7 +148,11 @@ def _reconstruct_full_from_cp_parts(
 
 
 def reconstruct_packed_from_cp_parts(
-    parts: list[torch.Tensor], *, cu_seqlens_padded: torch.Tensor, cp_size: int, dim: int
+    parts: list[torch.Tensor],
+    *,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    dim: int,
 ) -> torch.Tensor:
     """Reconstruct a full packed THD tensor from CP-local zigzag parts."""
     return _reconstruct_full_from_cp_parts(
@@ -140,11 +161,20 @@ def reconstruct_packed_from_cp_parts(
 
 
 def split_packed_to_cp_local(
-    tensor: torch.Tensor, *, cu_seqlens_padded: torch.Tensor, cp_size: int, cp_rank: int, dim: int
+    tensor: torch.Tensor,
+    *,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    dim: int,
 ) -> torch.Tensor:
     """Slice a full packed THD tensor back to one CP rank's zigzag shard."""
     return _split_full_to_cp_local(
-        tensor, cu_seqlens_padded=cu_seqlens_padded, cp_size=cp_size, cp_rank=cp_rank, dim=dim
+        tensor,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        dim=dim,
     )
 
 
@@ -165,7 +195,9 @@ def _sequence_dim(tensor: torch.Tensor) -> int:
     return tensor.dim() - 1 if tensor.dim() > 1 else 0
 
 
-def _with_cp_metadata(packed_seq_params: Any, *, cp_size: int, cp_rank: int, cp_group: Any):
+def _with_cp_metadata(
+    packed_seq_params: Any, *, cp_size: int, cp_rank: int, cp_group: Any
+):
     updated = copy(packed_seq_params)
     updated.local_cp_size = cp_size
     updated.cp_rank = cp_rank
@@ -217,7 +249,11 @@ def prepare_packed_thd_for_context_parallel(
         if tensor is None:
             local_tensors.append(None)
             continue
-        dim = _sequence_dim(tensor) if dims is None or dims[idx] is None else int(dims[idx])
+        dim = (
+            _sequence_dim(tensor)
+            if dims is None or dims[idx] is None
+            else int(dims[idx])
+        )
         local_tensors.append(
             _split_full_to_cp_local(
                 tensor,
@@ -228,7 +264,9 @@ def prepare_packed_thd_for_context_parallel(
             )
         )
     return (
-        _with_cp_metadata(packed_seq_params, cp_size=cp_size, cp_rank=cp_rank, cp_group=cp_group),
+        _with_cp_metadata(
+            packed_seq_params, cp_size=cp_size, cp_rank=cp_rank, cp_group=cp_group
+        ),
         tuple(local_tensors),
     )
 
@@ -314,12 +352,17 @@ def unpack_thd_to_nested(
         flat = output
 
     if meta.cp_size > 1:
-        parts = _all_gather_cp_tensor(flat, cp_size=meta.cp_size, cp_group=meta.cp_group)
+        parts = _all_gather_cp_tensor(
+            flat, cp_size=meta.cp_size, cp_group=meta.cp_group
+        )
         if contiguous:
             flat = torch.cat(parts, dim=0)
         else:
             flat = _reconstruct_full_from_cp_parts(
-                parts, cu_seqlens_padded=meta.cu_seqlens_padded, cp_size=meta.cp_size, dim=0
+                parts,
+                cu_seqlens_padded=meta.cu_seqlens_padded,
+                cp_size=meta.cp_size,
+                dim=0,
             )
 
     pieces = []
@@ -352,7 +395,9 @@ def _roll_packed_thd_left_local(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dim = dims if dims >= 0 else tensor.dim() + dims
     if dim < 0 or dim >= tensor.dim():
-        raise ValueError(f"Invalid roll dim {dims} for tensor with {tensor.dim()} dims.")
+        raise ValueError(
+            f"Invalid roll dim {dims} for tensor with {tensor.dim()} dims."
+        )
 
     rolled = tensor.clone()
     for idx in range(int(cu_seqlens_padded.numel()) - 1):
@@ -395,7 +440,9 @@ def roll_packed_thd_left(
 
     dim = dims if dims >= 0 else tensor.dim() + dims
     if cp_size <= 1:
-        return _roll_packed_thd_left_local(tensor, cu_seqlens_padded=cu_seqlens_padded, dims=dim)
+        return _roll_packed_thd_left_local(
+            tensor, cu_seqlens_padded=cu_seqlens_padded, dims=dim
+        )
 
     parts = _all_gather_cp_tensor(tensor, cp_size=cp_size, cp_group=cp_group)
     full = _reconstruct_full_from_cp_parts(
@@ -405,7 +452,11 @@ def roll_packed_thd_left(
         full, cu_seqlens_padded=cu_seqlens_padded, dims=dim
     )
     local = _split_full_to_cp_local(
-        rolled_full, cu_seqlens_padded=cu_seqlens_padded, cp_size=cp_size, cp_rank=cp_rank, dim=dim
+        rolled_full,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        dim=dim,
     )
     return local, token_sum
 
@@ -456,7 +507,9 @@ def pack_nested_thd(
     pad_size = (align_size - lengths % align_size) % align_size
     padded_lengths = lengths + pad_size
 
-    cu_seqlens_padded = torch.zeros(lengths.numel() + 1, dtype=torch.int32, device=device)
+    cu_seqlens_padded = torch.zeros(
+        lengths.numel() + 1, dtype=torch.int32, device=device
+    )
     cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
     cu_seqlens = torch.zeros_like(cu_seqlens_padded)
     cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
@@ -466,7 +519,9 @@ def pack_nested_thd(
 
     packed_input = torch.zeros(total_local, dtype=input_ids.dtype, device=device)
     packed_labels = (
-        torch.zeros(total_local, dtype=labels.dtype, device=device) if labels is not None else None
+        torch.zeros(total_local, dtype=labels.dtype, device=device)
+        if labels is not None
+        else None
     )
     packed_loss_mask = (
         torch.zeros(total_local, dtype=loss_mask.dtype, device=device)
@@ -496,10 +551,14 @@ def pack_nested_thd(
         seq_loss_mask = None
         if loss_mask is not None:
             assert packed_loss_mask is not None
-            seq_loss_mask = torch.zeros(padded_length, dtype=loss_mask.dtype, device=device)
+            seq_loss_mask = torch.zeros(
+                padded_length, dtype=loss_mask.dtype, device=device
+            )
             seq_loss_mask[:length] = loss_mask[idx]
             if roll_loss_mask and length > 0:
-                seq_loss_mask[:length] = torch.roll(seq_loss_mask[:length], shifts=-1, dims=0)
+                seq_loss_mask[:length] = torch.roll(
+                    seq_loss_mask[:length], shifts=-1, dims=0
+                )
                 seq_loss_mask[length - 1] = 0
         seq_positions = torch.zeros(padded_length, dtype=torch.long, device=device)
         seq_positions[:length] = torch.arange(length, dtype=torch.long, device=device)
@@ -533,7 +592,9 @@ def pack_nested_thd(
                 else seq_labels
             )
             assert packed_labels is not None
-            packed_labels[local_start : local_start + local_labels.numel()] = local_labels
+            packed_labels[local_start : local_start + local_labels.numel()] = (
+                local_labels
+            )
         if seq_loss_mask is not None:
             local_loss_mask = (
                 _split_full_to_cp_local(
@@ -549,13 +610,17 @@ def pack_nested_thd(
                 else seq_loss_mask
             )
             assert packed_loss_mask is not None
-            packed_loss_mask[local_start : local_start + local_loss_mask.numel()] = local_loss_mask
+            packed_loss_mask[local_start : local_start + local_loss_mask.numel()] = (
+                local_loss_mask
+            )
         position_ids[full_start : full_start + padded_length] = seq_positions
 
     return PackedTHDBatch(
         input_ids=packed_input.unsqueeze(0),
         labels=packed_labels.unsqueeze(0) if packed_labels is not None else None,
-        loss_mask=(packed_loss_mask.unsqueeze(0) if packed_loss_mask is not None else None),
+        loss_mask=(
+            packed_loss_mask.unsqueeze(0) if packed_loss_mask is not None else None
+        ),
         position_ids=position_ids.unsqueeze(0),
         packed_seq_params=_make_packed_seq_params(
             cu_seqlens=cu_seqlens,
@@ -574,7 +639,9 @@ def pack_nested_thd(
     )
 
 
-def unpack_packed_thd_to_nested(output: torch.Tensor, batch: PackedTHDBatch) -> torch.Tensor:
+def unpack_packed_thd_to_nested(
+    output: torch.Tensor, batch: PackedTHDBatch
+) -> torch.Tensor:
     """Unpack ``[1, total_padded, ...]`` THD model output back to jagged form."""
 
     if output.dim() >= 2 and output.shape[0] == 1:
@@ -586,9 +653,14 @@ def unpack_packed_thd_to_nested(output: torch.Tensor, batch: PackedTHDBatch) -> 
 
     if batch.cp_size > 1:
         dim = 0
-        parts = _all_gather_cp_tensor(flat, cp_size=batch.cp_size, cp_group=batch.cp_group)
+        parts = _all_gather_cp_tensor(
+            flat, cp_size=batch.cp_size, cp_group=batch.cp_group
+        )
         flat = _reconstruct_full_from_cp_parts(
-            parts, cu_seqlens_padded=batch.cu_seqlens_padded, cp_size=batch.cp_size, dim=dim
+            parts,
+            cu_seqlens_padded=batch.cu_seqlens_padded,
+            cp_size=batch.cp_size,
+            dim=dim,
         )
 
     pieces = []

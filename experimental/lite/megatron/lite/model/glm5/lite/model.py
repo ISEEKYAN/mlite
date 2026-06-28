@@ -448,10 +448,7 @@ class _LocalLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
         self.linear = te.Linear(
-            in_features,
-            out_features,
-            bias=False,
-            params_dtype=torch.bfloat16,
+            in_features, out_features, bias=False, params_dtype=torch.bfloat16
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -481,17 +478,9 @@ class MoELayer(nn.Module):
             compute_aux_loss=True,
             use_pre_softmax=True,
         )
-        self.experts = Experts(
-            config,
-            ps,
-            fp8=fp8,
-            moe_act_recompute=moe_act_recompute,
-        )
+        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
-            config.num_experts,
-            config.hidden_size,
-            ps,
-            use_deepep=use_deepep,
+            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
         )
         self.shared_expert = SharedExpert(config, ps)
 
@@ -579,10 +568,7 @@ class Glm5Layer(nn.Module):
 
 
 def _roll_mtp_left(
-    tensor: torch.Tensor,
-    *,
-    packed_seq_params=None,
-    dims: int = -1,
+    tensor: torch.Tensor, *, packed_seq_params=None, dims: int = -1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if packed_seq_params is not None:
         return roll_packed_thd_left(
@@ -777,8 +763,7 @@ def _dsa_index_share_decoder_layer_groups(config: Glm5Config) -> list[list[int]]
 
 
 def _local_dsa_index_share_consumer_counts(
-    layers: nn.ModuleList,
-    mtp: Glm5MTPBlock | None,
+    layers: nn.ModuleList, mtp: Glm5MTPBlock | None
 ) -> dict[int, int]:
     """Count local shared-layer executions for each 1-indexed source layer."""
     consumer_counts: dict[int, int] = {}
@@ -1138,14 +1123,10 @@ class Glm5Model(nn.Module):
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
             mtp_labels, _ = _roll_mtp_left(
-                mtp_labels,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
+                mtp_labels, packed_seq_params=packed_seq_params, dims=-1
             )
             mtp_loss_mask, num_tokens = _roll_mtp_left(
-                mtp_loss_mask,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
+                mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1
             )
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
@@ -1176,8 +1157,7 @@ class Glm5Model(nn.Module):
                 len(mtp_hidden_states), 1
             )
             hidden_states = MTPLossAutoScaler.apply(
-                hidden_states,
-                mtp_loss_scale * token_loss / num_tokens,
+                hidden_states, mtp_loss_scale * token_loss / num_tokens
             )
 
         if not mtp_loss_values:

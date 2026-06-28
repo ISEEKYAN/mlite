@@ -151,11 +151,7 @@ def _torch_indexer_topk(
     k = k_indexer.permute(1, 0, 2).float()
     w = weights.permute(1, 0, 2).float()
     scores = _indexer_score_matrix(
-        q,
-        k,
-        w,
-        ratio=ratio,
-        indexer_softmax_scale=indexer_softmax_scale,
+        q, k, w, ratio=ratio, indexer_softmax_scale=indexer_softmax_scale
     )
     return _topk_from_score_matrix(scores, topk)
 
@@ -358,21 +354,13 @@ def test_glm52_release_vllm_hf_helper_and_mlite_indexer_rope_authority(
         )
         raw_k = indexer.k_norm(indexer.wk(hidden_states)).unsqueeze(2)
         raw_q_rot, raw_q_pass = torch.split(
-            raw_q,
-            [indexer.qk_rope_head_dim, indexer.qk_nope_head_dim],
-            dim=-1,
+            raw_q, [indexer.qk_rope_head_dim, indexer.qk_nope_head_dim], dim=-1
         )
         raw_k_rot, raw_k_pass = torch.split(
-            raw_k,
-            [indexer.qk_rope_head_dim, indexer.qk_nope_head_dim],
-            dim=-1,
+            raw_k, [indexer.qk_rope_head_dim, indexer.qk_nope_head_dim], dim=-1
         )
         hf_q_rot, hf_k_rot = hf_impl.apply_rotary_pos_emb_interleave(
-            raw_q_rot,
-            raw_k_rot,
-            cos,
-            sin,
-            unsqueeze_dim=2,
+            raw_q_rot, raw_k_rot, cos, sin, unsqueeze_dim=2
         )
         hf_q = torch.cat((hf_q_rot, raw_q_pass), dim=-1)
         hf_k = torch.cat((hf_k_rot, raw_k_pass), dim=-1).squeeze(2)
@@ -389,11 +377,7 @@ def test_glm52_release_vllm_hf_helper_and_mlite_indexer_rope_authority(
         vllm_q = torch.cat((vllm_q_rot, raw_q_pass), dim=-1)
         vllm_k = torch.cat((vllm_k_rot, raw_k_pass), dim=-1).squeeze(2)
         vanilla_q_rot, vanilla_k_rot = hf_impl.apply_rotary_pos_emb(
-            raw_q_rot,
-            raw_k_rot,
-            cos,
-            sin,
-            unsqueeze_dim=2,
+            raw_q_rot, raw_k_rot, cos, sin, unsqueeze_dim=2
         )
         vanilla_q = torch.cat((vanilla_q_rot, raw_q_pass), dim=-1)
         vanilla_k = torch.cat((vanilla_k_rot, raw_k_pass), dim=-1).squeeze(2)
@@ -404,11 +388,7 @@ def test_glm52_release_vllm_hf_helper_and_mlite_indexer_rope_authority(
     torch.testing.assert_close(mlite_q, hf_q, rtol=0.0, atol=1.0e-12)
     torch.testing.assert_close(mlite_k, hf_k, rtol=0.0, atol=1.0e-12)
     authority_scores = _indexer_score_matrix(
-        hf_q,
-        hf_k,
-        mlite_weights,
-        ratio=1,
-        indexer_softmax_scale=indexer.softmax_scale,
+        hf_q, hf_k, mlite_weights, ratio=1, indexer_softmax_scale=indexer.softmax_scale
     )
     vllm_scores = _indexer_score_matrix(
         vllm_q,
@@ -440,12 +420,7 @@ def test_glm52_release_vllm_hf_helper_and_mlite_indexer_rope_authority(
     recorded_kernel_scores: list[torch.Tensor] = []
 
     def _recording_indexer_topk(
-        q_indexer,
-        k_indexer,
-        weights,
-        topk,
-        ratio=1,
-        indexer_softmax_scale=1.0,
+        q_indexer, k_indexer, weights, topk, ratio=1, indexer_softmax_scale=1.0
     ):
         scores = _indexer_score_matrix(
             q_indexer.permute(1, 0, 2, 3),

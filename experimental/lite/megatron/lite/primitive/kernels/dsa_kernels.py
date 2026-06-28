@@ -58,18 +58,12 @@ def _bottom_right_valid_kv_counts(
     q_positions = torch.arange(seq_q, device=device, dtype=torch.int64)
     q_global_start = seq_k * ratio - seq_q
     return torch.div(
-        q_global_start + q_positions + 1,
-        ratio,
-        rounding_mode="floor",
+        q_global_start + q_positions + 1, ratio, rounding_mode="floor"
     ).clamp(min=0, max=seq_k)
 
 
 def _estimate_dsa_score_peak_bytes(
-    batch: int,
-    seq_q: int,
-    seq_k: int,
-    *,
-    dense_loss: bool,
+    batch: int, seq_q: int, seq_k: int, *, dense_loss: bool
 ) -> int:
     """Estimate unavoidable FP32 full-score storage for the current kernels."""
 
@@ -80,12 +74,7 @@ def _estimate_dsa_score_peak_bytes(
 
 
 def _guard_dsa_score_memory(
-    tensor: Tensor,
-    batch: int,
-    seq_q: int,
-    seq_k: int,
-    *,
-    dense_loss: bool,
+    tensor: Tensor, batch: int, seq_q: int, seq_k: int, *, dense_loss: bool
 ) -> None:
     """Fail before a predictable full-score OOM with an actionable message."""
 
@@ -163,9 +152,9 @@ def _dsa_fwd_flash_mla(
     Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
     the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
     """
-    assert not (indexer_topk > 0 and topk_length is not None), (
-        "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
-    )
+    assert not (
+        indexer_topk > 0 and topk_length is not None
+    ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
     _ensure_flash_mla()
 
     _total_S_q, _H, _D = q.shape
@@ -747,10 +736,7 @@ def _scale_target_for_canonical_log_eps_backward_(
 
 
 def _scale_dense_target_for_canonical_log_eps_backward_(
-    attn_score: Tensor,
-    index_score: Tensor,
-    index_lse: Tensor,
-    ratio: int,
+    attn_score: Tensor, index_score: Tensor, index_lse: Tensor, ratio: int
 ) -> Tensor:
     """Apply the canonical log-epsilon score-grad factor in bounded blocks."""
 
@@ -911,16 +897,9 @@ def _compute_full_causal_attn_lse(
     fp32_bytes = torch.empty((), dtype=torch.float32).element_size()
     max_score_elements = max_score_bytes // fp32_bytes
     score_elements_per_qk = batch * q_heads
-    keys_per_block = max(
-        1,
-        min(seq_k, max_score_elements // score_elements_per_qk),
-    )
+    keys_per_block = max(1, min(seq_k, max_score_elements // score_elements_per_qk))
     queries_per_block = max(
-        1,
-        min(
-            seq_q,
-            max_score_elements // (score_elements_per_qk * keys_per_block),
-        ),
+        1, min(seq_q, max_score_elements // (score_elements_per_qk * keys_per_block))
     )
     qheads_per_kv_head = q_heads // kv_heads
     k_f32 = k_attn_bshd.detach().float()
@@ -954,8 +933,7 @@ def _compute_full_causal_attn_lse(
             )
             causal = key_positions.view(1, -1) < valid_kv.view(-1, 1)
             scores.masked_fill_(
-                ~causal.view(1, q_end - q_start, 1, 1, k_end - k_start),
-                -torch.inf,
+                ~causal.view(1, q_end - q_start, 1, 1, k_end - k_start), -torch.inf
             )
             block_lse = torch.logaddexp(block_lse, torch.logsumexp(scores, dim=-1))
         block_lse = block_lse.reshape(batch, q_end - q_start, q_heads)
@@ -981,8 +959,7 @@ def _dense_kl_block_shape(batch: int, seq_q: int, seq_k: int) -> tuple[int, int]
     elements_per_qk = max(batch, 1)
     keys_per_block = max(1, min(seq_k, max_elements // elements_per_qk))
     queries_per_block = max(
-        1,
-        min(seq_q, max_elements // (elements_per_qk * keys_per_block)),
+        1, min(seq_q, max_elements // (elements_per_qk * keys_per_block))
     )
     return queries_per_block, keys_per_block
 
@@ -1147,11 +1124,7 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
         n_comp = k_indexer.shape[0]
 
         _guard_dsa_score_memory(
-            query,
-            b,
-            sq,
-            n_comp,
-            dense_loss=loss_coeff > 0 and not sparse_loss,
+            query, b, sq, n_comp, dense_loss=loss_coeff > 0 and not sparse_loss
         )
 
         requested_topk = indexer_topk
@@ -1250,10 +1223,7 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
             # the complete causal KV axis. FlashMLA's sparse/indexer LSE is
             # selected-top-k-only and would make this target depend on top-k.
             full_attn_lse = _compute_full_causal_attn_lse(
-                q_attn_bshd,
-                k_attn_compressed_bsd.unsqueeze(2),
-                softmax_scale,
-                ratio,
+                q_attn_bshd, k_attn_compressed_bsd.unsqueeze(2), softmax_scale, ratio
             )
 
             attn_score, attn_l1norm = _compute_dense_attn_score(
@@ -1308,10 +1278,7 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
                 )
             else:
                 _scale_dense_target_for_canonical_log_eps_backward_(
-                    attn_score,
-                    index_score,
-                    index_lse,
-                    ratio,
+                    attn_score, index_score, index_lse, ratio
                 )
                 ig = _DSA.dense_indexer_backward_wrapper(
                     q_idx_bwd,

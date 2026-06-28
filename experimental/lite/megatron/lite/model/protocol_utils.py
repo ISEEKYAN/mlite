@@ -46,7 +46,9 @@ def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
         pieces.append(tensor.narrow(0, offset, length))
         offset += length
     if offset != tensor.numel():
-        raise ValueError(f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens.")
+        raise ValueError(
+            f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens."
+        )
     return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
 
 
@@ -87,7 +89,9 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     return kwargs
 
 
-def unpack_thd_forward_output(model, batch: PackedBatch, output: torch.Tensor) -> torch.Tensor:
+def unpack_thd_forward_output(
+    model, batch: PackedBatch, output: torch.Tensor
+) -> torch.Tensor:
     """Reverse a zigzag-CP THD model output back to jagged true-length form."""
     ps = _parallel_state(model)
     meta = thd_pack_meta(
@@ -99,7 +103,9 @@ def unpack_thd_forward_output(model, batch: PackedBatch, output: torch.Tensor) -
     return unpack_thd_to_nested(output, meta, contiguous=False)
 
 
-def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs: bool = False) -> None:
+def add_loss_context_kwargs(
+    kwargs: dict[str, Any], *, include_return_log_probs: bool = False
+) -> None:
     loss_context = get_loss_context()
     if loss_context is None:
         return

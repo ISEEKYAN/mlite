@@ -499,18 +499,12 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
 
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
-            local_path=str(hf_path),
-            hf_config={"model_type": model_type},
-            mtp=None,
+            local_path=str(hf_path), hf_config={"model_type": model_type}, mtp=None
         ),
         engine_config=MegatronLiteEngineConfig(
             model_name=model_name,
             cp=world,
-            impl_cfg={
-                "use_thd": True,
-                "deterministic": False,
-                "mtp_enable": False,
-            },
+            impl_cfg={"use_thd": True, "deterministic": False, "mtp_enable": False},
             use_fused_kernels=False,
         ),
         optimizer_config=_optimizer_config(),

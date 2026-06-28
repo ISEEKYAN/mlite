@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-
 pytestmark = pytest.mark.mlite
 
 
@@ -36,10 +35,7 @@ def _half_split_reference(
 def _rotary_inputs(dsa, *, dtype: torch.dtype = torch.float64):
     position_ids = torch.tensor([[0, 3, 11, 29]], dtype=torch.long)
     cos, sin = dsa.build_rotary_embeddings(
-        position_ids=position_ids,
-        dim=8,
-        rope_theta=8_000_000.0,
-        dtype=dtype,
+        position_ids=position_ids, dim=8, rope_theta=8_000_000.0, dtype=dtype
     )
     values = torch.linspace(-2.5, 3.5, 2 * 4 * 3 * 8, dtype=dtype).reshape(2, 4, 3, 8)
     return values, cos.expand(2, -1, -1), sin.expand(2, -1, -1), position_ids
@@ -148,10 +144,7 @@ def test_dynamic_sparse_attention_main_rope_matches_independent_reference(
     )
     position_ids = torch.tensor([[0, 3, 11, 29]], dtype=torch.long)
     cos, sin = dsa.build_rotary_embeddings(
-        position_ids=position_ids,
-        dim=8,
-        rope_theta=8_000_000.0,
-        dtype=torch.float32,
+        position_ids=position_ids, dim=8, rope_theta=8_000_000.0, dtype=torch.float32
     )
     x = torch.linspace(-1.5, 2.0, 4 * 16, dtype=torch.float32).reshape(1, 4, 16)
 
@@ -200,10 +193,7 @@ def test_dsa_indexer_honors_its_independent_rope_layout_flag(
     )
     position_ids = torch.tensor([[0, 3, 11, 29]], dtype=torch.long)
     cos, sin = dsa.build_rotary_embeddings(
-        position_ids=position_ids,
-        dim=8,
-        rope_theta=8_000_000.0,
-        dtype=torch.float32,
+        position_ids=position_ids, dim=8, rope_theta=8_000_000.0, dtype=torch.float32
     )
     x = torch.linspace(-1.0, 1.0, 4 * 16, dtype=torch.float32).reshape(1, 4, 16)
     q_resid = torch.linspace(-0.5, 0.75, 4 * 8, dtype=torch.float32).reshape(1, 4, 8)

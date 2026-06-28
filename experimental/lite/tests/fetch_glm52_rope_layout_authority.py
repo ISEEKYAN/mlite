@@ -17,8 +17,7 @@ MAX_SOURCE_BYTES = 2 * 1024 * 1024
 
 def _download(url: str) -> bytes:
     request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "mlite-glm52-rope-authority/1"},
+        url, headers={"User-Agent": "mlite-glm52-rope-authority/1"}
     )
     with urllib.request.urlopen(request, timeout=120) as response:
         if response.status != 200:

@@ -395,8 +395,7 @@ def _shifted_external_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Te
     assert logits.shape == (_BATCH, _SEQ, _VOCAB)
     assert labels.shape == (_BATCH, _SEQ)
     return F.cross_entropy(
-        logits[:, :-1].float().reshape(-1, _VOCAB),
-        labels[:, 1:].reshape(-1),
+        logits[:, :-1].float().reshape(-1, _VOCAB), labels[:, 1:].reshape(-1)
     )
 
 
@@ -588,10 +587,7 @@ def test_glm52_transformers_512_adapted_production_layout_full_model_parity(
             assert attention.indexer is None
 
     input_ids = torch.tensor(
-        [
-            [3, 5, 7, 11, 13, 17, 19, 23, 29, 31],
-            [37, 41, 43, 47, 53, 59, 61, 67, 2, 4],
-        ],
+        [[3, 5, 7, 11, 13, 17, 19, 23, 29, 31], [37, 41, 43, 47, 53, 59, 61, 67, 2, 4]],
         dtype=torch.long,
     )
     labels = torch.tensor(
@@ -647,9 +643,7 @@ def test_glm52_transformers_512_adapted_production_layout_full_model_parity(
             return_dict=True,
         )
         lite_output = lite_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            packed_seq_params=None,
+            input_ids=input_ids, position_ids=position_ids, packed_seq_params=None
         )
     finally:
         for handle in [

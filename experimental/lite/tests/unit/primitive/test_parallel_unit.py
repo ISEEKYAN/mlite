@@ -23,7 +23,9 @@ pytestmark = pytest.mark.mlite
 
 def test_cp_zigzag_split_slice_and_reconstruct_match():
     tensor = torch.arange(16).reshape(1, 8, 2)
-    parts = [zigzag_split_for_cp(tensor, rank, cp_size=2, seq_dim=1) for rank in range(2)]
+    parts = [
+        zigzag_split_for_cp(tensor, rank, cp_size=2, seq_dim=1) for rank in range(2)
+    ]
 
     assert torch.equal(parts[0], tensor[:, [0, 1, 6, 7], :])
     assert torch.equal(parts[1], tensor[:, [2, 3, 4, 5], :])
@@ -63,7 +65,9 @@ def _ranks(pp_size: int, pp_layout=None) -> list[ParallelState]:
     ]
 
 
-def _layout_indices(num_layers: int, pp_size: int, *, pp_layout=None, **kw) -> list[list[int]]:
+def _layout_indices(
+    num_layers: int, pp_size: int, *, pp_layout=None, **kw
+) -> list[list[int]]:
     return [
         build_pipeline_chunk_layout(num_layers, ps, **kw).layer_indices
         for ps in _ranks(pp_size, pp_layout)
@@ -121,7 +125,9 @@ def test_pp_layout_accounts_for_head_tail_even_when_divisible():
 
 # --- Correctness matrix: real delivery counts x MTP{off,on} x PP{2,4,8} ---
 _REAL_LAYERS = {"deepseek_v4": 43, "kimi_k2": 61, "glm5": 78}
-_CORRECTNESS_CASES = [(m, pp, mtp) for m in _REAL_LAYERS for pp in (2, 4, 8) for mtp in (0, 1)]
+_CORRECTNESS_CASES = [
+    (m, pp, mtp) for m in _REAL_LAYERS for pp in (2, 4, 8) for mtp in (0, 1)
+]
 
 
 def _mcore_reference_decoder_ids(num_layers: int, pp: int, mtp: int) -> list[list[int]]:
@@ -139,7 +145,10 @@ def _mcore_reference_decoder_ids(num_layers: int, pp: int, mtp: int) -> list[lis
         rows.append(units[pos : pos + size])
         pos += size
     ref = PipelineParallelLayerLayout(rows, pipeline_model_parallel_size=pp)
-    return [ref.get_layer_id_list(LayerType.decoder, vp_stage=0, pp_rank=r) for r in range(pp)]
+    return [
+        ref.get_layer_id_list(LayerType.decoder, vp_stage=0, pp_rank=r)
+        for r in range(pp)
+    ]
 
 
 @pytest.mark.parametrize("model, pp, mtp", _CORRECTNESS_CASES)
@@ -147,13 +156,17 @@ def test_auto_layout_is_bit_equal_to_mcore(model, pp, mtp):
     # Faithful reuse: the glue's per-stage decoder ids are exactly mcore's for the same
     # canonical layout, so correctness is inherited from mcore (not re-derived).
     n = _REAL_LAYERS[model]
-    assert _layout_indices(n, pp, num_mtp_layers=mtp) == _mcore_reference_decoder_ids(n, pp, mtp)
+    assert _layout_indices(n, pp, num_mtp_layers=mtp) == _mcore_reference_decoder_ids(
+        n, pp, mtp
+    )
 
 
 @pytest.mark.parametrize("model, pp, mtp", _CORRECTNESS_CASES)
 def test_auto_layout_is_legal_and_balanced(model, pp, mtp):
     n = _REAL_LAYERS[model]
-    chunks = [build_pipeline_chunk_layout(n, ps, num_mtp_layers=mtp) for ps in _ranks(pp)]
+    chunks = [
+        build_pipeline_chunk_layout(n, ps, num_mtp_layers=mtp) for ps in _ranks(pp)
+    ]
     # complete + ordered, no missing/dup decoder -> sum == num_layers
     assert [i for c in chunks for i in c.layer_indices] == list(range(n))
     # embedding only on stage 0; loss/head only on the last stage
@@ -162,7 +175,10 @@ def test_auto_layout_is_legal_and_balanced(model, pp, mtp):
     # MTP placed exactly `mtp` times, on the final (head) stage
     assert sum(c.has_mtp for c in chunks) == mtp and chunks[-1].has_mtp == bool(mtp)
     # balanced: per-stage unit cells (decoders + embedding/loss/mtp slots) differ by <=1
-    cells = [len(c.layer_indices) + c.has_embed + c.has_head + (mtp if c.has_mtp else 0) for c in chunks]
+    cells = [
+        len(c.layer_indices) + c.has_embed + c.has_head + (mtp if c.has_mtp else 0)
+        for c in chunks
+    ]
     assert max(cells) - min(cells) <= 1
 
 
@@ -177,8 +193,14 @@ def _glm52_index_share_groups(num_layers: int = 78) -> list[list[int]]:
     current_source: int | None = None
     for layer_idx in range(num_layers):
         layer_number = layer_idx + 1
-        if dsa_indexer_type_for_layer(layer_number, skip_topk_offset=3, topk_freq=4) == "shared":
-            source_idx = source_dsa_compute_layer(layer_number, skip_topk_offset=3, topk_freq=4) - 1
+        if (
+            dsa_indexer_type_for_layer(layer_number, skip_topk_offset=3, topk_freq=4)
+            == "shared"
+        ):
+            source_idx = (
+                source_dsa_compute_layer(layer_number, skip_topk_offset=3, topk_freq=4)
+                - 1
+            )
         else:
             source_idx = layer_idx
         if current and source_idx != current_source:
@@ -198,10 +220,7 @@ def test_grouped_pp_layout_keeps_glm52_indexshare_groups_inside_stage():
 
     chunks = [
         build_pipeline_chunk_layout(
-            78,
-            ps,
-            num_mtp_layers=1,
-            decoder_layer_groups=_glm52_index_share_groups(),
+            78, ps, num_mtp_layers=1, decoder_layer_groups=_glm52_index_share_groups()
         )
         for ps in _ranks(8)
     ]
@@ -212,10 +231,7 @@ def test_grouped_pp_layout_keeps_glm52_indexshare_groups_inside_stage():
     assert [chunk.has_mtp for chunk in chunks[:-1]] == [False] * 7
     for stage_indices in indices:
         validate_dsa_index_share_pipeline_split(
-            stage_indices,
-            topk_freq=4,
-            skip_topk_offset=3,
-            indexer_types=None,
+            stage_indices, topk_freq=4, skip_topk_offset=3, indexer_types=None
         )
 
 
@@ -248,16 +264,15 @@ def test_grouped_pp_layout_uses_explicit_custom_indexer_schedule():
 
     chunks = [
         build_pipeline_chunk_layout(
-            cfg.num_hidden_layers,
-            ps,
-            num_mtp_layers=1,
-            decoder_layer_groups=groups,
+            cfg.num_hidden_layers, ps, num_mtp_layers=1, decoder_layer_groups=groups
         )
         for ps in _ranks(2)
     ]
     indices = [chunk.layer_indices for chunk in chunks]
     _assert_full_contiguous_cover(indices, cfg.num_hidden_layers)
-    owner = {layer_idx: stage for stage, layers in enumerate(indices) for layer_idx in layers}
+    owner = {
+        layer_idx: stage for stage, layers in enumerate(indices) for layer_idx in layers
+    }
     assert all(len({owner[layer_idx] for layer_idx in group}) == 1 for group in groups)
     for stage_indices in indices:
         validate_dsa_index_share_pipeline_split(
@@ -277,10 +292,7 @@ def test_ungrouped_glm52_auto_layout_would_trip_indexshare_guard():
     with pytest.raises(ValueError, match="DSA IndexShare cannot cross pipeline stages"):
         for stage_indices in bad_indices:
             validate_dsa_index_share_pipeline_split(
-                stage_indices,
-                topk_freq=4,
-                skip_topk_offset=3,
-                indexer_types=None,
+                stage_indices, topk_freq=4, skip_topk_offset=3, indexer_types=None
             )
 
 
@@ -313,9 +325,14 @@ def test_pp_layout_marks_mtp_stage_from_the_layout_not_a_fixed_rank():
     # no MTP requested -> no stage owns MTP.
     assert _mtp_flags(6, 4) == [False, False, False, False]
     # single stage owns the MTP too.
-    assert build_pipeline_chunk_layout(
-        5, ParallelState(pp_size=1, pp_rank=0, pp_is_first=True, pp_is_last=True), num_mtp_layers=1
-    ).has_mtp is True
+    assert (
+        build_pipeline_chunk_layout(
+            5,
+            ParallelState(pp_size=1, pp_rank=0, pp_is_first=True, pp_is_last=True),
+            num_mtp_layers=1,
+        ).has_mtp
+        is True
+    )
 
 
 def test_pp_layout_custom_string_mtp_lands_on_the_designated_stage():
@@ -324,7 +341,10 @@ def test_pp_layout_custom_string_mtp_lands_on_the_designated_stage():
     flags = _mtp_flags(6, 4, pp_layout="Ett|tt|t|tmL", num_mtp_layers=1)
     assert flags == [False, False, False, True]
     assert _layout_indices(6, 4, pp_layout="Ett|tt|t|tmL", num_mtp_layers=1) == [
-        [0, 1], [2, 3], [4], [5]
+        [0, 1],
+        [2, 3],
+        [4],
+        [5],
     ]
 
 
@@ -339,7 +359,11 @@ def test_pp_layout_custom_string_mtp_lands_on_the_designated_stage():
 def test_pp_layout_custom_string_standalone_mtp_builds_on_designated_stage():
     # DESIRED (follow-up): `m` on a non-final stage builds MTP on that stage.
     # "E|ttttttm|L" over pp3 -> [E], [t*6, m], [L]; MTP belongs on the middle stage.
-    assert _mtp_flags(6, 3, pp_layout="E|ttttttm|L", num_mtp_layers=1) == [False, True, False]
+    assert _mtp_flags(6, 3, pp_layout="E|ttttttm|L", num_mtp_layers=1) == [
+        False,
+        True,
+        False,
+    ]
 
 
 def test_pp_layout_single_stage_owns_all_layers():
@@ -367,7 +391,9 @@ def test_virtual_pipeline_rank_is_tracked_on_lite_parallel_state():
 
 def test_thd_roll_keeps_sequence_boundaries():
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
-    rolled, token_sum = roll_packed_thd_left(torch.arange(8), cu_seqlens_padded=cu_seqlens, dims=0)
+    rolled, token_sum = roll_packed_thd_left(
+        torch.arange(8), cu_seqlens_padded=cu_seqlens, dims=0
+    )
 
     assert torch.equal(rolled, torch.tensor([1, 2, 3, 0, 5, 6, 7, 0]))
     assert token_sum.item() == 24
@@ -386,30 +412,25 @@ def test_thd_cp_split_and_reconstruct_roundtrip():
     assert torch.equal(parts[0], torch.tensor([0, 1, 6, 7]))
     assert torch.equal(parts[1], torch.tensor([2, 3, 4, 5]))
     assert torch.equal(
-        reconstruct_packed_from_cp_parts(parts, cu_seqlens_padded=cu_seqlens, cp_size=2, dim=0),
+        reconstruct_packed_from_cp_parts(
+            parts, cu_seqlens_padded=cu_seqlens, cp_size=2, dim=0
+        ),
         tensor,
     )
 
 
 def test_plain_thd_batch_is_split_by_protocol_context_parallel_helper():
     ids = torch.nested.as_nested_tensor(
-        [torch.arange(1, 6), torch.arange(11, 18)],
-        layout=torch.jagged,
+        [torch.arange(1, 6), torch.arange(11, 18)], layout=torch.jagged
     )
     labels = torch.nested.as_nested_tensor(
-        [torch.arange(101, 106), torch.arange(111, 118)],
-        layout=torch.jagged,
+        [torch.arange(101, 106), torch.arange(111, 118)], layout=torch.jagged
     )
     loss_mask = torch.nested.as_nested_tensor(
-        [torch.ones(5), torch.ones(7)],
-        layout=torch.jagged,
+        [torch.ones(5), torch.ones(7)], layout=torch.jagged
     )
     packed = pack_nested_thd(
-        ids,
-        cp_size=2,
-        split_cp=False,
-        labels=labels,
-        loss_mask=loss_mask,
+        ids, cp_size=2, split_cp=False, labels=labels, loss_mask=loss_mask
     )
 
     assert packed.input_ids.shape == (1, 16)
@@ -484,10 +505,7 @@ def test_protocol_context_parallel_helper_is_noop_without_packed_thd_params():
     tensor = torch.arange(8)
 
     local_params, local_tensors = prepare_packed_thd_for_context_parallel(
-        None,
-        (tensor,),
-        cp_size=2,
-        cp_rank=0,
+        None, (tensor,), cp_size=2, cp_rank=0
     )
 
     assert local_params is None

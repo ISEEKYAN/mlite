@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.parallel import (
     PackedSeqParams,
     contiguous_to_zigzag_chunks,

@@ -9,7 +9,6 @@ from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
     default_expert_classifier,
@@ -33,7 +32,9 @@ def _effective_etp(parallel) -> int:
 def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
     """Initialize Megatron-Core mpu globals when dist_opt fallback groups are used."""
 
-    from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
+    from megatron.core import (
+        parallel_state as mpu,  # pyright: ignore[reportMissingImports]
+    )
 
     p = engine_cfg.parallel
     expected = (int(p.tp), int(p.ep), _effective_etp(p), int(p.pp), int(p.cp))
@@ -191,7 +192,9 @@ def build_dist_opt_stack(
         optimizer = get_megatron_optimizer(
             config=opt_config, model_chunks=wrapped_chunks
         )
-        optimizer._dist_opt_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
+        optimizer._dist_opt_pg_collection = (
+            None  # pyright: ignore[reportAttributeAccessIssue]
+        )
     else:
         optimizer = get_megatron_optimizer(
             config=opt_config,
@@ -199,7 +202,9 @@ def build_dist_opt_stack(
             use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
-        optimizer._dist_opt_pg_collection = pg_collection  # pyright: ignore[reportAttributeAccessIssue]
+        optimizer._dist_opt_pg_collection = (
+            pg_collection  # pyright: ignore[reportAttributeAccessIssue]
+        )
     return wrapped_chunks, optimizer
 
 
@@ -337,7 +342,6 @@ def _mark_dist_opt_parallel_attrs(
 
 def _build_pg_collection(ps, engine_cfg):
     import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     if ps.pp_group is None:

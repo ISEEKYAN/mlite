@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 
 

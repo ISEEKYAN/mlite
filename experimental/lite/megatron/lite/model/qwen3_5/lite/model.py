@@ -13,7 +13,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
@@ -498,9 +497,9 @@ class Qwen35Model(nn.Module):
             h = hidden_states
 
         if packed_seq_params is not None:
-            assert position_ids is not None, (
-                "THD path requires caller-supplied MRoPE position_ids."
-            )
+            assert (
+                position_ids is not None
+            ), "THD path requires caller-supplied MRoPE position_ids."
         elif position_ids is None and input_ids is not None:
             if self.ps.cp_size > 1:
                 raise ValueError(

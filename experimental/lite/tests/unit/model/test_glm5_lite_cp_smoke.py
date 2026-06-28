@@ -27,8 +27,8 @@ def _make_glm5_model(cfg, ps, **kwargs):
 
 
 def _init_dist_or_skip():
-    from datetime import timedelta
     import os
+    from datetime import timedelta
 
     import torch
     import torch.distributed as dist
@@ -200,7 +200,6 @@ def _make_dsa(
 
 def _wrap_dsa(dsa, ps, *, rope_theta: float = 1_000_000.0):
     import torch.nn as nn
-
     from megatron.lite.model.glm5.lite.model import Glm5DSAAttention
 
     attention = Glm5DSAAttention.__new__(Glm5DSAAttention)
@@ -221,7 +220,6 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
 ):
     import torch
     import torch.distributed as dist
-
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -244,11 +242,7 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
     torch.manual_seed(2026)
     ref_ps = ParallelState()
     ref_attn = _wrap_dsa(
-        _make_dsa(
-            rope_interleaved=rope_interleaved,
-            indexer_loss_coeff=1.0e-2,
-        ),
-        ref_ps,
+        _make_dsa(rope_interleaved=rope_interleaved, indexer_loss_coeff=1.0e-2), ref_ps
     ).to(device=device, dtype=torch.bfloat16)
 
     batch, seq = 1, _sparse_fused_dsa_seq_len(world)
@@ -311,7 +305,6 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
 def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -351,7 +344,6 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 def test_glm5_tiny_model_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -391,7 +383,6 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
 def test_glm5_packed_thd_variable_sequence_cp2_direct_forward_backward_smoke():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.parallel.state import ParallelState
     from megatron.lite.primitive.parallel.thd import (
@@ -569,12 +560,12 @@ def test_glm5_packed_thd_protocol_indexshare_mtp_cp2_forward_backward_smoke():
         for name, parameter in parameters:
             assert parameter.grad is not None, f"missing gradient for {label}.{name}"
             gradient = parameter.grad.detach().float()
-            assert torch.isfinite(gradient).all(), (
-                f"non-finite gradient for {label}.{name}"
-            )
-            assert torch.count_nonzero(gradient).item() > 0, (
-                f"zero gradient for {label}.{name}"
-            )
+            assert torch.isfinite(
+                gradient
+            ).all(), f"non-finite gradient for {label}.{name}"
+            assert (
+                torch.count_nonzero(gradient).item() > 0
+            ), f"zero gradient for {label}.{name}"
 
     for layer_idx, indexer in trunk_indexers:
         assert_finite_nonzero_indexer_grads(
@@ -616,15 +607,14 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     world = dist.get_world_size()
     rank = dist.get_rank()
 
-    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-        DeepseekV3ForCausalLM,
-    )
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3ForCausalLM,
+    )
 
     cfg = Glm5Config(**_tiny_hf_parity_config_kwargs())
 
@@ -682,21 +672,21 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
                 f"norm_ratio=[{min_norm_ratio},{max_norm_ratio}],"
                 f"max_abs_diff<={max_abs_diff}"
             )
-        assert math.isfinite(cosine) and cosine >= min_cosine, (
-            f"{label} cosine {cosine:.9f} is below {min_cosine}"
-        )
-        assert math.isfinite(rms_relative) and rms_relative <= max_rms_relative, (
-            f"{label} RMS-relative {rms_relative:.9e} exceeds {max_rms_relative}"
-        )
+        assert (
+            math.isfinite(cosine) and cosine >= min_cosine
+        ), f"{label} cosine {cosine:.9f} is below {min_cosine}"
+        assert (
+            math.isfinite(rms_relative) and rms_relative <= max_rms_relative
+        ), f"{label} RMS-relative {rms_relative:.9e} exceeds {max_rms_relative}"
         assert (
             math.isfinite(norm_ratio) and min_norm_ratio <= norm_ratio <= max_norm_ratio
         ), (
             f"{label} norm ratio {norm_ratio:.9f} is outside "
             f"[{min_norm_ratio}, {max_norm_ratio}]"
         )
-        assert math.isfinite(max_abs) and max_abs <= max_abs_diff, (
-            f"{label} max-abs {max_abs:.9e} exceeds {max_abs_diff}"
-        )
+        assert (
+            math.isfinite(max_abs) and max_abs <= max_abs_diff
+        ), f"{label} max-abs {max_abs:.9e} exceeds {max_abs_diff}"
 
     torch.manual_seed(20260611)
     hf_ref = DeepseekV3ForCausalLM(_to_hf_deepseek_v3_config(cfg)).to(
@@ -718,11 +708,7 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     label_generator = torch.Generator(device=device)
     label_generator.manual_seed(20260627)
     full_labels = torch.randint(
-        0,
-        cfg.vocab_size,
-        (batch, seq),
-        generator=label_generator,
-        device=device,
+        0, cfg.vocab_size, (batch, seq), generator=label_generator, device=device
     )
     local_labels = zigzag_slice_for_cp(full_labels, rank, world, seq_dim=1).contiguous()
     local_seq = seq // world

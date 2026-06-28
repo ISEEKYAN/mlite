@@ -7,6 +7,7 @@ repos:
     language: python
     additional_dependencies: ["isort==5.13.2"]
     files: ^experimental/lite/.*\.py$
+    args: ["--profile", "black"]
   - id: black
     name: black
     entry: black

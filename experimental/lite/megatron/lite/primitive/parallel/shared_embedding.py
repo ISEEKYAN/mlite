@@ -127,12 +127,7 @@ def _embedding_weight(module: nn.Module | None) -> nn.Parameter | None:
 
 
 def _parameter_signature(parameter: nn.Parameter) -> tuple[object, ...]:
-    return (
-        tuple(parameter.shape),
-        parameter.dtype,
-        parameter.device,
-        parameter.layout,
-    )
+    return (tuple(parameter.shape), parameter.dtype, parameter.device, parameter.layout)
 
 
 def _local_shared_embedding_candidates(
@@ -163,8 +158,7 @@ def _group_backend_name(group: dist.ProcessGroup | None) -> str:
 
 
 def _control_device_for_group(
-    group: dist.ProcessGroup | None,
-    model_chunks: Iterable[nn.Module] = (),
+    group: dist.ProcessGroup | None, model_chunks: Iterable[nn.Module] = ()
 ) -> torch.device:
     """Choose a device supported by the process-group backend, not model data."""
     backend = _group_backend_name(group)
@@ -295,12 +289,7 @@ def _metadata_pair_status(
         count_valid |= (first[1] == 0) & (last[1] == 0)
     records_valid = (first[2] == 1) & (last[2] == 1)
     success = matching_records & version_valid & count_valid & records_valid
-    summary = torch.stack(
-        (
-            (~success).to(dtype=torch.int64),
-            first[1] + last[1],
-        )
-    )
+    summary = torch.stack(((~success).to(dtype=torch.int64), first[1] + last[1]))
     pair_error, total_presence = summary.detach().cpu().tolist()
     return bool(pair_error), int(total_presence)
 
@@ -623,11 +612,7 @@ def validate_mtp_embedding_parameter_replicas(
         assert cache.global_ranks is not None
         weight = cache.weight
         canonical = weight.detach().clone()
-        dist.broadcast(
-            canonical,
-            src=cache.global_ranks[0],
-            group=cache.group,
-        )
+        dist.broadcast(canonical, src=cache.global_ranks[0], group=cache.group)
         mismatch = not torch.equal(canonical, weight.detach())
         if mismatch:
             local_max_abs = (

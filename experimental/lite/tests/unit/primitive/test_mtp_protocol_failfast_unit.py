@@ -8,16 +8,9 @@ from pathlib import Path
 
 import pytest
 
-
 pytestmark = [pytest.mark.mlite]
 
-_PROTOCOLS = (
-    "glm5",
-    "deepseek_v4",
-    "kimi_k2",
-    "qwen3_5",
-    "qwen3_moe",
-)
+_PROTOCOLS = ("glm5", "deepseek_v4", "kimi_k2", "qwen3_5", "qwen3_moe")
 
 
 def _protocol_path(model_name: str) -> Path:
@@ -93,18 +86,18 @@ def test_fsdp2_pp_mtp_gate_precedes_parallel_and_cuda_initialization(
 
     init_parallel_lines = _call_lines(function, "init_parallel")
     cuda_lines = _call_lines(function, "cuda")
-    assert init_parallel_lines, (
-        f"{model_name}: build_model does not initialize parallel state"
-    )
-    assert cuda_lines, (
-        f"{model_name}: build_model does not materialize CUDA model chunks"
-    )
-    assert gate.lineno < min(init_parallel_lines), (
-        f"{model_name}: FSDP2 PP+MTP gate runs after init_parallel"
-    )
-    assert gate.lineno < min(cuda_lines), (
-        f"{model_name}: FSDP2 PP+MTP gate runs after CUDA construction"
-    )
+    assert (
+        init_parallel_lines
+    ), f"{model_name}: build_model does not initialize parallel state"
+    assert (
+        cuda_lines
+    ), f"{model_name}: build_model does not materialize CUDA model chunks"
+    assert gate.lineno < min(
+        init_parallel_lines
+    ), f"{model_name}: FSDP2 PP+MTP gate runs after init_parallel"
+    assert gate.lineno < min(
+        cuda_lines
+    ), f"{model_name}: FSDP2 PP+MTP gate runs after CUDA construction"
 
 
 def test_deepseek_v4_packed_mtp_requires_single_sequence_without_cp() -> None:

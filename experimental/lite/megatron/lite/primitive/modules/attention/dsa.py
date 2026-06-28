@@ -540,11 +540,7 @@ class DSAIndexer(nn.Module):
                 k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
         q_pe = apply_rotary_pos_emb(
-            q_pe,
-            cos,
-            sin,
-            unsqueeze_dim=2,
-            mla_interleaved=self.rope_interleaved,
+            q_pe, cos, sin, unsqueeze_dim=2, mla_interleaved=self.rope_interleaved
         )
         k_pe = apply_rotary_pos_emb(
             k_pe.unsqueeze(2),
@@ -791,11 +787,7 @@ class DynamicSparseAttention(nn.Module):
                     x, position_ids, packed_seq_params
                 )
                 cos, sin = self._gather_packed_cp_rotary(
-                    cos,
-                    sin,
-                    packed_seq_params,
-                    x.device,
-                    local_seq=local_seq,
+                    cos, sin, packed_seq_params, x.device, local_seq=local_seq
                 )
             out = self._forward_packed_full(
                 x,
@@ -833,11 +825,7 @@ class DynamicSparseAttention(nn.Module):
                 x, position_ids, attention_mask
             )
             cos, sin = self._gather_cp_rotary(
-                cos,
-                sin,
-                local_seq=local_seq,
-                full_seq=x.shape[1],
-                device=x.device,
+                cos, sin, local_seq=local_seq, full_seq=x.shape[1], device=x.device
             )
 
         out = self._forward_dense_full(
@@ -963,11 +951,7 @@ class DynamicSparseAttention(nn.Module):
         )
 
         q_pe = apply_rotary_pos_emb(
-            q_pe,
-            cos,
-            sin,
-            unsqueeze_dim=2,
-            mla_interleaved=self.rope_interleaved,
+            q_pe, cos, sin, unsqueeze_dim=2, mla_interleaved=self.rope_interleaved
         )
         k_up_weight, v_up_weight = self._split_kv_b_weights()
         q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
@@ -1042,9 +1026,7 @@ class DynamicSparseAttention(nn.Module):
                     value_dim=self.kv_lora_rank,
                 )
                 index_share_state.save_topk(
-                    self.layer_number,
-                    topk_indices,
-                    sequence_key=index_share_cache_key,
+                    self.layer_number, topk_indices, sequence_key=index_share_cache_key
                 )
             else:
                 out, indexer_loss = _fused_indexer_sparse_attn(

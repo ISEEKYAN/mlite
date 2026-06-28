@@ -17,15 +17,15 @@ from megatron.lite.primitive.parallel.pp import (
     PipelineChunkLayout,
     build_pipeline_chunk_layout,
 )
-from megatron.lite.primitive.parallel.sp import (
-    gather_for_non_sp_head,
-    gather_from_sequence_parallel,
-    scatter_to_sequence_parallel,
-)
 from megatron.lite.primitive.parallel.shared_embedding import (
     allreduce_mtp_embedding_grads,
     synchronize_mtp_embedding_parameters,
     validate_mtp_embedding_parameter_replicas,
+)
+from megatron.lite.primitive.parallel.sp import (
+    gather_for_non_sp_head,
+    gather_from_sequence_parallel,
+    scatter_to_sequence_parallel,
 )
 from megatron.lite.primitive.parallel.state import (
     ParallelState,

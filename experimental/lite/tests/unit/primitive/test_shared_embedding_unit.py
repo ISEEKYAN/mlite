@@ -9,13 +9,12 @@ from collections.abc import Callable
 from queue import Empty
 from types import SimpleNamespace
 
+import megatron.lite.primitive.parallel.shared_embedding as shared_embedding
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-
-import megatron.lite.primitive.parallel.shared_embedding as shared_embedding
 from megatron.lite.primitive.parallel.shared_embedding import (
     allreduce_mtp_embedding_grads,
     synchronize_mtp_embedding_parameters,
@@ -63,34 +62,17 @@ class _Embedding(nn.Module):
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         self.embedding = nn.Embedding(
-            weight.shape[0],
-            weight.shape[1],
-            device=weight.device,
-            dtype=weight.dtype,
+            weight.shape[0], weight.shape[1], device=weight.device, dtype=weight.dtype
         )
         with torch.no_grad():
             self.embedding.weight.copy_(weight)
 
 
 def _boundary_states(group: object) -> tuple[ParallelState, ParallelState]:
-    common = {
-        "pp_size": 2,
-        "embedding_group": group,
-        "embedding_global_ranks": [3, 11],
-    }
+    common = {"pp_size": 2, "embedding_group": group, "embedding_global_ranks": [3, 11]}
     return (
-        ParallelState(
-            **common,
-            pp_rank=0,
-            pp_is_first=True,
-            pp_is_last=False,
-        ),
-        ParallelState(
-            **common,
-            pp_rank=1,
-            pp_is_first=False,
-            pp_is_last=True,
-        ),
+        ParallelState(**common, pp_rank=0, pp_is_first=True, pp_is_last=False),
+        ParallelState(**common, pp_rank=1, pp_is_first=False, pp_is_last=True),
     )
 
 
@@ -138,22 +120,14 @@ def _prime_shared_embedding_cache(
     monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
     _run_for_both_boundaries(
-        synchronize_mtp_embedding_parameters,
-        first,
-        last,
-        first_ps,
-        last_ps,
+        synchronize_mtp_embedding_parameters, first, last, first_ps, last_ps
     )
     assert first_ps.mtp_embedding_preflight_cache is not None
     assert last_ps.mtp_embedding_preflight_cache is not None
 
 
 def _distributed_shared_embedding_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    case: str,
-    results,
+    rank: int, world_size: int, init_method: str, case: str, results
 ) -> None:
     """Real Gloo endpoint used by the no-hang metadata regression test."""
     try:
@@ -286,13 +260,9 @@ def test_shared_embedding_initialization_broadcasts_first_stage_and_marks_replic
     embedding_group = object()
     first_ps, last_ps = _boundary_states(embedding_group)
     canonical = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    first = _EmbeddingOwner(
-        canonical_attr=canonical_attr,
-        canonical_weight=canonical,
-    )
+    first = _EmbeddingOwner(canonical_attr=canonical_attr, canonical_weight=canonical)
     last = _EmbeddingOwner(
-        canonical_attr=canonical_attr,
-        mtp_weight=torch.full_like(canonical, -9.0),
+        canonical_attr=canonical_attr, mtp_weight=torch.full_like(canonical, -9.0)
     )
     reduced: list[torch.Tensor] = []
     collective_order: list[str] = []
@@ -323,22 +293,12 @@ def test_shared_embedding_initialization_broadcasts_first_stage_and_marks_replic
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     _run_for_both_boundaries(
-        synchronize_mtp_embedding_parameters,
-        first,
-        last,
-        first_ps,
-        last_ps,
+        synchronize_mtp_embedding_parameters, first, last, first_ps, last_ps
     )
 
     assert (
         collective_order
-        == [
-            "world",
-            "pair_parameter_metadata",
-            "world",
-            "pair_data",
-        ]
-        * 2
+        == ["world", "pair_parameter_metadata", "world", "pair_data"] * 2
     )
     first_weight = getattr(first, canonical_attr).embedding.weight
     last_weight = last.mtp_embed.embedding.weight
@@ -363,13 +323,7 @@ def test_shared_embedding_gradient_allreduce_sums_main_and_parameter_grads(
     zeros = torch.zeros(3, 2)
     first = _EmbeddingOwner(canonical_attr="embed", canonical_weight=zeros)
     last = _EmbeddingOwner(mtp_weight=zeros)
-    _prime_shared_embedding_cache(
-        monkeypatch,
-        first,
-        last,
-        first_ps,
-        last_ps,
-    )
+    _prime_shared_embedding_cache(monkeypatch, first, last, first_ps, last_ps)
     first_weight = first.embed.embedding.weight
     last_weight = last.mtp_embed.embedding.weight
     first_weight.grad = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -400,30 +354,17 @@ def test_shared_embedding_gradient_allreduce_sums_main_and_parameter_grads(
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     _run_for_both_boundaries(
-        allreduce_mtp_embedding_grads,
-        first,
-        last,
-        first_ps,
-        last_ps,
+        allreduce_mtp_embedding_grads, first, last, first_ps, last_ps
     )
 
     assert (
         collective_order
-        == [
-            "world",
-            "pair_gradient_metadata",
-            "world",
-            "pair_data",
-        ]
-        * 2
+        == ["world", "pair_gradient_metadata", "world", "pair_data"] * 2
     )
     torch.testing.assert_close(first_weight.grad, expected, atol=0.0, rtol=0.0)
     torch.testing.assert_close(last_weight.main_grad, expected, atol=0.0, rtol=0.0)
     torch.testing.assert_close(
-        last_weight.grad,
-        torch.full_like(last_weight, -99.0),
-        atol=0.0,
-        rtol=0.0,
+        last_weight.grad, torch.full_like(last_weight, -99.0), atol=0.0, rtol=0.0
     )
 
 
@@ -435,13 +376,7 @@ def test_incomplete_shared_embedding_grads_fail_both_ranks_before_data_allreduce
     zeros = torch.zeros(3, 2)
     first = _EmbeddingOwner(canonical_attr="embed", canonical_weight=zeros)
     last = _EmbeddingOwner(mtp_weight=zeros)
-    _prime_shared_embedding_cache(
-        monkeypatch,
-        first,
-        last,
-        first_ps,
-        last_ps,
-    )
+    _prime_shared_embedding_cache(monkeypatch, first, last, first_ps, last_ps)
     first.embed.embedding.weight.grad = torch.ones_like(first.embed.embedding.weight)
     collective_order: list[str] = []
 
@@ -476,15 +411,7 @@ def test_incomplete_shared_embedding_grads_fail_both_ranks_before_data_allreduce
         ):
             allreduce_mtp_embedding_grads([model], ps, enabled=True)
 
-    assert (
-        collective_order
-        == [
-            "world",
-            "pair_gradient_metadata",
-            "world",
-        ]
-        * 2
-    )
+    assert collective_order == ["world", "pair_gradient_metadata", "world"] * 2
 
 
 def test_absent_shared_embedding_grads_return_after_presence_collective(
@@ -495,13 +422,7 @@ def test_absent_shared_embedding_grads_return_after_presence_collective(
     zeros = torch.zeros(3, 2)
     first = _EmbeddingOwner(canonical_attr="embed", canonical_weight=zeros)
     last = _EmbeddingOwner(mtp_weight=zeros)
-    _prime_shared_embedding_cache(
-        monkeypatch,
-        first,
-        last,
-        first_ps,
-        last_ps,
-    )
+    _prime_shared_embedding_cache(monkeypatch, first, last, first_ps, last_ps)
     collective_order: list[str] = []
 
     def fake_all_gather(
@@ -524,24 +445,12 @@ def test_absent_shared_embedding_grads_return_after_presence_collective(
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     _run_for_both_boundaries(
-        allreduce_mtp_embedding_grads,
-        first,
-        last,
-        first_ps,
-        last_ps,
+        allreduce_mtp_embedding_grads, first, last, first_ps, last_ps
     )
 
     # A layer can legitimately be unused on both endpoints. Both ranks still
     # compare fixed-size metadata and reach WORLD consensus, then skip data.
-    assert (
-        collective_order
-        == [
-            "world",
-            "pair_gradient_metadata",
-            "world",
-        ]
-        * 2
-    )
+    assert collective_order == ["world", "pair_gradient_metadata", "world"] * 2
 
 
 @pytest.mark.parametrize(
@@ -556,10 +465,7 @@ def test_absent_shared_embedding_grads_return_after_presence_collective(
     ],
 )
 def test_parameter_metadata_mismatch_fails_both_endpoints_before_data_collective(
-    monkeypatch,
-    mismatch: str,
-    first_weight: torch.Tensor,
-    last_weight: torch.Tensor,
+    monkeypatch, mismatch: str, first_weight: torch.Tensor, last_weight: torch.Tensor
 ) -> None:
     embedding_group = object()
     first_ps, last_ps = _boundary_states(embedding_group)
@@ -599,23 +505,14 @@ def test_parameter_metadata_mismatch_fails_both_endpoints_before_data_collective
         with pytest.raises(RuntimeError, match="parameter metadata preflight failed"):
             synchronize_mtp_embedding_parameters([model], ps, enabled=True)
 
-    assert (
-        collective_order
-        == [
-            "world",
-            "pair_parameter_metadata",
-            "world",
-        ]
-        * 2
-    )
+    assert collective_order == ["world", "pair_parameter_metadata", "world"] * 2
     assert first_ps.mtp_embedding_preflight_cache is None
     assert last_ps.mtp_embedding_preflight_cache is None
 
 
 @pytest.mark.parametrize("mismatch", ["shape", "dtype"])
 def test_real_gloo_parameter_metadata_mismatch_fails_both_ranks_without_hang(
-    tmp_path,
-    mismatch: str,
+    tmp_path, mismatch: str
 ) -> None:
     # Each outer Phase-A pytest rank receives its own tmp_path. UUID also keeps
     # repeated parameter cases from sharing a FileStore rendezvous path.
@@ -663,13 +560,7 @@ def test_gradient_shape_mismatch_fails_both_endpoints_before_data_collective(
     zeros = torch.zeros(3, 2)
     first = _EmbeddingOwner(canonical_attr="embed", canonical_weight=zeros)
     last = _EmbeddingOwner(mtp_weight=zeros)
-    _prime_shared_embedding_cache(
-        monkeypatch,
-        first,
-        last,
-        first_ps,
-        last_ps,
-    )
+    _prime_shared_embedding_cache(monkeypatch, first, last, first_ps, last_ps)
     first.embed.embedding.weight.main_grad = torch.ones(3, 2)
     last.mtp_embed.embedding.weight.main_grad = torch.ones(4, 2)
     collective_order: list[str] = []
@@ -716,13 +607,7 @@ def test_cached_parameter_signature_change_fails_before_gradient_data_collective
     zeros = torch.zeros(3, 2)
     first = _EmbeddingOwner(canonical_attr="embed", canonical_weight=zeros)
     last = _EmbeddingOwner(mtp_weight=zeros)
-    _prime_shared_embedding_cache(
-        monkeypatch,
-        first,
-        last,
-        first_ps,
-        last_ps,
-    )
+    _prime_shared_embedding_cache(monkeypatch, first, last, first_ps, last_ps)
     # Preserve Parameter identity while changing the facts proven at init. Both
     # endpoints use the same new metadata so only the cached fingerprint can
     # catch this stale-preflight condition.
@@ -799,15 +684,7 @@ def test_nccl_cpu_parameter_fails_metadata_preflight_before_data_collective(
         with pytest.raises(RuntimeError, match="parameter metadata preflight failed"):
             synchronize_mtp_embedding_parameters([model], ps, enabled=True)
 
-    assert (
-        collective_order
-        == [
-            "world",
-            "pair_parameter_metadata",
-            "world",
-        ]
-        * 2
-    )
+    assert collective_order == ["world", "pair_parameter_metadata", "world"] * 2
 
 
 def test_declared_embedding_ranks_must_match_actual_group_membership(
@@ -825,11 +702,7 @@ def test_declared_embedding_ranks_must_match_actual_group_membership(
     monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
     monkeypatch.setattr(dist, "get_rank", lambda: current_rank)
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(
-        dist,
-        "get_process_group_ranks",
-        lambda group: [3, 12],
-    )
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [3, 12])
 
     def fake_all_reduce(tensor: torch.Tensor, *, group: object) -> None:
         assert group is dist.group.WORLD
@@ -841,10 +714,7 @@ def test_declared_embedding_ranks_must_match_actual_group_membership(
     monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
     monkeypatch.setattr(dist, "all_gather", forbidden_all_gather)
 
-    for rank, model, ps in (
-        (3, first, first_ps),
-        (11, last, last_ps),
-    ):
+    for rank, model, ps in ((3, first, first_ps), (11, last, last_ps)):
         current_rank = rank
         with pytest.raises(RuntimeError, match="group preflight failed"):
             synchronize_mtp_embedding_parameters([model], ps, enabled=True)
@@ -861,9 +731,7 @@ def test_declared_embedding_ranks_must_match_actual_group_membership(
     ],
 )
 def test_middle_pipeline_rank_participates_only_in_world_consensus(
-    monkeypatch,
-    fn: Callable,
-    expected_world_collectives: int,
+    monkeypatch, fn: Callable, expected_world_collectives: int
 ) -> None:
     middle = _EmbeddingOwner()
     ps = ParallelState(
@@ -920,12 +788,7 @@ def test_mtp_embedding_parameter_replica_validation_accepts_exact_equality(
         collective_order.append("world")
         tensor.zero_()
 
-    def fake_broadcast(
-        tensor: torch.Tensor,
-        *,
-        src: int,
-        group: object,
-    ) -> None:
+    def fake_broadcast(tensor: torch.Tensor, *, src: int, group: object) -> None:
         assert src == first_ps.embedding_global_ranks[0]
         assert group is embedding_group
         collective_order.append("pair_broadcast")
@@ -936,23 +799,12 @@ def test_mtp_embedding_parameter_replica_validation_accepts_exact_equality(
     monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
 
     _run_for_both_boundaries(
-        validate_mtp_embedding_parameter_replicas,
-        first,
-        last,
-        first_ps,
-        last_ps,
+        validate_mtp_embedding_parameter_replicas, first, last, first_ps, last_ps
     )
 
     assert (
         collective_order
-        == [
-            "world",
-            "pair_parameter_metadata",
-            "world",
-            "pair_broadcast",
-            "world",
-        ]
-        * 2
+        == ["world", "pair_parameter_metadata", "world", "pair_broadcast", "world"] * 2
     )
 
 
@@ -964,13 +816,7 @@ def test_save_validation_rechecks_parameters_instead_of_trusting_init_cache(
     canonical = torch.zeros(3, 2)
     first = _EmbeddingOwner(canonical_attr="embed", canonical_weight=canonical)
     last = _EmbeddingOwner(mtp_weight=canonical)
-    _prime_shared_embedding_cache(
-        monkeypatch,
-        first,
-        last,
-        first_ps,
-        last_ps,
-    )
+    _prime_shared_embedding_cache(monkeypatch, first, last, first_ps, last_ps)
     # Replace the registered parameter after initialization. A validator that
     # trusted only the static optimizer cache would miss this incompatible
     # replica and could hang in broadcast.
@@ -1004,15 +850,7 @@ def test_save_validation_rechecks_parameters_instead_of_trusting_init_cache(
         with pytest.raises(RuntimeError, match="parameter metadata preflight failed"):
             validate_mtp_embedding_parameter_replicas([model], ps, enabled=True)
 
-    assert (
-        collective_order
-        == [
-            "world",
-            "pair_parameter_metadata",
-            "world",
-        ]
-        * 2
-    )
+    assert collective_order == ["world", "pair_parameter_metadata", "world"] * 2
 
 
 def test_mtp_embedding_parameter_replica_divergence_fails_all_ranks_via_world(
@@ -1050,12 +888,7 @@ def test_mtp_embedding_parameter_replica_divergence_fails_all_ranks_via_world(
             return
         raise AssertionError("only WORLD error consensus uses all_reduce")
 
-    def fake_broadcast(
-        tensor: torch.Tensor,
-        *,
-        src: int,
-        group: object,
-    ) -> None:
+    def fake_broadcast(tensor: torch.Tensor, *, src: int, group: object) -> None:
         assert src == first_ps.embedding_global_ranks[0]
         assert group is embedding_group
         collective_order.append("pair_broadcast")
@@ -1075,14 +908,7 @@ def test_mtp_embedding_parameter_replica_divergence_fails_all_ranks_via_world(
     assert "local_max_abs=2.500000e-01" in errors[1]
     assert (
         collective_order
-        == [
-            "world",
-            "pair_parameter_metadata",
-            "world",
-            "pair_broadcast",
-            "world",
-        ]
-        * 2
+        == ["world", "pair_parameter_metadata", "world", "pair_broadcast", "world"] * 2
     )
 
 
@@ -1116,14 +942,10 @@ def test_dist_opt_finalize_runs_dp_sync_before_mtp_pair_sync(monkeypatch) -> Non
         call_order.append("mtp_pair")
 
     monkeypatch.setattr(
-        megatron_wrap,
-        "build_dist_opt_stack",
-        fake_build_dist_opt_stack,
+        megatron_wrap, "build_dist_opt_stack", fake_build_dist_opt_stack
     )
     monkeypatch.setattr(
-        megatron_wrap,
-        "finalize_dist_opt_grads",
-        fake_finalize_dist_opt_grads,
+        megatron_wrap, "finalize_dist_opt_grads", fake_finalize_dist_opt_grads
     )
     monkeypatch.setattr(
         shared_embedding,
@@ -1135,8 +957,7 @@ def test_dist_opt_finalize_runs_dp_sync_before_mtp_pair_sync(monkeypatch) -> Non
         chunks,
         model_cfg=SimpleNamespace(),
         impl_cfg=SimpleNamespace(
-            optimizer_config=SimpleNamespace(),
-            parallel=SimpleNamespace(),
+            optimizer_config=SimpleNamespace(), parallel=SimpleNamespace()
         ),
         ps=ps,
         model_name="unit",
@@ -1152,8 +973,7 @@ def test_dist_opt_finalize_runs_dp_sync_before_mtp_pair_sync(monkeypatch) -> Non
 
 @pytest.mark.parametrize("rank", [0, 1, 3])
 def test_init_parallel_defers_mtp_embedding_pair_until_lazy_init(
-    monkeypatch,
-    rank: int,
+    monkeypatch, rank: int
 ) -> None:
     config = SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=4)
     created_groups: list[tuple[tuple[int, ...], str | None, object]] = []
@@ -1204,10 +1024,7 @@ def test_distckpt_tied_embedding_uses_canonical_logical_key_and_replica_id() -> 
     )
 
     weight = torch.arange(6, dtype=torch.float32).reshape(3, 2)
-    first = _EmbeddingOwner(
-        canonical_attr="embed_tokens",
-        canonical_weight=weight,
-    )
+    first = _EmbeddingOwner(canonical_attr="embed_tokens", canonical_weight=weight)
     last = _EmbeddingOwner(mtp_weight=weight)
     last._mlite_tied_checkpoint_keys = {
         "mtp_embed.embedding.weight": "embed_tokens.embedding.weight"
@@ -1244,8 +1061,7 @@ def test_distckpt_tied_embedding_uses_canonical_logical_key_and_replica_id() -> 
 
 
 def test_distckpt_save_validates_tied_embedding_before_logical_collapse(
-    monkeypatch,
-    tmp_path,
+    monkeypatch, tmp_path
 ) -> None:
     pytest.importorskip("megatron.core.dist_checkpointing")
     import megatron.lite.primitive.ckpt.distckpt as distckpt
@@ -1282,14 +1098,10 @@ def test_distckpt_save_validates_tied_embedding_before_logical_collapse(
         call_order.append("save")
 
     monkeypatch.setattr(
-        parallel,
-        "validate_mtp_embedding_parameter_replicas",
-        fake_validate,
+        parallel, "validate_mtp_embedding_parameter_replicas", fake_validate
     )
     monkeypatch.setattr(
-        distckpt,
-        "_model_sharded_state_dict",
-        fake_model_sharded_state_dict,
+        distckpt, "_model_sharded_state_dict", fake_model_sharded_state_dict
     )
     monkeypatch.setattr(distckpt.dist_checkpointing, "save", fake_save)
 
@@ -1306,27 +1118,19 @@ def test_distckpt_save_validates_tied_embedding_before_logical_collapse(
 
 
 @pytest.mark.parametrize(
-    "canonical_name",
-    ["embed.embedding.weight", "embed_tokens.embedding.weight"],
+    "canonical_name", ["embed.embedding.weight", "embed_tokens.embedding.weight"]
 )
 def test_hf_export_accepts_equal_mtp_embedding_replica(canonical_name: str) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        _validate_mtp_embedding_replica,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import _validate_mtp_embedding_replica
 
     canonical = torch.arange(6, dtype=torch.float32).reshape(3, 2)
     _validate_mtp_embedding_replica(
-        {
-            canonical_name: canonical,
-            "mtp_embed.embedding.weight": canonical.clone(),
-        }
+        {canonical_name: canonical, "mtp_embed.embedding.weight": canonical.clone()}
     )
 
 
 def test_hf_export_rejects_perturbed_mtp_embedding_replica() -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        _validate_mtp_embedding_replica,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import _validate_mtp_embedding_replica
 
     canonical = torch.arange(6, dtype=torch.float32).reshape(3, 2)
     replica = canonical.clone()
@@ -1334,17 +1138,12 @@ def test_hf_export_rejects_perturbed_mtp_embedding_replica() -> None:
 
     with pytest.raises(AssertionError, match="divergent PP MTP embedding replica"):
         _validate_mtp_embedding_replica(
-            {
-                "embed.embedding.weight": canonical,
-                "mtp_embed.embedding.weight": replica,
-            }
+            {"embed.embedding.weight": canonical, "mtp_embed.embedding.weight": replica}
         )
 
 
 def test_hf_export_rejects_mtp_embedding_replica_without_canonical() -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        _validate_mtp_embedding_replica,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import _validate_mtp_embedding_replica
 
     with pytest.raises(AssertionError, match="without exactly one canonical"):
         _validate_mtp_embedding_replica(

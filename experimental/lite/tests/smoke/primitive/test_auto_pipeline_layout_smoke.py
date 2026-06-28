@@ -550,9 +550,9 @@ def _assert_snapshot_changed(
     before: dict[str, torch.Tensor], named_parameters, *, label: str
 ) -> list[str]:
     after = {name: parameter.detach().cpu() for name, parameter in named_parameters}
-    assert before.keys() == after.keys(), (
-        f"{label}: parameter set changed during optimizer step"
-    )
+    assert (
+        before.keys() == after.keys()
+    ), f"{label}: parameter set changed during optimizer step"
     changed = [name for name in before if not torch.equal(before[name], after[name])]
     assert changed, f"{label}: optimizer step did not change any selected parameter"
     return changed
@@ -567,9 +567,9 @@ def _optimizer_master_snapshot(handle) -> list[torch.Tensor]:
 
 def _assert_optimizer_master_changed(handle, before: list[torch.Tensor]) -> int:
     after = list(handle._optimizer.get_parameters())
-    assert len(before) == len(after), (
-        "optimizer main-parameter count changed during step"
-    )
+    assert len(before) == len(
+        after
+    ), "optimizer main-parameter count changed during step"
     changed = sum(
         not torch.equal(old, new.detach().cpu())
         for old, new in zip(before, after, strict=True)
@@ -597,9 +597,9 @@ def _assert_optimizer_state_initialized(handle) -> int:
             for key, value in state.items():
                 if not isinstance(value, torch.Tensor):
                     continue
-                assert torch.isfinite(value.float()).all(), (
-                    f"optimizer state {key} contains non-finite values"
-                )
+                assert torch.isfinite(
+                    value.float()
+                ).all(), f"optimizer state {key} contains non-finite values"
                 state_tensors.append(value)
                 if key in {"exp_avg", "exp_avg_sq"}:
                     moving_average_tensors.append(value)
@@ -616,9 +616,9 @@ def _assert_successful_optimizer_step(
 ) -> dict:
     update_successful, grad_norm, num_zeros = runtime.optimizer_step(handle)
     assert update_successful is True, f"{label}: optimizer rejected/skipped the update"
-    assert torch.isfinite(torch.tensor(grad_norm)), (
-        f"{label}: non-finite grad_norm={grad_norm}"
-    )
+    assert torch.isfinite(
+        torch.tensor(grad_norm)
+    ), f"{label}: non-finite grad_norm={grad_norm}"
     assert grad_norm > 0.0, f"{label}: zero grad norm permits a no-op optimizer pass"
     changed_main = _assert_optimizer_master_changed(handle, master_before)
     optimizer_state_tensors = _assert_optimizer_state_initialized(handle)
@@ -649,20 +649,20 @@ def _gather_and_validate_pipeline_layout(
     by_stage: dict[int, list[dict]] = {}
     for item in gathered:
         by_stage.setdefault(item["pp_rank"], []).append(item)
-    assert sorted(by_stage) == list(range(ps.pp_size)), (
-        f"PP ranks are incomplete or out of range: {sorted(by_stage)}"
-    )
+    assert sorted(by_stage) == list(
+        range(ps.pp_size)
+    ), f"PP ranks are incomplete or out of range: {sorted(by_stage)}"
     expected_peers = dist.get_world_size() // ps.pp_size
     splits = []
     for pp_rank in range(ps.pp_size):
         peers = by_stage[pp_rank]
-        assert len(peers) == expected_peers, (
-            f"PP stage {pp_rank} has {len(peers)} peers, want {expected_peers}"
-        )
+        assert (
+            len(peers) == expected_peers
+        ), f"PP stage {pp_rank} has {len(peers)} peers, want {expected_peers}"
         ownership = {tuple(item["layers"]) for item in peers}
-        assert len(ownership) == 1, (
-            f"TP/EP/DP peers disagree on PP stage {pp_rank} layer ownership: {ownership}"
-        )
+        assert (
+            len(ownership) == 1
+        ), f"TP/EP/DP peers disagree on PP stage {pp_rank} layer ownership: {ownership}"
         splits.append(list(next(iter(ownership))))
 
     flat = [layer for split in splits for layer in split]
@@ -716,13 +716,13 @@ def _assert_exact_export_manifest(
     )
     for key, expected_shape in expected_shapes.items():
         actual_shape = tuple(weights[key].shape)
-        assert actual_shape == expected_shape, (
-            f"{model_name}: {key} shape={actual_shape}, want {expected_shape}"
-        )
+        assert (
+            actual_shape == expected_shape
+        ), f"{model_name}: {key} shape={actual_shape}, want {expected_shape}"
         if key.endswith(".tid2eid"):
-            assert weights[key].dtype == torch.int64, (
-                f"{model_name}: {key} dtype={weights[key].dtype}, want torch.int64"
-            )
+            assert (
+                weights[key].dtype == torch.int64
+            ), f"{model_name}: {key} dtype={weights[key].dtype}, want torch.int64"
 
 
 def _glm5_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
@@ -807,10 +807,7 @@ def _glm5_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
                             cfg.moe_intermediate_size,
                             hidden,
                         ),
-                        f"{expert}up_proj.weight": (
-                            cfg.moe_intermediate_size,
-                            hidden,
-                        ),
+                        f"{expert}up_proj.weight": (cfg.moe_intermediate_size, hidden),
                         f"{expert}down_proj.weight": (
                             hidden,
                             cfg.moe_intermediate_size,
@@ -877,10 +874,7 @@ def _deepseek_v4_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
                     cfg.o_groups * cfg.o_lora_rank,
                     num_heads_per_group * cfg.head_dim,
                 ),
-                f"{prefix}attn.wo_b.weight": (
-                    hidden,
-                    cfg.o_groups * cfg.o_lora_rank,
-                ),
+                f"{prefix}attn.wo_b.weight": (hidden, cfg.o_groups * cfg.o_lora_rank),
                 f"{prefix}attn.attn_sink": (cfg.num_attention_heads,),
                 f"{prefix}hc_attn_fn": (hc_mix, cfg.hc_mult * hidden),
                 f"{prefix}hc_attn_base": (hc_mix,),
@@ -949,10 +943,7 @@ def _deepseek_v4_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
                         indexer_compressor_width,
                         hidden,
                     ),
-                    f"{indexer}compressor.ape": (
-                        ratio,
-                        indexer_compressor_width,
-                    ),
+                    f"{indexer}compressor.ape": (ratio, indexer_compressor_width),
                     f"{indexer}compressor.norm.weight": (cfg.index_head_dim,),
                 }
             )
@@ -1048,14 +1039,8 @@ def _qwen35_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
                 {
                     f"{attn}in_proj_qkv.weight": (2 * qk_dim + value_dim, hidden),
                     f"{attn}in_proj_z.weight": (value_dim, hidden),
-                    f"{attn}in_proj_b.weight": (
-                        cfg.linear_num_value_heads,
-                        hidden,
-                    ),
-                    f"{attn}in_proj_a.weight": (
-                        cfg.linear_num_value_heads,
-                        hidden,
-                    ),
+                    f"{attn}in_proj_b.weight": (cfg.linear_num_value_heads, hidden),
+                    f"{attn}in_proj_a.weight": (cfg.linear_num_value_heads, hidden),
                     f"{attn}conv1d.weight": (
                         2 * qk_dim + value_dim,
                         1,
@@ -1133,10 +1118,7 @@ def _qwen35_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
                             cfg.moe_intermediate_size,
                             hidden,
                         ),
-                        f"{expert}up_proj.weight": (
-                            cfg.moe_intermediate_size,
-                            hidden,
-                        ),
+                        f"{expert}up_proj.weight": (cfg.moe_intermediate_size, hidden),
                         f"{expert}down_proj.weight": (
                             hidden,
                             cfg.moe_intermediate_size,
@@ -1146,10 +1128,7 @@ def _qwen35_expected_export_shapes(cfg) -> dict[str, tuple[int, ...]]:
     return expected
 
 
-_QWEN35_FP32_CHECKPOINT_SUFFIXES = (
-    ".linear_attn.A_log",
-    ".linear_attn.norm.weight",
-)
+_QWEN35_FP32_CHECKPOINT_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
 
 
 def _expected_floating_export_dtype(model_name: str, key: str) -> torch.dtype:
@@ -1164,9 +1143,9 @@ def _validate_model_specific_hf_keys(
     keys = set(weights)
     embed_key, norm_key, head_key = _required_hf_roots(model_name)
     for required in (embed_key, norm_key, head_key):
-        assert required in keys, (
-            f"{model_name}: HF export is missing required tensor {required}"
-        )
+        assert (
+            required in keys
+        ), f"{model_name}: HF export is missing required tensor {required}"
     assert tuple(weights[embed_key].shape) == (cfg.vocab_size, cfg.hidden_size)
     assert tuple(weights[norm_key].shape) == (cfg.hidden_size,)
     assert tuple(weights[head_key].shape) == (cfg.vocab_size, cfg.hidden_size)
@@ -1188,9 +1167,9 @@ def _validate_model_specific_hf_keys(
             model_name, weights, _qwen35_expected_export_shapes(cfg)
         )
         mtp_keys = {key for key in keys if key.startswith("mtp.")}
-        assert len(mtp_keys) == 17 + 3 * cfg.num_experts, (
-            f"qwen3_5: incomplete released MTP schema; got {len(mtp_keys)} keys"
-        )
+        assert (
+            len(mtp_keys) == 17 + 3 * cfg.num_experts
+        ), f"qwen3_5: incomplete released MTP schema; got {len(mtp_keys)} keys"
         return
 
     if model_name == "kimi_k2":
@@ -1198,9 +1177,9 @@ def _validate_model_specific_hf_keys(
             if not cfg.is_moe_layer(layer_idx):
                 continue
             bias_key = f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"
-            assert bias_key in keys, (
-                f"kimi_k2: PP export is missing router correction buffer {bias_key}"
-            )
+            assert (
+                bias_key in keys
+            ), f"kimi_k2: PP export is missing router correction buffer {bias_key}"
 
 
 def _validate_rank0_export_and_reload(exported, cfg, model_name: str, tmp_path) -> int:
@@ -1217,13 +1196,13 @@ def _validate_rank0_export_and_reload(exported, cfg, model_name: str, tmp_path) 
     weights = {name: tensor.detach().cpu().contiguous() for name, tensor in exported}
     assert weights, f"{model_name}: export returned zero tensors"
     for name, tensor in weights.items():
-        assert _is_valid_hf_export_key(name, model_name), (
-            f"{model_name}: invalid HF key schema {name}"
-        )
+        assert _is_valid_hf_export_key(
+            name, model_name
+        ), f"{model_name}: invalid HF key schema {name}"
         assert tensor.numel() > 0, f"{model_name}: empty exported tensor {name}"
-        assert torch.isfinite(tensor.float()).all(), (
-            f"{model_name}: non-finite exported tensor {name}"
-        )
+        assert torch.isfinite(
+            tensor.float()
+        ).all(), f"{model_name}: non-finite exported tensor {name}"
         if tensor.dtype.is_floating_point:
             expected_dtype = _expected_floating_export_dtype(model_name, name)
             assert tensor.dtype == expected_dtype, (
@@ -1231,15 +1210,17 @@ def _validate_rank0_export_and_reload(exported, cfg, model_name: str, tmp_path) 
                 f"want {expected_dtype}"
             )
         else:
-            assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
-                f"{model_name}: {name} has unexpected integer dtype {tensor.dtype}"
-            )
+            assert tensor.dtype in (
+                torch.int64,
+                torch.int32,
+                torch.bool,
+            ), f"{model_name}: {name} has unexpected integer dtype {tensor.dtype}"
 
     present = _hf_decoder_layer_indices(weights)
     expected = set(range(cfg.num_hidden_layers))
-    assert expected.issubset(present), (
-        f"{model_name}: uneven-PP export dropped decoder layers {sorted(expected - present)}"
-    )
+    assert expected.issubset(
+        present
+    ), f"{model_name}: uneven-PP export dropped decoder layers {sorted(expected - present)}"
     _validate_model_specific_hf_keys(model_name, cfg, weights)
 
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
@@ -1253,13 +1234,13 @@ def _validate_rank0_export_and_reload(exported, cfg, model_name: str, tmp_path) 
     ) as reader:
         for name in reader.keys():
             reloaded[name] = reader.get_tensor(name)
-    assert reloaded.keys() == weights.keys(), (
-        f"{model_name}: safetensors reload key mismatch"
-    )
+    assert (
+        reloaded.keys() == weights.keys()
+    ), f"{model_name}: safetensors reload key mismatch"
     for name in weights:
-        assert torch.equal(reloaded[name], weights[name]), (
-            f"{model_name}: safetensors reload changed tensor {name}"
-        )
+        assert torch.equal(
+            reloaded[name], weights[name]
+        ), f"{model_name}: safetensors reload changed tensor {name}"
     return len(weights)
 
 
@@ -1378,9 +1359,9 @@ def test_uneven_pp_builds_trains_and_exports(model_name, tmp_path):
         if mtp_hook is not None:
             mtp_hook.remove()
     loss = result.model_output.loss
-    assert loss is not None and torch.isfinite(loss).all(), (
-        f"{model_name}: non-finite loss {loss} on uneven PP layout"
-    )
+    assert (
+        loss is not None and torch.isfinite(loss).all()
+    ), f"{model_name}: non-finite loss {loss} on uneven PP layout"
     named_parameters = _named_local_parameters(handle)
     nonzero_grads = _assert_finite_nonzero_gradient_signal(
         named_parameters, label=f"{model_name} uneven-PP model"
@@ -1420,9 +1401,9 @@ def test_uneven_pp_builds_trains_and_exports(model_name, tmp_path):
             mtp_parameters, label=f"{model_name} MTP block"
         )
     else:
-        assert not mtp_parameters, (
-            f"non-MTP stage unexpectedly owns {model_name} MTP parameters"
-        )
+        assert (
+            not mtp_parameters
+        ), f"non-MTP stage unexpectedly owns {model_name} MTP parameters"
         assert not captured_mtp_losses
         nonzero_mtp_grads = []
     model_before = _snapshot_named_parameters(named_parameters)
@@ -1454,12 +1435,12 @@ def test_uneven_pp_builds_trains_and_exports(model_name, tmp_path):
     )
     changed_mtp_embedding = [name for name in changed_mtp if ".mtp_embed." in name]
     if local_has_mtp and ps.pp_size > 1:
-        assert any(".mtp_embed." in name for name in nonzero_mtp_grads), (
-            f"{model_name}: PP MTP embedding replica received no nonzero gradient"
-        )
-        assert changed_mtp_embedding, (
-            f"{model_name}: optimizer did not update the PP MTP embedding replica"
-        )
+        assert any(
+            ".mtp_embed." in name for name in nonzero_mtp_grads
+        ), f"{model_name}: PP MTP embedding replica received no nonzero gradient"
+        assert (
+            changed_mtp_embedding
+        ), f"{model_name}: optimizer did not update the PP MTP embedding replica"
     # Export across the uneven PP split, persist it, and exact-reload it. This is
     # deliberately stronger than merely finding one finite key per decoder layer.
     protocol = handle._extras["protocol"]
@@ -1567,9 +1548,9 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
         for layer_idx in local
         if cfg.dsa_indexer_type(layer_idx) == "shared"
     ]
-    assert all(source_idx in local for _, source_idx in local_shared_sources), (
-        local_shared_sources
-    )
+    assert all(
+        source_idx in local for _, source_idx in local_shared_sources
+    ), local_shared_sources
     validated_splits, _layout = _gather_and_validate_pipeline_layout(handle, cfg)
 
     local_model = unwrap_model(handle._extras["model_chunks"][0])
@@ -1609,9 +1590,9 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
         if mtp_hook is not None:
             mtp_hook.remove()
     loss = result.model_output.loss
-    assert loss is not None and torch.isfinite(loss).all(), (
-        f"glm52_indexshare: non-finite loss {loss} on 78-layer uneven PP layout"
-    )
+    assert (
+        loss is not None and torch.isfinite(loss).all()
+    ), f"glm52_indexshare: non-finite loss {loss} on 78-layer uneven PP layout"
 
     named_parameters = _named_local_parameters(handle)
     _assert_finite_nonzero_gradient_signal(
@@ -1667,10 +1648,7 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
     mtp_before = _snapshot_named_parameters(mtp_parameters)
     master_before = _optimizer_master_snapshot(handle)
     optimizer_stats = _assert_successful_optimizer_step(
-        runtime,
-        handle,
-        label="glm52 IndexShare PP8",
-        master_before=master_before,
+        runtime, handle, label="glm52 IndexShare PP8", master_before=master_before
     )
     changed_trunk_indexers = _assert_snapshot_changed(
         trunk_indexer_before,
@@ -1698,9 +1676,9 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
         boundary_embedding_changed = not torch.equal(
             boundary_embedding_before, boundary_embedding_after
         )
-        assert boundary_embedding_changed, (
-            f"GLM5.2 PP boundary embedding did not update on pp_rank={ps.pp_rank}"
-        )
+        assert (
+            boundary_embedding_changed
+        ), f"GLM5.2 PP boundary embedding did not update on pp_rank={ps.pp_rank}"
 
     stage_info = {
         "pp_rank": ps.pp_rank,
@@ -1742,9 +1720,9 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
     assert torch.equal(
         ordered[0]["boundary_embedding"], ordered[7]["boundary_embedding"]
     ), "canonical and MTP-stage embedding diverged after the optimizer step"
-    assert all(item["boundary_embedding"] is None for item in ordered[1:7]), (
-        "a middle PP stage unexpectedly reported a shared embedding replica"
-    )
+    assert all(
+        item["boundary_embedding"] is None for item in ordered[1:7]
+    ), "a middle PP stage unexpectedly reported a shared embedding replica"
     assert all(item["changed_trunk_indexers"] > 0 for item in ordered)
     if dist.get_rank() == 0:
         print(

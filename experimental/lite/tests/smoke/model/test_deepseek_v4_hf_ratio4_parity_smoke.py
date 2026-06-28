@@ -162,11 +162,7 @@ def _copy_hf_ratio4_attention_weights(hf_attention, lite_attention) -> None:
         ),
         ("compressor-position", lite_compressor.ape, hf_compressor.position_bias),
         ("compressor-norm", lite_compressor.norm.weight, hf_compressor.kv_norm.weight),
-        (
-            "indexer-query",
-            lite_indexer.wq_b.weight,
-            hf_indexer.q_b_proj.weight,
-        ),
+        ("indexer-query", lite_indexer.wq_b.weight, hf_indexer.q_b_proj.weight),
         (
             "indexer-weights",
             lite_indexer.weights_proj.weight,
@@ -229,9 +225,9 @@ def _sliding_causal_mask(
 
 
 def _metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
-    assert candidate.shape == reference.shape, (
-        f"candidate shape {tuple(candidate.shape)} != reference shape {tuple(reference.shape)}"
-    )
+    assert (
+        candidate.shape == reference.shape
+    ), f"candidate shape {tuple(candidate.shape)} != reference shape {tuple(reference.shape)}"
     reference = reference.detach().float()
     candidate = candidate.detach().float()
     assert torch.isfinite(reference).all()
@@ -313,14 +309,11 @@ def test_dsv4_transformers_512_ratio4_csa_attention_numeric_parity():
     pytest.importorskip("transformer_engine.pytorch")
     pytest.importorskip("cudnn", reason="MLite fused ratio-4 CSA requires cuDNN DSA.")
 
+    from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
+    from megatron.lite.primitive.parallel import ParallelState
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
-
-    from megatron.lite.primitive.modules.attention.csa import (
-        CompressedSparseAttention,
-    )
-    from megatron.lite.primitive.parallel import ParallelState
 
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(20260627)
@@ -354,9 +347,9 @@ def test_dsv4_transformers_512_ratio4_csa_attention_numeric_parity():
     assert lite_torch.compressor is not None
     assert lite_torch.indexer is not None
     compressed_entries = _SEQ // _COMPRESS_RATIO
-    assert _INDEX_TOPK < compressed_entries, (
-        "the parity batch must make Lightning Indexer selection genuinely sparse"
-    )
+    assert (
+        _INDEX_TOPK < compressed_entries
+    ), "the parity batch must make Lightning Indexer selection genuinely sparse"
 
     generator = torch.Generator(device="cpu").manual_seed(20260628)
     hidden_cpu = torch.randn(
@@ -406,10 +399,7 @@ def test_dsv4_transformers_512_ratio4_csa_attention_numeric_parity():
 
     head_generator = torch.Generator(device="cpu").manual_seed(20260629)
     head_weight = torch.randn(
-        _VOCAB,
-        lite_config.hidden_size,
-        generator=head_generator,
-        dtype=torch.float32,
+        _VOCAB, lite_config.hidden_size, generator=head_generator, dtype=torch.float32
     ).mul_(lite_config.hidden_size**-0.5)
     head_weight = head_weight.to(device=device, dtype=torch.bfloat16)
     hf_logits = F.linear(hf_output, head_weight)
@@ -464,14 +454,10 @@ def test_dsv4_transformers_512_ratio4_csa_attention_numeric_parity():
     assert lite_torch_hidden.grad is not None
     assert lite_fused_hidden.grad is not None
     input_grad_hf_torch = _assert_hf_parity(
-        "input-gradient/hf-vs-lite-torch",
-        hf_hidden.grad,
-        lite_torch_hidden.grad,
+        "input-gradient/hf-vs-lite-torch", hf_hidden.grad, lite_torch_hidden.grad
     )
     input_grad_hf_fused = _assert_hf_parity(
-        "input-gradient/hf-vs-lite-fused",
-        hf_hidden.grad,
-        lite_fused_hidden.grad,
+        "input-gradient/hf-vs-lite-fused", hf_hidden.grad, lite_fused_hidden.grad
     )
     input_grad_torch_fused = _assert_lite_backend_parity(
         "input-gradient/lite-torch-vs-fused",

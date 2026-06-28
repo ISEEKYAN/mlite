@@ -5,11 +5,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.modules.attention.cp import (
     compress_contiguous_chunks_for_cp,
     iter_cp_sources,
 )
+from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import (
     _yarn_find_correction_range,
@@ -28,7 +28,9 @@ class GroupedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out_per_group = self.out_features // self.n_groups
-        weight = self.weight.view(self.n_groups, out_per_group, self.in_features_per_group)
+        weight = self.weight.view(
+            self.n_groups, out_per_group, self.in_features_per_group
+        )
         return torch.einsum("...gd,god->...go", x, weight)
 
 
@@ -42,7 +44,10 @@ def build_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, rope_head_dim, 2, device=device, dtype=torch.float32) / rope_head_dim)
+        ** (
+            torch.arange(0, rope_head_dim, 2, device=device, dtype=torch.float32)
+            / rope_head_dim
+        )
     )
     freqs = torch.einsum("bs,d->bsd", position_ids.to(torch.float32), inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)
@@ -60,11 +65,13 @@ def build_yarn_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dim = rope_head_dim
     inv_freq_extra = 1.0 / (
-        rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        rope_theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     inv_freq_inter = 1.0 / (
         config.rotary_scaling_factor
-        * rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        * rope_theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     low, high = _yarn_find_correction_range(
         config.beta_fast,
@@ -99,7 +106,9 @@ def build_compressed_rope_cos_sin(
             device=device,
             dtype=dtype,
         )
-    return build_rope_cos_sin(position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype)
+    return build_rope_cos_sin(
+        position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype
+    )
 
 
 def apply_partial_rope(
@@ -123,7 +132,9 @@ def apply_partial_rope(
 
 
 class CompressedSequenceCompressor(nn.Module):
-    def __init__(self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False):
+    def __init__(
+        self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False
+    ):
         super().__init__()
         self.config = config
         self.compress_ratio = compress_ratio
@@ -140,7 +151,9 @@ class CompressedSequenceCompressor(nn.Module):
         self.norm = te.RMSNorm(head_dim, eps=config.rms_norm_eps)
         nn.init.normal_(self.ape, mean=0.0, std=config.initializer_range)
 
-    def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
+    def _overlap_transform(
+        self, tensor: torch.Tensor, fill_value: float
+    ) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape
         out = tensor.new_full((bsz, n_blocks, 2 * ratio, head_dim), fill_value)
         out[:, :, ratio:] = tensor[:, :, :, 1]
@@ -160,7 +173,9 @@ class CompressedSequenceCompressor(nn.Module):
         gate = self.wgate(x[:, :cutoff])
         content = content.view(bsz, n_blocks, ratio, self.coff, self.head_dim)
         gate = gate.view_as(content)
-        gate = gate + self.ape.view(1, 1, ratio, self.coff, self.head_dim).to(gate.device)
+        gate = gate + self.ape.view(1, 1, ratio, self.coff, self.head_dim).to(
+            gate.device
+        )
         if self.overlap:
             content = self._overlap_transform(content, 0.0)
             gate = self._overlap_transform(gate, float("-inf"))
@@ -211,9 +226,7 @@ def _window_topk_indices(
 
 
 def _mask_compressed_scores_with_indexer(
-    compressed_scores: torch.Tensor,
-    index_scores: torch.Tensor,
-    index_topk: int,
+    compressed_scores: torch.Tensor, index_scores: torch.Tensor, index_topk: int
 ) -> torch.Tensor:
     """Apply the Lightning Indexer's selection as a pure block mask.
 
@@ -269,20 +282,16 @@ class CompressedSparseAttentionIndexer(nn.Module):
         self.wq_b = nn.Linear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
-        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+        self.weights_proj = nn.Linear(
+            config.hidden_size, config.index_n_heads, bias=False
+        )
         self.compressor = CompressedSequenceCompressor(
             config, compress_ratio, config.index_head_dim, rotate=True
         )
 
 
 class CompressedSparseAttention(nn.Module):
-    def __init__(
-        self,
-        config,
-        *,
-        layer_idx: int,
-        ps: ParallelState,
-    ):
+    def __init__(self, config, *, layer_idx: int, ps: ParallelState):
         super().__init__()
         self.config = config
         self.ps = ps
@@ -301,7 +310,9 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = 0
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
@@ -309,7 +320,9 @@ class CompressedSparseAttention(nn.Module):
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = nn.Linear(
+            config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
+        )
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
@@ -330,10 +343,14 @@ class CompressedSparseAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.ps.cp_size > 1 and attention_mask is not None:
-            raise ValueError("CP expects attention_mask=None; masks are derived from position_ids.")
+            raise ValueError(
+                "CP expects attention_mask=None; masks are derived from position_ids."
+            )
         batch, seq_len, _ = x.shape
         attention_rope_theta = (
-            self.config.compress_rope_theta if self.compress_ratio > 1 else self.config.rope_theta
+            self.config.compress_rope_theta
+            if self.compress_ratio > 1
+            else self.config.rope_theta
         )
         cos, sin = build_compressed_rope_cos_sin(
             position_ids,
@@ -345,11 +362,19 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.wq_b(q_low)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         q = q * torch.rsqrt(
             q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         ).to(dtype=q.dtype)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        kv = (
+            self.kv_norm(self.wkv(x))
+            .view(batch, seq_len, 1, self.head_dim)
+            .transpose(1, 2)
+        )
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
         use_sparse_backend = self.attention_backend not in {"local", "eager", "torch"}
@@ -372,12 +397,7 @@ class CompressedSparseAttention(nn.Module):
             )
         if use_sparse_backend and self.ps.cp_size == 1 and attention_mask is None:
             return self._forward_fused_sparse_no_indexer_cp1(
-                x,
-                q,
-                kv,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
+                x, q, kv, position_ids=position_ids, cos=cos, sin=sin
             )
 
         dense_score_parts = []
@@ -394,9 +414,7 @@ class CompressedSparseAttention(nn.Module):
                 self.head_dim**0.5
             )
             source_mask = _source_scores_mask(
-                position_ids,
-                source_pos,
-                sliding_window=self.config.sliding_window,
+                position_ids, source_pos, sliding_window=self.config.sliding_window
             ).unsqueeze(1)
             scores = scores.masked_fill(~source_mask, -float("inf"))
             dense_score_parts.append(scores)
@@ -429,11 +447,11 @@ class CompressedSparseAttention(nn.Module):
                 q.float(), compressed_values.float().transpose(-1, -2)
             ) / (self.head_dim**0.5)
             compressed_valid = _compressed_scores_mask(
-                position_ids,
-                compressed_pos,
-                ratio=self.compress_ratio,
+                position_ids, compressed_pos, ratio=self.compress_ratio
             ).unsqueeze(1)
-            compressed_scores = compressed_scores.masked_fill(~compressed_valid, -float("inf"))
+            compressed_scores = compressed_scores.masked_fill(
+                ~compressed_valid, -float("inf")
+            )
 
             if self.indexer is not None:
                 index_comp_pack = compress_contiguous_chunks_for_cp(
@@ -462,11 +480,16 @@ class CompressedSparseAttention(nn.Module):
                     q_idx = (
                         self.indexer.wq_b(q_low)
                         .view(
-                            batch, seq_len, self.indexer.index_n_heads, self.indexer.index_head_dim
+                            batch,
+                            seq_len,
+                            self.indexer.index_n_heads,
+                            self.indexer.index_head_dim,
                         )
                         .transpose(1, 2)
                     )
-                    q_idx = apply_partial_rope(q_idx, idx_cos, idx_sin, self.indexer.rope_head_dim)
+                    q_idx = apply_partial_rope(
+                        q_idx, idx_cos, idx_sin, self.indexer.rope_head_dim
+                    )
                     # The indexer compressor stores Hadamard-rotated keys for
                     # the fused kernel.  Rotate the eager query as well: an
                     # orthonormal transform preserves q·k only when applied to
@@ -481,17 +504,15 @@ class CompressedSparseAttention(nn.Module):
                     index_scores = torch.einsum(
                         "bhsd,btd->bsht", q_idx.float(), k_idx.float()
                     ).relu()
-                    index_scores = (index_scores * index_weights.unsqueeze(-1)).sum(dim=2)
+                    index_scores = (index_scores * index_weights.unsqueeze(-1)).sum(
+                        dim=2
+                    )
                     index_valid = _compressed_scores_mask(
-                        position_ids,
-                        index_pos,
-                        ratio=self.compress_ratio,
+                        position_ids, index_pos, ratio=self.compress_ratio
                     )
                     index_scores = index_scores.masked_fill(~index_valid, -float("inf"))
                     compressed_scores = _mask_compressed_scores_with_indexer(
-                        compressed_scores,
-                        index_scores,
-                        self.indexer.index_topk,
+                        compressed_scores, index_scores, self.indexer.index_topk
                     )
             score_parts.append(compressed_scores)
             value_parts.append(compressed_values)
@@ -503,8 +524,12 @@ class CompressedSparseAttention(nn.Module):
             .to(dtype=scores.dtype)
         )
         combined_scores = torch.cat([scores, sink], dim=-1)
-        combined_scores = combined_scores - combined_scores.max(dim=-1, keepdim=True).values
-        probs = torch.softmax(combined_scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+        combined_scores = (
+            combined_scores - combined_scores.max(dim=-1, keepdim=True).values
+        )
+        probs = torch.softmax(combined_scores, dim=-1, dtype=torch.float32).to(
+            dtype=q.dtype
+        )
 
         context = q.new_zeros(batch, self.num_heads, seq_len, self.head_dim)
         offset = 0
@@ -519,10 +544,15 @@ class CompressedSparseAttention(nn.Module):
     def _project_context(
         self, context: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(1, 2)
+        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(
+            1, 2
+        )
         batch, seq_len = context.shape[:2]
         grouped = context.reshape(
-            batch, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
+            batch,
+            seq_len,
+            self.config.o_groups,
+            self.num_heads_per_group * self.head_dim,
         )
         return self.wo_b(self.wo_a(grouped).flatten(2))
 
@@ -558,22 +588,19 @@ class CompressedSparseAttention(nn.Module):
         kv_full = kv.squeeze(1)
         kv_full = kv_full.transpose(0, 1).contiguous()
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
 
         compressed = None
         if self.compressor is not None and self.compress_ratio > 1:
             compressed = self.compressor(
-                x,
-                position_ids=position_ids,
-                rope_theta=self.config.compress_rope_theta,
+                x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
             )
             if compressed is not None:
                 compressed_kv = compressed.squeeze(1)
-                kv_full = torch.cat([kv_full, compressed_kv.transpose(0, 1).contiguous()], dim=0)
+                kv_full = torch.cat(
+                    [kv_full, compressed_kv.transpose(0, 1).contiguous()], dim=0
+                )
 
         if compressed is not None:
             n_compressed = compressed.size(2)
@@ -597,20 +624,16 @@ class CompressedSparseAttention(nn.Module):
             )
         else:
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
 
         out = dsa_kernels.dsa_sparse_attn(
-            query,
-            kv_full,
-            self.sinks.float(),
-            flat_idxs,
-            self.head_dim**-0.5,
+            query, kv_full, self.sinks.float(), flat_idxs, self.head_dim**-0.5
         )
         context = (
-            out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
+            out.view(seq_len, batch, self.num_heads, self.head_dim)
+            .permute(1, 2, 0, 3)
+            .contiguous()
         )
         return self._project_context(context, cos, sin)
 
@@ -627,7 +650,9 @@ class CompressedSparseAttention(nn.Module):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.ps.cp_size != 1:
-            raise NotImplementedError("DeepSeek V4 fused DSA path currently supports CP=1 only.")
+            raise NotImplementedError(
+                "DeepSeek V4 fused DSA path currently supports CP=1 only."
+            )
         if attention_mask is not None:
             raise NotImplementedError(
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
@@ -652,17 +677,15 @@ class CompressedSparseAttention(nn.Module):
             kv = torch.nn.functional.pad(kv, (0, 0, 0, pad))
         batch, seq_len, _ = x.shape
         compressed = self.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         index_comp = self.indexer.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         if compressed is None or index_comp is None:
-            raise RuntimeError("DeepSeek V4 fused DSA requires at least one compressed KV entry.")
+            raise RuntimeError(
+                "DeepSeek V4 fused DSA requires at least one compressed KV entry."
+            )
         compressed_kv = compressed.squeeze(1)
         index_k = index_comp.squeeze(1).transpose(0, 1).contiguous()
         kv_full = torch.cat([kv.squeeze(1), compressed_kv], dim=1)
@@ -681,11 +704,16 @@ class CompressedSparseAttention(nn.Module):
             batch, seq_len, self.indexer.index_n_heads, self.indexer.index_head_dim
         )
         q_indexer = q_indexer.transpose(1, 2)
-        q_indexer = apply_partial_rope(q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim)
+        q_indexer = apply_partial_rope(
+            q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim
+        )
         q_indexer = rotate_activation(q_indexer)
         q_indexer = q_indexer.transpose(1, 2).transpose(0, 1).contiguous()
         weights_indexer = (
-            (self.indexer.weights_proj(x).to(dtype=x.dtype) * (self.indexer.index_n_heads**-0.5))
+            (
+                self.indexer.weights_proj(x).to(dtype=x.dtype)
+                * (self.indexer.index_n_heads**-0.5)
+            )
             .transpose(0, 1)
             .contiguous()
         )
@@ -693,10 +721,7 @@ class CompressedSparseAttention(nn.Module):
         if indexer_topk <= 0:
             raise RuntimeError("DeepSeek V4 fused DSA requires positive indexer_topk.")
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
         query = q.transpose(1, 2).transpose(0, 1).contiguous()
         sink = self.sinks.float()
@@ -705,10 +730,7 @@ class CompressedSparseAttention(nn.Module):
             indexer_loss_coeff = 0.0
             fused_q_indexer, fused_index_k, fused_weights_indexer = (
                 _prepare_indexer_inputs_for_fused_loss(
-                    q_indexer,
-                    index_k,
-                    weights_indexer,
-                    loss_coeff=indexer_loss_coeff,
+                    q_indexer, index_k, weights_indexer, loss_coeff=indexer_loss_coeff
                 )
             )
             out, _indexer_loss = dsa_kernels.fused_indexer_sparse_attn(
@@ -738,9 +760,7 @@ class CompressedSparseAttention(nn.Module):
                 indexer_softmax_scale=self.indexer.softmax_scale,
             )
             topk_indices = torch.where(
-                topk_indices >= 0,
-                topk_indices + seq_len,
-                topk_indices,
+                topk_indices >= 0, topk_indices + seq_len, topk_indices
             ).to(torch.int32)
             flat_idxs, flat_tlen = dsa_kernels.build_flat_topk_idxs(
                 window_idxs,
@@ -759,7 +779,9 @@ class CompressedSparseAttention(nn.Module):
             )
 
         context = (
-            out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
+            out.view(seq_len, batch, self.num_heads, self.head_dim)
+            .permute(1, 2, 0, 3)
+            .contiguous()
         )
         if pad:
             context = context[:, :, :orig_seq_len, :].contiguous()

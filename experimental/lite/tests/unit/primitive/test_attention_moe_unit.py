@@ -507,10 +507,7 @@ def test_glm5_cp_per_token_indexer_loss_fails_until_global_divisor_is_wired(
 
 @pytest.mark.parametrize(
     ("calculate_per_token_loss", "expected_weights"),
-    [
-        (False, [0.2, 0.3, 0.5]),
-        (True, [1.0, 1.0, 1.0]),
-    ],
+    [(False, [0.2, 0.3, 0.5]), (True, [1.0, 1.0, 1.0])],
     ids=["mean-kl-token-weighted", "per-token-kl-sum"],
 )
 def test_glm5_packed_dsa_weights_segment_indexer_losses(
@@ -553,12 +550,7 @@ def test_glm5_packed_dsa_weights_segment_indexer_losses(
     )
 
     actual = attention._forward_packed_full(
-        x,
-        cos,
-        sin,
-        positions,
-        packed_seq_params,
-        index_share_state=None,
+        x, cos, sin, positions, packed_seq_params, index_share_state=None
     )
 
     torch.testing.assert_close(actual, x)
@@ -607,12 +599,7 @@ def test_glm5_packed_dsa_rejects_padded_indexer_aux_until_query_mask_exists():
 
     with pytest.raises(NotImplementedError, match="query-valid mask"):
         attention._forward_packed_full(
-            x,
-            cos,
-            sin,
-            positions,
-            packed_seq_params,
-            index_share_state=None,
+            x, cos, sin, positions, packed_seq_params, index_share_state=None
         )
 
 
@@ -630,18 +617,10 @@ def test_dense_dsa_full_causal_lse_is_chunked_and_topk_independent():
     # block loop rather than accidentally validating one monolithic einsum.
     max_score_bytes = 2 * batch * q_heads * seq_k * 4
     actual = dsa_kernels._compute_full_causal_attn_lse(
-        q,
-        k,
-        scale,
-        ratio,
-        max_score_bytes=max_score_bytes,
+        q, k, scale, ratio, max_score_bytes=max_score_bytes
     )
     key_chunked = dsa_kernels._compute_full_causal_attn_lse(
-        q,
-        k,
-        scale,
-        ratio,
-        max_score_bytes=2 * batch * q_heads * 4,
+        q, k, scale, ratio, max_score_bytes=2 * batch * q_heads * 4
     )
 
     expanded_k = k.float().repeat_interleave(q_heads // kv_heads, dim=2)
@@ -650,19 +629,14 @@ def test_dense_dsa_full_causal_lse_is_chunked_and_topk_independent():
     q_pos = torch.arange(seq_q)
     k_pos = torch.arange(seq_k)
     valid_kv = torch.div(
-        q_global_start + q_pos + 1,
-        ratio,
-        rounding_mode="floor",
+        q_global_start + q_pos + 1, ratio, rounding_mode="floor"
     ).clamp(min=0, max=seq_k)
     causal = k_pos.view(1, seq_k) < valid_kv.view(seq_q, 1)
     expected = torch.logsumexp(
-        scores.masked_fill(~causal.view(1, seq_q, 1, seq_k), -torch.inf),
-        dim=-1,
+        scores.masked_fill(~causal.view(1, seq_q, 1, seq_k), -torch.inf), dim=-1
     )
     expected = torch.where(
-        valid_kv.view(1, seq_q, 1) > 0,
-        expected,
-        torch.full_like(expected, torch.inf),
+        valid_kv.view(1, seq_q, 1) > 0, expected, torch.full_like(expected, torch.inf)
     )
 
     torch.testing.assert_close(actual, expected, atol=1.0e-6, rtol=1.0e-6)
@@ -692,26 +666,16 @@ def test_dsa_score_memory_guard_raises_before_predictable_cuda_oom(monkeypatch):
     from megatron.lite.primitive.kernels import dsa_kernels
 
     gib = 1024**3
-    fake_cuda_tensor = SimpleNamespace(
-        is_cuda=True,
-        device=torch.device("cuda", 0),
-    )
+    fake_cuda_tensor = SimpleNamespace(is_cuda=True, device=torch.device("cuda", 0))
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
-        lambda _device: (80 * gib, 288 * gib),
+        torch.cuda, "mem_get_info", lambda _device: (80 * gib, 288 * gib)
     )
 
     with pytest.raises(
-        RuntimeError,
-        match=r"DSA indexer top-k.*estimated peak of 153\.[0-9] GiB",
+        RuntimeError, match=r"DSA indexer top-k.*estimated peak of 153\.[0-9] GiB"
     ):
         dsa_kernels._guard_dsa_score_memory(
-            fake_cuda_tensor,
-            1,
-            202_752,
-            202_752,
-            dense_loss=False,
+            fake_cuda_tensor, 1, 202_752, 202_752, dense_loss=False
         )
 
 
@@ -795,11 +759,7 @@ def test_dense_dsa_kl_matches_canonical_epsilon_placement():
     coeff = 0.25
 
     actual = dsa_kernels._kl_loss_from_dense_scores(
-        attn_score,
-        attn_l1norm,
-        index_logits,
-        index_lse,
-        coeff,
+        attn_score, attn_l1norm, index_logits, index_lse, coeff
     )
 
     target = attn_score[0, 0] / attn_l1norm[0, 0]
@@ -853,11 +813,7 @@ def test_glm5_nonpacked_cp_reconstructs_rank3_rotary_in_zigzag_order(monkeypatch
     attention.cp_group = "cp-group"
 
     gathered_cos, gathered_sin = attention._gather_cp_rotary(
-        cos_parts[0],
-        sin_parts[0],
-        local_seq=4,
-        full_seq=8,
-        device=torch.device("cpu"),
+        cos_parts[0], sin_parts[0], local_seq=4, full_seq=8, device=torch.device("cpu")
     )
     torch.testing.assert_close(gathered_cos, full_cos)
     torch.testing.assert_close(gathered_sin, full_sin)
@@ -865,11 +821,7 @@ def test_glm5_nonpacked_cp_reconstructs_rank3_rotary_in_zigzag_order(monkeypatch
     cache_cos = torch.ones(8, 2)
     cache_sin = torch.zeros(8, 2)
     same_cos, same_sin = attention._gather_cp_rotary(
-        cache_cos,
-        cache_sin,
-        local_seq=4,
-        full_seq=8,
-        device=torch.device("cpu"),
+        cache_cos, cache_sin, local_seq=4, full_seq=8, device=torch.device("cpu")
     )
     assert same_cos is cache_cos
     assert same_sin is cache_sin
@@ -888,9 +840,7 @@ def test_glm5_packed_cp_rejects_inconsistent_padded_extent():
 
     with pytest.raises(ValueError, match="padded packed sequence exactly"):
         attention._gather_packed_cp_inputs(
-            torch.zeros(1, 3, 8),
-            torch.arange(3).unsqueeze(0),
-            packed,
+            torch.zeros(1, 3, 8), torch.arange(3).unsqueeze(0), packed
         )
 
 
@@ -920,11 +870,7 @@ def test_glm5_packed_cp_rejects_invalid_rotary_representations(cos, sin, match):
 
     with pytest.raises(ValueError, match=match):
         attention._gather_packed_cp_rotary(
-            cos,
-            sin,
-            packed,
-            torch.device("cpu"),
-            local_seq=4,
+            cos, sin, packed, torch.device("cpu"), local_seq=4
         )
 
 
@@ -937,21 +883,13 @@ def test_glm5_packed_cp_reconstructs_rank3_rotary(monkeypatch):
     full_sin = full_cos + 100.0
     cos_parts = [
         split_packed_to_cp_local(
-            full_cos,
-            cu_seqlens_padded=cu_seqlens,
-            cp_size=2,
-            cp_rank=rank,
-            dim=1,
+            full_cos, cu_seqlens_padded=cu_seqlens, cp_size=2, cp_rank=rank, dim=1
         )
         for rank in range(2)
     ]
     sin_parts = [
         split_packed_to_cp_local(
-            full_sin,
-            cu_seqlens_padded=cu_seqlens,
-            cp_size=2,
-            cp_rank=rank,
-            dim=1,
+            full_sin, cu_seqlens_padded=cu_seqlens, cp_size=2, cp_rank=rank, dim=1
         )
         for rank in range(2)
     ]
@@ -969,20 +907,14 @@ def test_glm5_packed_cp_reconstructs_rank3_rotary(monkeypatch):
     packed = SimpleNamespace(cu_seqlens_q_padded=cu_seqlens)
 
     gathered_cos, gathered_sin = attention._gather_packed_cp_rotary(
-        cos_parts[0],
-        sin_parts[0],
-        packed,
-        torch.device("cpu"),
-        local_seq=4,
+        cos_parts[0], sin_parts[0], packed, torch.device("cpu"), local_seq=4
     )
     torch.testing.assert_close(gathered_cos, full_cos)
     torch.testing.assert_close(gathered_sin, full_sin)
 
 
 @pytest.mark.parametrize(
-    "metadata_index",
-    [12, 18],
-    ids=["position-local-vs-full", "rotary-local-vs-full"],
+    "metadata_index", [12, 18], ids=["position-local-vs-full", "rotary-local-vs-full"]
 )
 def test_glm5_cp_rejects_mixed_collective_input_representations(
     monkeypatch, metadata_index
@@ -1025,22 +957,14 @@ def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
     )
 
     validate_dsa_index_share_pipeline_split(
-        [0, 1, 2, 3],
-        topk_freq=4,
-        skip_topk_offset=3,
+        [0, 1, 2, 3], topk_freq=4, skip_topk_offset=3
     )
     with pytest.raises(ValueError, match="cannot cross pipeline stages"):
         validate_dsa_index_share_pipeline_split(
-            [3, 4, 5],
-            topk_freq=4,
-            skip_topk_offset=3,
+            [3, 4, 5], topk_freq=4, skip_topk_offset=3
         )
     with pytest.raises(ValueError, match="must execute before"):
-        validate_dsa_index_share_pipeline_split(
-            [3, 2],
-            topk_freq=4,
-            skip_topk_offset=3,
-        )
+        validate_dsa_index_share_pipeline_split([3, 2], topk_freq=4, skip_topk_offset=3)
 
 
 def test_dsa_index_share_pipeline_guard_uses_explicit_nearest_full_source(monkeypatch):
@@ -1053,17 +977,11 @@ def test_dsa_index_share_pipeline_guard_uses_explicit_nearest_full_source(monkey
 
     indexer_types = ["full", "shared", "full", "shared", "shared", "full"]
     validate_dsa_index_share_pipeline_split(
-        [2, 3, 4],
-        topk_freq=1,
-        skip_topk_offset=0,
-        indexer_types=indexer_types,
+        [2, 3, 4], topk_freq=1, skip_topk_offset=0, indexer_types=indexer_types
     )
     with pytest.raises(ValueError, match="cannot cross pipeline stages"):
         validate_dsa_index_share_pipeline_split(
-            [3, 4],
-            topk_freq=1,
-            skip_topk_offset=0,
-            indexer_types=indexer_types,
+            [3, 4], topk_freq=1, skip_topk_offset=0, indexer_types=indexer_types
         )
 
     # A canonical explicit schedule may intentionally contradict freq/offset.
