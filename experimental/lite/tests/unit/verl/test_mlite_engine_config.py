@@ -159,6 +159,35 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.impl_cfg["deterministic"] is False
 
 
+def test_auto_qwen35_weight_sync_uses_resolved_vllm_export_target() -> None:
+    engine = _engine(engine_config=_engine_config())
+    assert engine.engine_config.model_name == "auto"
+    engine._mlite_config = engine._build_mlite_config()
+    assert engine._mlite_config.model_name == "qwen3_5"
+
+    captured = {}
+
+    def export_weights(handle, **kwargs):
+        captured["handle"] = handle
+        captured["kwargs"] = kwargs
+        return ["weight-payload"]
+
+    handle = object()
+    engine.runtime = SimpleNamespace(export_weights=export_weights)
+    engine.handle = handle
+
+    payload, metadata = engine.get_per_tensor_param(limit=3)
+
+    assert payload == ["weight-payload"]
+    assert metadata is None
+    assert captured["handle"] is handle
+    assert captured["kwargs"] == {
+        "limit": 3,
+        "target": "vllm",
+        "export_dtype": "bfloat16",
+    }
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
     opt = SimpleNamespace(
