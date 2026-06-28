@@ -1,0 +1,126 @@
+{
+  "release": {
+    "config": {
+      "path": "config.json",
+      "required_values": {
+        "indexer_rope_interleave": true,
+        "model_type": "glm_moe_dsa",
+        "rope_interleave": true,
+        "transformers_version": "5.12.0"
+      },
+      "sha256": "817f5fb39ca5d4c4b5648de89ca00deaea7537d8c2f130172a459252a05c1073"
+    },
+    "repo": "zai-org/GLM-5.2",
+    "revision": "4d67f66cc64d3219133b767c253b2ad1425c6c88"
+  },
+  "vllm": {
+    "adjacent_pair_contract": {
+      "config_field": "indexer_rope_interleave",
+      "config_value": true,
+      "is_neox_style": false,
+      "layout": "gptj_adjacent_pair"
+    },
+    "files": {
+      "vllm/model_executor/layers/rotary_embedding/common.py": {
+        "required_snippets": [
+          {
+            "expected_count": 2,
+            "text": "if is_neox_style:"
+          },
+          {
+            "expected_count": 2,
+            "text": "x1 = x[..., ::2]"
+          },
+          {
+            "expected_count": 2,
+            "text": "x2 = x[..., 1::2]"
+          },
+          {
+            "expected_count": 1,
+            "text": "output = torch.stack((o1, o2), dim=-1).flatten(-2)"
+          }
+        ],
+        "sha256": "86c9f61904fd3066fd146f0f5b3c5932dd8252841947ffcfd699b18e6a8bde08"
+      },
+      "vllm/model_executor/models/deepseek_v2.py": {
+        "required_snippets": [
+          {
+            "expected_count": 1,
+            "text": "is_neox_style=not getattr(config, \"indexer_rope_interleave\", False)"
+          }
+        ],
+        "sha256": "640b6e60fbacf859f60caff149015dbfc223dff0baf302c507ddd9009b7726a3"
+      }
+    },
+    "gptj_forward_static_golden": {
+      "cos": [
+        [
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.6,
+            -0.8
+          ]
+        ]
+      ],
+      "dtype": "float64",
+      "output": [
+        [
+          [
+            [
+              1.0,
+              2.0,
+              3.0,
+              4.0
+            ]
+          ],
+          [
+            [
+              -1.5,
+              0.5,
+              0.1,
+              4.3
+            ]
+          ]
+        ]
+      ],
+      "sin": [
+        [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.8,
+            0.6
+          ]
+        ]
+      ],
+      "x": [
+        [
+          [
+            [
+              1.0,
+              2.0,
+              3.0,
+              4.0
+            ]
+          ],
+          [
+            [
+              -0.5,
+              1.5,
+              2.5,
+              -3.5
+            ]
+          ]
+        ]
+      ]
+    },
+    "release": "v0.23.0",
+    "repo": "vllm-project/vllm",
+    "revision": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665"
+  }
+}

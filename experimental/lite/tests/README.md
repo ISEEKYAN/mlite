@@ -46,6 +46,22 @@ This is pinned real-checkpoint, dequantized-BF16 q_a projection-level evidence
 through the production `torch.nn.Linear` + Transformer Engine RMSNorm path. It
 is not HF quantized-runtime, full-model, or long-context parity.
 
+The GLM-5.2 indexer-RoPE authority is independent of vanilla Transformers
+5.12, whose indexer ignores the released `indexer_rope_interleave=true` field.
+Fetch the pinned release config and vLLM v0.23.0 sources, verify their exact
+revisions and digests, then run the score/top-k oracle:
+
+```bash
+python experimental/lite/tests/fetch_glm52_rope_layout_authority.py /tmp/glm52-rope
+pytest --mlite-fail-on-skip -q -s \
+  experimental/lite/tests/unit/model/test_glm52_hf_attention_parity.py
+```
+
+The oracle binds MLite's real `DSAIndexer` to the released adjacent-pair
+layout at score/top-k level. The full-model comparison uses an explicitly
+adapted, instance-local HF indexer subclass; it is supporting numerical
+evidence, not a claim of unmodified-Transformers or Megatron-Bridge parity.
+
 Current matrix:
 
 | Surface | Unit | Smoke |
@@ -69,5 +85,7 @@ Current matrix:
 | Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` and single-process CUDA coverage in `unit/primitive/test_fsdp2_offload_gpu.py` | multi-rank offloaded grad clipping is checked against the non-offloaded baseline in `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Qwen3 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 | Qwen3.5 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
+| GLM-5.2 released RoPE/index-share layout | `unit/model/test_glm52_hf_attention_parity.py`, `unit/model/test_glm5_lite_static.py` | `smoke/model/test_glm52_hf_production_layout_full_model_smoke.py`, `smoke/model/test_glm52_fp8_real_weight_projection_smoke.py` |
+| VERL external-engine registry and THD/CP runtime | `unit/verl/test_mlite_engine_config.py` | `unit/verl/test_mlite_engine_cp_smoke.py` (distributed smoke markers; not Ray worker/trainer E2E) |
 
 Classic FSDP is not a separate MLite primitive in the current source tree; MLite's native sharded optimizer coverage is FSDP2 plus Megatron DDP/distopt.

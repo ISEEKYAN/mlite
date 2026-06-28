@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +35,7 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 def _engine(
     *,
     engine_config: MegatronLiteEngineConfig,
-    optimizer_config: SimpleNamespace | None = None
+    optimizer_config: SimpleNamespace | None = None,
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
@@ -48,6 +51,46 @@ def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
+
+
+def test_canonical_config_target_import_registers_default_mlite_backend() -> None:
+    """Exercise the fresh-process import path used by VERL/Hydra configs."""
+
+    script = r"""
+import importlib
+import sys
+
+from verl.workers.engine.base import EngineRegistry
+
+assert "verl_mlite.engine.mlite_engine" not in sys.modules
+config_module = importlib.import_module("verl_mlite.engine.config")
+config = config_module.MegatronLiteEngineConfig(impl_cfg={"use_thd": True})
+assert config.custom_backend_module == "verl_mlite.engine.mlite_engine"
+assert config.strategy == "mlite"
+engine_cls = EngineRegistry.get_engine_cls(
+    model_type="language_model", backend="mlite"
+)
+assert engine_cls.__module__ == config.custom_backend_module
+assert engine_cls.__name__ == "MegatronLiteEngine"
+print("CANONICAL_VERL_MLITE_REGISTRY_PASS")
+"""
+    env = dict(os.environ)
+    env["VERL_ENGINE_DEVICE"] = "cuda"
+    env.pop("VERL_ENGINE_VENDOR", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, (
+        f"fresh VERL registry process failed\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert result.stdout.strip() == "CANONICAL_VERL_MLITE_REGISTRY_PASS"
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:

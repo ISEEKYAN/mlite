@@ -1,21 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Adapted Transformers 5.12 authority for GLM-5.2 production RoPE layout.
+"""ADAPTED Transformers 5.12 full-model check for GLM-5.2 RoPE layout.
 
 Transformers 5.12 already uses its interleaved helper for the main MLA path,
 but ``GlmMoeDsaIndexer.forward`` calls the half-split helper unconditionally
 and ignores the published ``indexer_rope_interleave=true`` checkpoint field.
-The reference below applies one deliberately narrow adapter: within the HF
-modeling module, bind that indexer-only helper name to HF's own interleaved
-helper.  In Transformers 5.12 this symbol has exactly one runtime call site,
-the indexer; the main attention continues to execute the unmodified HF path.
+The reference below applies one deliberately narrow, instance-local adapter:
+only the full layer's indexer is replaced by a test-local subclass whose
+forward calls HF's public interleaved helper. The HF modeling module and its
+globals are never modified; the main attention executes the unmodified path.
 
 The test first proves that vanilla HF and the configured layout choose
 different top-k rows and produce different logits.  It then compares the
-adapted official ``GlmMoeDsaForCausalLM`` with the actual MLite ``Glm5Model``
-through a complete two-layer F/S IndexShare model: dense MLP, MoE, per-layer
-hidden states, logits, fixed external-label shifted CE, and the gradient at the
-embedding output.  Optional production kernels are replaced with explicit
-Torch implementations so this authority lane is deterministic and CPU-only.
+test-locally adapted ``GlmMoeDsaForCausalLM`` with the actual MLite
+``Glm5Model`` through a complete two-layer F/S IndexShare model: dense MLP,
+MoE, per-layer hidden states, logits, fixed external-label shifted CE, and the
+gradient at the embedding output. Optional production kernels are replaced
+with explicit Torch implementations so this supporting comparison is
+deterministic and CPU-only. Release semantics are gated independently by the
+pinned release/vLLM score-and-top-k oracle.
 
 This is not unmodified-Transformers parity, a production sparse-kernel test, or
 coverage for MTP, CP, PP, recompute/offload, or the 202,752-token target.
@@ -23,7 +25,6 @@ coverage for MTP, CP, PP, recompute/offload, or the 202,752-token target.
 
 from __future__ import annotations
 
-import inspect
 import math
 from types import SimpleNamespace
 
@@ -31,7 +32,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke]
 
@@ -227,7 +227,7 @@ def _hf_config():
     import transformers
 
     assert transformers.__version__ == _TRANSFORMERS_AUTHORITY, (
-        "GLM-5.2 HF authority is pinned to Transformers "
+        "GLM-5.2 ADAPTED HF comparison is pinned to Transformers "
         f"{_TRANSFORMERS_AUTHORITY}; got {transformers.__version__}"
     )
     config = transformers.GlmMoeDsaConfig(
@@ -424,10 +424,77 @@ def _capture_first_attention_topk(model, input_ids, position_ids):
     return logits, captured[0]
 
 
+def _make_instance_local_interleaved_indexer(hf_impl, vanilla_indexer):
+    """Replace one HF indexer without changing any HF module-global symbol."""
+
+    class _AdaptedInterleavedGlmMoeDsaIndexer(hf_impl.GlmMoeDsaIndexer):
+        @torch.no_grad()
+        def forward(
+            self,
+            hidden_states,
+            q_resid,
+            position_embeddings,
+            attention_mask,
+            position_ids,
+            past_key_values=None,
+        ):
+            batch_size, seq_len, _ = hidden_states.shape
+            cos, sin = position_embeddings
+            q = self.wq_b(q_resid).view(
+                batch_size, seq_len, self.n_heads, self.head_dim
+            )
+            q_rot, q_pass = torch.split(
+                q,
+                [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
+                dim=-1,
+            )
+
+            k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
+            k_rot, k_pass = torch.split(
+                k,
+                [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
+                dim=-1,
+            )
+            q_rot, k_rot = hf_impl.apply_rotary_pos_emb_interleave(
+                q_rot, k_rot, cos, sin, unsqueeze_dim=2
+            )
+            q = torch.cat((q_rot, q_pass), dim=-1)
+            k = torch.cat((k_rot, k_pass), dim=-1).squeeze(2)
+
+            if past_key_values is not None:
+                k = past_key_values.update_indexer(k, self.layer_idx)
+
+            scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1))
+            scores = F.relu(scores * self.softmax_scale)
+            weights = self.weights_proj(
+                hidden_states.to(self.weights_proj.weight.dtype)
+            ).float() * (self.n_heads**-0.5)
+            index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+            if attention_mask is not None:
+                index_scores = index_scores + attention_mask
+            else:
+                key_positions = torch.arange(
+                    index_scores.shape[-1], device=index_scores.device
+                )
+                causal = key_positions[None, None, :] > position_ids[:, :, None]
+                index_scores = index_scores.masked_fill(causal, float("-inf"))
+
+            topk = min(self.index_topk, index_scores.shape[-1])
+            return index_scores.topk(topk, dim=-1).indices.to(torch.int32)
+
+    reference_parameter = next(vanilla_indexer.parameters())
+    adapted = _AdaptedInterleavedGlmMoeDsaIndexer(
+        vanilla_indexer.config, vanilla_indexer.layer_idx
+    ).to(device=reference_parameter.device, dtype=reference_parameter.dtype)
+    adapted.load_state_dict(vanilla_indexer.state_dict(), strict=True)
+    adapted.train(vanilla_indexer.training)
+    return adapted
+
+
 def test_glm52_transformers_512_adapted_production_layout_full_model_parity(
     tmp_path, transformer_engine_import_stub, monkeypatch
 ):
-    """Configured/interleaved F/S GLM-5.2 vs a one-line adapted HF model."""
+    """Configured/interleaved F/S GLM-5.2 vs instance-locally ADAPTED HF."""
 
     transformers = pytest.importorskip("transformers")
     pytest.importorskip("safetensors")
@@ -448,6 +515,11 @@ def test_glm52_transformers_512_adapted_production_layout_full_model_parity(
     # implementation adapters only; the actual MLite model/layer wiring,
     # checkpoint loader, IndexShare state, and autograd graph remain in use.
     monkeypatch.setattr(lite_impl.te, "RMSNorm", _TorchRMSNorm)
+    monkeypatch.setattr(lite_impl.te, "Linear", _TorchLinear)
+    monkeypatch.setattr(lite_impl.te, "LayerNormLinear", _TorchLayerNormLinear)
+    monkeypatch.setattr(
+        lite_impl.te, "GroupedLinear", _TorchGroupedLinear, raising=False
+    )
     monkeypatch.setattr(linear_impl.te, "Linear", _TorchLinear)
     monkeypatch.setattr(linear_impl.te, "LayerNormLinear", _TorchLayerNormLinear)
     monkeypatch.setattr(
@@ -531,37 +603,18 @@ def test_glm52_transformers_512_adapted_production_layout_full_model_parity(
     )
     position_ids = torch.arange(_SEQ, dtype=torch.long).unsqueeze(0).expand(_BATCH, -1)
 
-    # Unmodified Transformers 5.12 is intentionally not the authority for the
-    # published production layout: it ignores indexer_rope_interleave.
+    # Unmodified Transformers 5.12 is the negative control: its indexer ignores
+    # indexer_rope_interleave even though the released GLM-5.2 config enables it.
     vanilla_logits, vanilla_topk = _capture_first_attention_topk(
         hf_model, input_ids, position_ids
     )
-    indexer_forward = inspect.unwrap(hf_impl.GlmMoeDsaIndexer.forward)
-    module_source = inspect.getsource(hf_impl)
-    indexer_source = inspect.getsource(indexer_forward)
-    attention_source = inspect.getsource(
-        inspect.unwrap(hf_impl.GlmMoeDsaAttention.forward)
-    )
-    # One definition plus one call proves that rebinding the module global can
-    # affect no HF runtime path other than this indexer call site.
-    assert module_source.count("apply_rotary_pos_emb(") == 2
-    assert indexer_source.count("apply_rotary_pos_emb(") == 1
-    assert "apply_rotary_pos_emb_interleave(" in attention_source
-    assert indexer_forward.__globals__["apply_rotary_pos_emb"] is (
-        hf_impl.apply_rotary_pos_emb
-    )
-
-    # Minimal production-layout adapter. In Transformers 5.12 the rebound name
-    # is called only by GlmMoeDsaIndexer; main MLA already calls the explicit
-    # interleaved helper and all remaining HF model code stays untouched.
-    monkeypatch.setattr(
-        hf_impl,
-        "apply_rotary_pos_emb",
-        hf_impl.apply_rotary_pos_emb_interleave,
-    )
-    assert indexer_forward.__globals__["apply_rotary_pos_emb"] is (
-        hf_impl.apply_rotary_pos_emb_interleave
-    )
+    vanilla_indexer = hf_model.model.layers[0].self_attn.indexer
+    assert type(vanilla_indexer) is hf_impl.GlmMoeDsaIndexer
+    vanilla_half_split_helper = hf_impl.apply_rotary_pos_emb
+    adapted_indexer = _make_instance_local_interleaved_indexer(hf_impl, vanilla_indexer)
+    assert type(adapted_indexer).__name__ == "_AdaptedInterleavedGlmMoeDsaIndexer"
+    hf_model.model.layers[0].self_attn.indexer = adapted_indexer
+    assert hf_impl.apply_rotary_pos_emb is vanilla_half_split_helper
 
     adapted_topk: list[torch.Tensor] = []
 
@@ -713,7 +766,7 @@ def test_glm52_transformers_512_adapted_production_layout_full_model_parity(
     print(
         "NON_SKIP_GLM52_TRANSFORMERS_512_ADAPTED_PRODUCTION_LAYOUT_"
         "FULL_MODEL_PARITY_PASSED "
-        "adapter=indexer_apply_rotary_pos_emb_interleave_only "
+        "adapter=instance_local_interleaved_indexer_subclass "
         "scope=tiny_full_model_dense_moe_indexshare_F_S "
         "configured_main_rope=true configured_indexer_rope=true "
         f"vanilla_differing_topk_rows={differing_topk_rows} "

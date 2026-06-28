@@ -300,7 +300,7 @@ def test_glm52_config_pattern_precedence_groups_and_all_full_override():
     assert roundtripped.uses_configured_dsa_rope_layout is True
 
 
-def test_glm5_rope_revision_is_inferred_before_schedule_overrides():
+def test_glm52_rope_revision_is_inferred_before_schedule_overrides():
     from megatron.lite.model.glm5.config import Glm5Config
 
     glm52_source = {
@@ -317,6 +317,10 @@ def test_glm5_rope_revision_is_inferred_before_schedule_overrides():
     )
     assert glm52_all_full.uses_dsa_index_share is False
     assert glm52_all_full.uses_configured_dsa_rope_layout is True
+
+
+def test_glm51_local_all_full_preserves_legacy_rope_revision():
+    from megatron.lite.model.glm5.config import Glm5Config
 
     glm51_with_local_all_full = Glm5Config._from_hf_dict(
         _tiny_config_kwargs(), indexer_types=["full", "full"]
@@ -1434,10 +1438,11 @@ def test_glm5_lite_tiny_forward_backward(monkeypatch):
     import pytest
     import torch
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.primitive.modules.attention import dsa
 
     if not torch.cuda.is_available():
         pytest.skip("GLM-5 native model requires CUDA (Transformer Engine RMSNorm)")
+    from megatron.lite.primitive.modules.attention import dsa
+
     device = torch.device("cuda")
 
     def fake_fused_indexer_sparse_attn(
@@ -1483,9 +1488,20 @@ def test_glm5_lite_tiny_forward_backward(monkeypatch):
     )
 
     torch.manual_seed(1234)
-    model = _make_glm5_model(Glm5Config(**_tiny_config_kwargs())).to(
+    glm52_kwargs = {
+        **_tiny_config_kwargs(),
+        "index_topk_freq": 4,
+        "index_skip_topk_offset": 3,
+        "indexer_types": ["full", "shared"],
+        "rope_interleave": True,
+        "indexer_rope_interleave": True,
+    }
+    model = _make_glm5_model(Glm5Config(**glm52_kwargs)).to(
         device=device, dtype=torch.bfloat16
     )
+    assert model.layers[0].self_attention.self_attention.indexer is not None
+    assert model.layers[1].self_attention.self_attention.indexer is None
+    assert model.layers[0].self_attention.self_attention.rope_interleaved is True
     input_ids = torch.randint(0, model.config.vocab_size, (2, 5), device=device)
     labels = torch.randint(0, model.config.vocab_size, (2, 5), device=device)
 
@@ -1504,10 +1520,16 @@ def test_glm5_lite_tiny_forward_backward(monkeypatch):
     assert torch.isfinite(grad_norm)
 
     mtp_model = _make_glm5_model(
-        Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1),
+        Glm5Config(**glm52_kwargs, num_nextn_predict_layers=1),
         mtp_enable=True,
         mtp_enable_train=True,
     ).to(device=device, dtype=torch.bfloat16)
+    assert mtp_model.mtp is not None
+    mtp_attention = mtp_model.mtp.layers[
+        0
+    ].transformer_layer.self_attention.self_attention
+    assert mtp_attention.indexer is not None
+    assert mtp_attention.rope_interleaved is True
     # Inference path (no labels) exposes the per-MTP-head logits.
     mtp_infer = mtp_model(input_ids=input_ids)
     assert len(mtp_infer["mtp_hidden_states"]) == 1
