@@ -18,6 +18,12 @@ backend as `mlite`, while Megatron Lite model implementations still use
 - `scripts/run_qwen3moe_gsm8k_sft.sh`: GSM8K wrapper around the SFT launcher.
 - `scripts/run_qwen3moe_gsm8k_grpo.sh`: GSM8K GRPO launcher with MLite actor
   training and a standard VERL rollout backend.
+- `scripts/run_qwen3moe_gsm8k_dapo.sh`: GSM8K DAPO launcher. Same MLite actor +
+  VERL rollout path as GRPO, with the DAPO recipe enabled through
+  `verl.trainer.main_ppo`: decoupled clip (`clip_ratio_low`/`clip_ratio_high`),
+  token-level loss (`loss_agg_mode=token-mean`), dynamic sampling
+  (`algorithm.filter_groups` over an oversampled `data.gen_batch_size`), no KL,
+  and the `dapo` reward manager with optional overlong reward shaping.
 
 ## Prerequisites
 
