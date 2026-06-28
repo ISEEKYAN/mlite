@@ -33,15 +33,17 @@ from megatron.lite.primitive.protocols import (
     default_expert_classifier,
     default_placement_fn,
 )
-from torch.distributed.device_mesh import (
+from torch.distributed.device_mesh import (  # pyright: ignore[reportMissingImports]
     DeviceMesh,
-)  # pyright: ignore[reportMissingImports]
+)
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 _DCP_MODEL_SCHEMA_KEY = "mlite_model_schema_version"
 _DCP_MODEL_SCHEMA_VERSION = 2
 _CHECKPOINT_MANIFEST = "mlite_checkpoint_manifest.json"
 _CHECKPOINT_MANIFEST_FORMAT = "megatron_lite.training_checkpoint.v2"
+_LOCAL_TRAINING_FORMAT_V1 = "megatron_lite.local_training.v1"
+_LOCAL_TRAINING_FORMAT_V2 = "megatron_lite.local_training.v2"
 
 
 def save_training_checkpoint(
@@ -1860,14 +1862,18 @@ def _chunk_tensor_state(module: nn.Module) -> dict[str, torch.Tensor]:
     state: dict[str, torch.Tensor] = {}
     for name, param in module.named_parameters():
         state[f"param.{name}"] = _to_local_tensor(param.detach()).cpu().clone()
-    for name, buffer in module.named_buffers():
+    for name, buffer in named_persistent_buffers(module):
         state[f"buffer.{name}"] = _to_local_tensor(buffer.detach()).cpu().clone()
     return state
 
 
 def _preflight_chunk_tensor_state(
-    module: nn.Module, state: Any, *, chunk_index: int
-) -> None:
+    module: nn.Module,
+    state: Any,
+    *,
+    chunk_index: int,
+    allow_legacy_nonpersistent_buffers: bool = False,
+) -> tuple[str, ...]:
     """Validate one local model chunk without mutating any live tensor."""
 
     if not isinstance(state, dict):
@@ -1875,19 +1881,36 @@ def _preflight_chunk_tensor_state(
             f"checkpoint model chunk {chunk_index} must be a dict, got "
             f"{type(state).__name__}"
         )
+    persistent_buffers = dict(named_persistent_buffers(module))
     targets = {
         **{f"param.{name}": tensor for name, tensor in module.named_parameters()},
-        **{f"buffer.{name}": tensor for name, tensor in module.named_buffers()},
+        **{f"buffer.{name}": tensor for name, tensor in persistent_buffers.items()},
     }
     saved_keys = set(state)
     expected_keys = set(targets)
     missing = sorted(expected_keys - saved_keys)
-    unexpected = sorted(saved_keys - expected_keys, key=repr)
+    ignored_legacy_keys: set[str] = set()
+    if allow_legacy_nonpersistent_buffers:
+        persistent_buffer_names = set(persistent_buffers)
+        nonpersistent_buffer_keys = {
+            f"buffer.{name}"
+            for name, _buffer in module.named_buffers()
+            if name not in persistent_buffer_names
+        }
+        ignored_legacy_keys = (saved_keys - expected_keys) & nonpersistent_buffer_keys
+    unexpected = sorted(saved_keys - expected_keys - ignored_legacy_keys, key=repr)
     if missing or unexpected:
         raise RuntimeError(
             f"checkpoint model chunk {chunk_index} schema mismatch: "
             f"missing={missing}, unexpected={unexpected}"
         )
+    for key in sorted(ignored_legacy_keys):
+        source = state[key]
+        if not isinstance(source, torch.Tensor):
+            raise TypeError(
+                f"legacy checkpoint model chunk {chunk_index} non-persistent buffer "
+                f"{key!r} must be torch.Tensor, got {type(source).__name__}"
+            )
     for key, target in targets.items():
         source = state[key]
         if not isinstance(source, torch.Tensor):
@@ -1912,12 +1935,16 @@ def _preflight_chunk_tensor_state(
                 f"checkpoint={tuple(local_source.shape)}/{local_source.dtype}, "
                 f"target={tuple(local_target.shape)}/{local_target.dtype}"
             )
+    return tuple(sorted(ignored_legacy_keys))
 
 
 def _load_chunk_tensor_state(module: nn.Module, state: dict[str, torch.Tensor]) -> None:
     targets = {
         **{f"param.{name}": tensor for name, tensor in module.named_parameters()},
-        **{f"buffer.{name}": tensor for name, tensor in module.named_buffers()},
+        **{
+            f"buffer.{name}": tensor
+            for name, tensor in named_persistent_buffers(module)
+        },
     }
     for key, target in targets.items():
         with torch.no_grad():
@@ -2521,7 +2548,7 @@ def _save_local_training_checkpoint(
         else None
     )
     state = {
-        "format": "megatron_lite.local_training.v1",
+        "format": _LOCAL_TRAINING_FORMAT_V2,
         "step": int(step),
         "model": [_chunk_tensor_state(chunk) for chunk in chunks],
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
@@ -2554,7 +2581,8 @@ def _load_local_training_checkpoint(
         raise TypeError(
             f"Local checkpoint root must be a dict, got {type(state).__name__}"
         )
-    if state.get("format") != "megatron_lite.local_training.v1":
+    checkpoint_format = state.get("format")
+    if checkpoint_format not in {_LOCAL_TRAINING_FORMAT_V1, _LOCAL_TRAINING_FORMAT_V2}:
         raise RuntimeError(f"Unsupported local checkpoint format in {ckpt_file}")
     expected_root_keys = {
         "format",
@@ -2579,10 +2607,21 @@ def _load_local_training_checkpoint(
     chunk_states = state.get("model")
     if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
         raise RuntimeError("Checkpoint model chunk count does not match target model.")
+    ignored_legacy_buffer_keys: list[str] = []
     for chunk_index, (chunk, chunk_state) in enumerate(
         zip(chunks, chunk_states, strict=True)
     ):
-        _preflight_chunk_tensor_state(chunk, chunk_state, chunk_index=chunk_index)
+        ignored_legacy_buffer_keys.extend(
+            f"chunk{chunk_index}.{key}"
+            for key in _preflight_chunk_tensor_state(
+                chunk,
+                chunk_state,
+                chunk_index=chunk_index,
+                allow_legacy_nonpersistent_buffers=(
+                    checkpoint_format == _LOCAL_TRAINING_FORMAT_V1
+                ),
+            )
+        )
     saved_optimizer_state = state.get("optimizer")
     saved_has_optimizer = saved_optimizer_state is not None
     target_has_optimizer = optimizer is not None
@@ -2663,6 +2702,11 @@ def _load_local_training_checkpoint(
     finally:
         if staged_parameter_state_path is not None:
             staged_parameter_state_path.unlink(missing_ok=True)
+    if ignored_legacy_buffer_keys:
+        log_rank0(
+            "Loaded legacy local checkpoint while ignoring current non-persistent "
+            f"runtime buffers: {ignored_legacy_buffer_keys}"
+        )
     log_rank0(f"Loaded local training checkpoint from {ckpt_file} at step {step}")
     return step
 

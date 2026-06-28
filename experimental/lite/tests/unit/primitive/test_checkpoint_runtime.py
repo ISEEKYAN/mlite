@@ -28,6 +28,18 @@ class TinyMLP(nn.Module):
         return self.layers(x)
 
 
+class BufferedModule(nn.Module):
+    def __init__(self, cache_size: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        self.register_buffer("persistent_scale", torch.tensor([1.0, 2.0]))
+        self.register_buffer(
+            "runtime_cache",
+            torch.arange(cache_size, dtype=torch.float32),
+            persistent=False,
+        )
+
+
 def _step(
     model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor
 ):
@@ -266,6 +278,147 @@ def test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local(tmp_path):
 
     dcp_save_mock.assert_not_called()
     assert (tmp_path / "training_state.pt").exists()
+
+
+def test_local_checkpoint_v2_excludes_nonpersistent_buffers(tmp_path):
+    source = BufferedModule(cache_size=3)
+
+    save_training_checkpoint(
+        source, None, 12, str(tmp_path), use_dcp=False, save_rng=False
+    )
+
+    state = torch.load(tmp_path / "training_state.pt", weights_only=False)
+    assert state["format"] == "megatron_lite.local_training.v2"
+    assert set(state["model"][0]) == {"param.weight", "buffer.persistent_scale"}
+
+
+def test_local_checkpoint_v2_preserves_different_nonpersistent_cache_on_load(tmp_path):
+    source = BufferedModule(cache_size=3)
+    with torch.no_grad():
+        source.weight.add_(10.0)
+        source.persistent_scale.add_(20.0)
+    save_training_checkpoint(
+        source, None, 13, str(tmp_path), use_dcp=False, save_rng=False
+    )
+
+    target = BufferedModule(cache_size=7)
+    with torch.no_grad():
+        target.runtime_cache.add_(100.0)
+    cache_before = target.runtime_cache.clone()
+
+    assert (
+        load_training_checkpoint(
+            target, None, str(tmp_path), use_dcp=False, load_rng=False
+        )
+        == 13
+    )
+    torch.testing.assert_close(target.weight, source.weight, atol=0, rtol=0)
+    torch.testing.assert_close(
+        target.persistent_scale, source.persistent_scale, atol=0, rtol=0
+    )
+    torch.testing.assert_close(target.runtime_cache, cache_before, atol=0, rtol=0)
+
+
+def test_local_checkpoint_v2_rejects_nonpersistent_buffer_before_mutation(tmp_path):
+    source = BufferedModule(cache_size=3)
+    save_training_checkpoint(
+        source, None, 14, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    checkpoint_file = tmp_path / "training_state.pt"
+    state = torch.load(checkpoint_file, weights_only=False)
+    state["model"][0]["buffer.runtime_cache"] = source.runtime_cache.clone()
+    torch.save(state, checkpoint_file)
+
+    target = BufferedModule(cache_size=5)
+    before = copy.deepcopy(target.state_dict())
+    cache_before = target.runtime_cache.clone()
+    with pytest.raises(RuntimeError, match="schema mismatch.*buffer.runtime_cache"):
+        load_training_checkpoint(
+            target, None, str(tmp_path), use_dcp=False, load_rng=False
+        )
+
+    _assert_model_state_unchanged(target, before)
+    torch.testing.assert_close(target.runtime_cache, cache_before, atol=0, rtol=0)
+
+
+def test_local_checkpoint_v1_ignores_matching_nonpersistent_buffer(tmp_path):
+    source = BufferedModule(cache_size=3)
+    with torch.no_grad():
+        source.weight.add_(10.0)
+        source.persistent_scale.add_(20.0)
+    save_training_checkpoint(
+        source, None, 14, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    checkpoint_file = tmp_path / "training_state.pt"
+    state = torch.load(checkpoint_file, weights_only=False)
+    state["format"] = "megatron_lite.local_training.v1"
+    state["model"][0]["buffer.runtime_cache"] = torch.arange(11, dtype=torch.float64)
+    torch.save(state, checkpoint_file)
+
+    target = BufferedModule(cache_size=5)
+    with torch.no_grad():
+        target.runtime_cache.add_(100.0)
+    cache_before = target.runtime_cache.clone()
+
+    assert (
+        load_training_checkpoint(
+            target, None, str(tmp_path), use_dcp=False, load_rng=False
+        )
+        == 14
+    )
+    torch.testing.assert_close(target.weight, source.weight, atol=0, rtol=0)
+    torch.testing.assert_close(
+        target.persistent_scale, source.persistent_scale, atol=0, rtol=0
+    )
+    torch.testing.assert_close(target.runtime_cache, cache_before, atol=0, rtol=0)
+
+
+def test_local_checkpoint_v1_rejects_nontensor_nonpersistent_buffer_before_mutation(
+    tmp_path,
+):
+    source = BufferedModule(cache_size=3)
+    save_training_checkpoint(
+        source, None, 15, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    checkpoint_file = tmp_path / "training_state.pt"
+    state = torch.load(checkpoint_file, weights_only=False)
+    state["format"] = "megatron_lite.local_training.v1"
+    state["model"][0]["buffer.runtime_cache"] = "not-a-tensor"
+    torch.save(state, checkpoint_file)
+
+    target = BufferedModule(cache_size=5)
+    before = copy.deepcopy(target.state_dict())
+    cache_before = target.runtime_cache.clone()
+    with pytest.raises(TypeError, match="non-persistent buffer.*must be torch.Tensor"):
+        load_training_checkpoint(
+            target, None, str(tmp_path), use_dcp=False, load_rng=False
+        )
+
+    _assert_model_state_unchanged(target, before)
+    torch.testing.assert_close(target.runtime_cache, cache_before, atol=0, rtol=0)
+
+
+def test_local_checkpoint_v1_rejects_unknown_buffer_before_mutation(tmp_path):
+    source = BufferedModule(cache_size=3)
+    save_training_checkpoint(
+        source, None, 15, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    checkpoint_file = tmp_path / "training_state.pt"
+    state = torch.load(checkpoint_file, weights_only=False)
+    state["format"] = "megatron_lite.local_training.v1"
+    state["model"][0]["buffer.removed_cache"] = torch.ones(2)
+    torch.save(state, checkpoint_file)
+
+    target = BufferedModule(cache_size=5)
+    before = copy.deepcopy(target.state_dict())
+    cache_before = target.runtime_cache.clone()
+    with pytest.raises(RuntimeError, match="schema mismatch.*buffer.removed_cache"):
+        load_training_checkpoint(
+            target, None, str(tmp_path), use_dcp=False, load_rng=False
+        )
+
+    _assert_model_state_unchanged(target, before)
+    torch.testing.assert_close(target.runtime_cache, cache_before, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
