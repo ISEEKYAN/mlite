@@ -193,16 +193,16 @@ ALGORITHM=(
   "algorithm.kl_ctrl.kl_coef=0.0"
   "algorithm.rollout_correction.bypass_mode=True"
   "algorithm.norm_adv_by_std_in_grpo=False"
-  "algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE}"
-  "algorithm.filter_groups.metric=${FILTER_GROUPS_METRIC}"
-  "algorithm.filter_groups.max_num_gen_batches=${FILTER_GROUPS_MAX_NUM_GEN_BATCHES}"
+  "+algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE}"
+  "+algorithm.filter_groups.metric=${FILTER_GROUPS_METRIC}"
+  "+algorithm.filter_groups.max_num_gen_batches=${FILTER_GROUPS_MAX_NUM_GEN_BATCHES}"
 )
 
 DATA=(
   "data.train_files=${TRAIN_FILES}"
   "data.val_files=${VAL_FILES}"
   "data.train_batch_size=${TRAIN_BATCH_SIZE}"
-  "data.gen_batch_size=${GEN_BATCH_SIZE}"
+  "+data.gen_batch_size=${GEN_BATCH_SIZE}"
   "data.prompt_key=prompt"
   "data.return_raw_chat=True"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
