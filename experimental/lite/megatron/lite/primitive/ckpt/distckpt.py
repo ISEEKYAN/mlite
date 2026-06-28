@@ -24,7 +24,7 @@ from megatron.lite.primitive.protocols import (
 
 _DISTOPT_METADATA = {
     "distrib_optim_sharding_type": "fully_reshardable",
-    "distrib_optim_fully_reshardable_mem_efficient": False,
+    "distrib_optim_fully_reshardable_mem_efficient": True,
     "chained_optim_avoid_prefix": True,
 }
 
