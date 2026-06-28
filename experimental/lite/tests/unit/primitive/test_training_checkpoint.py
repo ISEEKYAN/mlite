@@ -15,11 +15,14 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
+    _DISTOPT_METADATA,
     _model_sharded_state_dict,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
     _synchronize_native_optimizer_steps,
     attach_model_sharded_state_dict,
+    load_dist_opt_checkpoint,
+    save_dist_opt_checkpoint,
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
@@ -64,14 +67,35 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     _assert_state_equal(optimizer.state_dict(), expected)
 
 
+class FakeDistributedOptimizer:
+    def __init__(self, data_parallel_group_gloo):
+        self.data_parallel_group_gloo = data_parallel_group_gloo
+        self.gbuf_ranges = {}
+        self.buffers = []
+        self.optimizer = object()
+
+    def sharded_state_dict(self, _model_sd, **_kwargs):
+        return {}
+
+    def _set_main_param_and_optimizer_states(self, _model_param, _tensors):
+        return None
+
+
 class FakeDistOpt:
-    def __init__(self):
+    def __init__(self, chained_optimizers=()):
+        self.chained_optimizers = list(chained_optimizers)
         self.save_model_sd = None
         self.load_model_sd = None
         self.loaded_state = None
+        self.metadata_calls = []
 
     def sharded_state_dict(self, model_sd, is_loading: bool = False, metadata=None):
-        assert metadata == DISTOPT_METADATA
+        if metadata["distrib_optim_fully_reshardable_mem_efficient"]:
+            assert all(
+                optimizer.data_parallel_group_gloo is not None
+                for optimizer in self.chained_optimizers
+            )
+        self.metadata_calls.append((is_loading, metadata))
         if is_loading:
             self.load_model_sd = model_sd
         else:
@@ -98,7 +122,7 @@ class FakeWrapper(torch.nn.Module):
 
 DISTOPT_METADATA = {
     "distrib_optim_sharding_type": "fully_reshardable",
-    "distrib_optim_fully_reshardable_mem_efficient": True,
+    "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
 
@@ -128,7 +152,53 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
     assert saved["checkpoint_dir"] == str(tmp_path / "step_5")
     assert saved["kwargs"]["validate_access_integrity"] is False
     assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
+    assert optimizer.metadata_calls == [(False, DISTOPT_METADATA)]
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
+
+
+@pytest.mark.parametrize("all_have_gloo", [True, False], ids=["all-gloo", "missing-gloo"])
+def test_dist_opt_checkpoint_metadata_requires_all_gloo_groups(
+    monkeypatch, tmp_path, all_have_gloo
+) -> None:
+    gloo_group = object()
+    optimizer = FakeDistOpt(
+        [
+            FakeDistributedOptimizer(gloo_group),
+            FakeDistributedOptimizer(gloo_group if all_have_gloo else None),
+        ]
+    )
+    expected_metadata = {
+        **DISTOPT_METADATA,
+        "distrib_optim_fully_reshardable_mem_efficient": all_have_gloo,
+    }
+    model = torch.nn.Linear(2, 2)
+    attach_model_sharded_state_dict([model], ParallelState())
+    saved = {}
+
+    def fake_save(state_dict, checkpoint_dir, **kwargs):
+        saved["state_dict"] = state_dict
+        saved["checkpoint_dir"] = checkpoint_dir
+        saved["kwargs"] = kwargs
+
+    def fake_load(_state_dict, _checkpoint_dir, **_kwargs):
+        return {"optimizer": {"is_loading": True}, "step": 7}
+
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save)
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load)
+
+    save_dist_opt_checkpoint(model, optimizer, 6, str(tmp_path), save_model=False)
+    loaded_step = load_dist_opt_checkpoint(
+        model, optimizer, str(tmp_path), load_model=False
+    )
+
+    assert optimizer.metadata_calls == [
+        (False, expected_metadata),
+        (True, expected_metadata),
+    ]
+    assert saved["kwargs"]["content_metadata"] == expected_metadata
+    assert optimizer.loaded_state == {"is_loading": True}
+    assert loaded_step == 7
+    assert _DISTOPT_METADATA == DISTOPT_METADATA
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
