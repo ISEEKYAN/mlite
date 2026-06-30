@@ -7,12 +7,13 @@ keep model config classes out of the primitive layer.
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
+from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.parallel.cp import (
     zigzag_reconstruct_from_cp_parts,
     zigzag_slice_for_cp,
@@ -21,8 +22,6 @@ from megatron.lite.primitive.parallel.thd import (
     reconstruct_packed_from_cp_parts,
     split_packed_to_cp_local,
 )
-
-from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
@@ -35,6 +34,17 @@ def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
         if "value_dim" not in str(exc):
             raise
         return _dsa_kernels.fused_indexer_sparse_attn(*args, **kwargs)
+
+
+def _fused_indexer_sparse_attn_with_topk(*args, value_dim: int | None = None, **kwargs):
+    try:
+        return _dsa_kernels.fused_indexer_sparse_attn_with_topk(
+            *args, value_dim=value_dim, **kwargs
+        )
+    except TypeError as exc:
+        if "value_dim" not in str(exc):
+            raise
+        return _dsa_kernels.fused_indexer_sparse_attn_with_topk(*args, **kwargs)
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -208,6 +218,174 @@ def _all_gather_cp(tensor: torch.Tensor, *, cp_size: int, cp_group) -> list[torc
     return list(all_gather(tensor.contiguous(), group=cp_group))
 
 
+def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+    """Return whether a 1-indexed layer reuses a previous DSA indexer top-k."""
+    if layer_number < 1:
+        raise ValueError(f"layer_number must be >= 1, got {layer_number}")
+    if topk_freq < 1:
+        raise ValueError(f"topk_freq must be >= 1, got {topk_freq}")
+    if skip_topk_offset < 0:
+        raise ValueError(f"skip_topk_offset must be >= 0, got {skip_topk_offset}")
+    if topk_freq == 1:
+        return False
+    return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
+
+
+def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+    """Return the 1-indexed full/indexer layer used by ``layer_number``."""
+    if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq):
+        return layer_number
+    source_layer = layer_number - (max(layer_number - skip_topk_offset, 0) % topk_freq)
+    if source_layer < 1:
+        raise ValueError(
+            "DSA IndexShare schedule makes layer "
+            f"{layer_number} shared before any full source layer."
+        )
+    return source_layer
+
+
+def dsa_indexer_type_for_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> str:
+    return "shared" if is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq) else "full"
+
+
+class DSAIndexShareState:
+    """Per-forward top-k holder for DSA cross-layer IndexShare.
+
+    Only one source layer is resident on GPU at a time.  When activation
+    checkpointing needs old source groups during backward recomputation, they
+    are retained on CPU and paged back one group at a time.  This keeps the GPU
+    working set bounded instead of letting checkpoint closures retain every
+    source layer's ``[B, S, topk]`` tensor.
+    """
+
+    def __init__(self, *, retain_for_recompute: bool = True):
+        self.retain_for_recompute = retain_for_recompute
+        self._resident_source_layer: int | None = None
+        self._resident_topk_by_layer: dict[
+            tuple[int, Hashable | None], torch.Tensor
+        ] = {}
+        self._cpu_topk_by_layer: dict[
+            tuple[int, Hashable | None], torch.Tensor
+        ] = {}
+        self._sealed = False
+
+    @staticmethod
+    def _key(
+        layer_number: int, sequence_key: Hashable | None
+    ) -> tuple[int, Hashable | None]:
+        return layer_number, sequence_key
+
+    def save_topk(
+        self,
+        layer_number: int,
+        topk_indices: torch.Tensor,
+        *,
+        sequence_key: Hashable | None = None,
+    ) -> None:
+        if self._sealed:
+            # A full source layer is being recomputed in backward.  Its shared
+            # consumers have already run in reverse order, so no later layer
+            # needs the newly produced top-k.
+            if self._resident_source_layer == layer_number:
+                self._resident_topk_by_layer.clear()
+                self._resident_source_layer = None
+            return
+
+        if self._resident_source_layer not in (None, layer_number):
+            self._evict_resident(retain=self.retain_for_recompute)
+        self._resident_source_layer = layer_number
+        self._resident_topk_by_layer[self._key(layer_number, sequence_key)] = (
+            topk_indices.detach()
+        )
+
+    def finish_forward(self) -> None:
+        """Evict the final GPU source group before returning model outputs."""
+        if self._sealed:
+            return
+        self._evict_resident(retain=self.retain_for_recompute)
+        self._sealed = True
+
+    def _evict_resident(self, *, retain: bool) -> None:
+        if retain:
+            for key, topk in self._resident_topk_by_layer.items():
+                self._cpu_topk_by_layer[key] = topk.detach().to(device="cpu")
+        self._resident_topk_by_layer.clear()
+        self._resident_source_layer = None
+
+    @property
+    def _topk_by_layer(self) -> dict[tuple[int, Hashable | None], torch.Tensor]:
+        """Private compatibility view used by focused validation harnesses."""
+        return {**self._cpu_topk_by_layer, **self._resident_topk_by_layer}
+
+    def get_topk(
+        self,
+        layer_number: int,
+        source_layer: int,
+        *,
+        sequence_key: Hashable | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        key = self._key(source_layer, sequence_key)
+        if key in self._resident_topk_by_layer:
+            return self._resident_topk_by_layer[key]
+        if key not in self._cpu_topk_by_layer:
+            available = sorted(self._topk_by_layer)
+            raise AssertionError(
+                "DSA IndexShare shared layer "
+                f"{layer_number} needs top-k indices from source layer {source_layer}, "
+                "but that source did not run earlier in this forward. "
+                "Cross-PP top-k sharing is not supported. "
+                f"Available cache keys: {available}."
+            )
+
+        if self._resident_source_layer != source_layer:
+            # During backward, groups are consumed in reverse order.  The CPU
+            # copy already remains authoritative, so dropping the previous GPU
+            # group does not require another device-to-host transfer.
+            self._resident_topk_by_layer.clear()
+            self._resident_source_layer = source_layer
+        topk = self._cpu_topk_by_layer[key]
+        if device is not None and topk.device != device:
+            topk = topk.to(device=device)
+        self._resident_topk_by_layer[key] = topk
+        return topk
+
+
+def validate_dsa_index_share_pipeline_split(
+    layer_indices: list[int],
+    *,
+    topk_freq: int,
+    skip_topk_offset: int,
+    indexer_types: list[str] | None = None,
+) -> None:
+    """Fail fast if a local PP stage starts on a shared DSA IndexShare layer."""
+    if topk_freq <= 1 and not indexer_types:
+        return
+
+    positions = {layer_idx: pos for pos, layer_idx in enumerate(layer_indices)}
+    for layer_idx in layer_indices:
+        if indexer_types is not None and layer_idx < len(indexer_types):
+            indexer_type = indexer_types[layer_idx]
+        else:
+            indexer_type = dsa_indexer_type_for_layer(layer_idx + 1, skip_topk_offset, topk_freq)
+        if indexer_type != "shared":
+            continue
+
+        source_idx = source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+        if source_idx not in positions:
+            raise ValueError(
+                "DSA IndexShare cannot cross pipeline stages: layer "
+                f"{layer_idx} is shared from source layer {source_idx}, but this "
+                f"stage only owns layers {layer_indices}."
+            )
+        if positions[source_idx] >= positions[layer_idx]:
+            raise ValueError(
+                "DSA IndexShare source layer must execute before its shared layer "
+                f"within a pipeline stage, got source={source_idx}, layer={layer_idx}, "
+                f"stage layers={layer_indices}."
+            )
+
+
 class DSAIndexer(nn.Module):
     """Compute per-token top-k key indices for Dynamic Sparse Attention."""
 
@@ -345,6 +523,10 @@ class DynamicSparseAttention(nn.Module):
         indexer_rope_interleaved: bool | None = None,
         indexer_rope_first: bool = False,
         indexer_use_hadamard: bool = True,
+        layer_number: int | None = None,
+        index_topk_freq: int = 1,
+        index_skip_topk_offset: int = 0,
+        indexer_type: str | None = None,
         indexer_loss_coeff: float = 0.0,
         indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
@@ -366,12 +548,35 @@ class DynamicSparseAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.rope_interleaved = rope_interleaved
         self.softmax_scale = self.qk_head_dim**-0.5
+        self.index_topk = index_topk
+        self.indexer_softmax_scale = index_head_dim**-0.5
         self.indexer_loss_coeff = indexer_loss_coeff
         self.indexer_use_sparse_loss = indexer_use_sparse_loss
         self.calculate_per_token_loss = calculate_per_token_loss
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_group = cp_group
+        self.layer_number = 1 if layer_number is None else layer_number
+        self.index_topk_freq = index_topk_freq
+        self.index_skip_topk_offset = index_skip_topk_offset
+        inferred_indexer_type = dsa_indexer_type_for_layer(
+            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+        )
+        if indexer_type is None:
+            indexer_type = inferred_indexer_type
+        if indexer_type not in {"full", "shared"}:
+            raise ValueError(f"indexer_type must be 'full' or 'shared', got {indexer_type!r}")
+        if indexer_type != inferred_indexer_type:
+            raise ValueError(
+                f"indexer_type={indexer_type!r} for layer {self.layer_number} does not match "
+                f"IndexShare schedule {inferred_indexer_type!r}."
+            )
+        self.indexer_type = indexer_type
+        self.index_share_enabled = self.index_topk_freq > 1
+        self.skip_topk = indexer_type == "shared"
+        self.index_share_source_layer = source_dsa_compute_layer(
+            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+        )
         latent_rms_norm_eps = rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
         indexer_rope_interleaved = (
             rope_interleaved if indexer_rope_interleaved is None else indexer_rope_interleaved
@@ -388,18 +593,20 @@ class DynamicSparseAttention(nn.Module):
             kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False
         )
         self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=False)
-        self.indexer = DSAIndexer(
-            hidden_size=hidden_size,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-            rope_interleaved=indexer_rope_interleaved,
-            layer_norm_eps=indexer_layer_norm_eps,
-            rope_first=indexer_rope_first,
-            use_hadamard=indexer_use_hadamard,
-        )
+        self.indexer: DSAIndexer | None = None
+        if not self.skip_topk:
+            self.indexer = DSAIndexer(
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                index_n_heads=index_n_heads,
+                index_head_dim=index_head_dim,
+                index_topk=index_topk,
+                rope_interleaved=indexer_rope_interleaved,
+                layer_norm_eps=indexer_layer_norm_eps,
+                rope_first=indexer_rope_first,
+                use_hadamard=indexer_use_hadamard,
+            )
         self.register_buffer(
             "attn_sink",
             torch.full((num_attention_heads,), -1.0e20, dtype=torch.float32),
@@ -415,6 +622,7 @@ class DynamicSparseAttention(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         packed_seq_params=None,
+        index_share_state: DSAIndexShareState | None = None,
     ) -> torch.Tensor:
         if attention_mask is not None:
             raise NotImplementedError(
@@ -425,7 +633,14 @@ class DynamicSparseAttention(nn.Module):
             if self.cp_size > 1:
                 x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
                 cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
-            out = self._forward_packed_full(x, cos, sin, position_ids, packed_seq_params)
+            out = self._forward_packed_full(
+                x,
+                cos,
+                sin,
+                position_ids,
+                packed_seq_params,
+                index_share_state=index_share_state,
+            )
             if self.cp_size > 1:
                 out = split_packed_to_cp_local(
                     out,
@@ -441,8 +656,11 @@ class DynamicSparseAttention(nn.Module):
             x, position_ids, attention_mask = self._gather_cp_inputs(
                 x, position_ids, attention_mask
             )
+            cos, sin = self._gather_dense_cp_rotary(cos, sin, full_seq=x.shape[1])
 
-        out = self._forward_dense_full(x, cos, sin, position_ids)
+        out = self._forward_dense_full(
+            x, cos, sin, position_ids, index_share_state=index_share_state
+        )
         if cp_restore:
             out = zigzag_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
         return out
@@ -454,6 +672,8 @@ class DynamicSparseAttention(nn.Module):
         sin: torch.Tensor,
         position_ids: torch.Tensor,
         packed_seq_params,
+        *,
+        index_share_state: DSAIndexShareState | None,
     ) -> torch.Tensor:
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
         if position_ids.dim() == 1:
@@ -476,6 +696,8 @@ class DynamicSparseAttention(nn.Module):
                     seg_cos,
                     seg_sin,
                     position_ids[:, start:end],
+                    index_share_state=index_share_state,
+                    index_share_cache_key=idx,
                 )
             )
         if pieces:
@@ -488,6 +710,9 @@ class DynamicSparseAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         position_ids: torch.Tensor,
+        *,
+        index_share_state: DSAIndexShareState | None = None,
+        index_share_cache_key: Hashable | None = None,
     ) -> torch.Tensor:
 
         batch, seq_len, _ = x.shape
@@ -510,42 +735,94 @@ class DynamicSparseAttention(nn.Module):
         k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
-        q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-            x.detach(), q_resid.detach(), cos, sin, position_ids
-        )
-        effective_indexer_topk = min(self.indexer.index_topk, seq_len)
-
-        if self.training and torch.is_grad_enabled():
-            window_idxs = torch.empty(batch, seq_len, 0, device=x.device, dtype=torch.int32)
-            out, indexer_loss = _fused_indexer_sparse_attn(
-                query_states,
-                kv_full,
-                self.attn_sink.float(),
-                window_idxs,
-                q_indexer,
-                k_indexer,
-                weights_indexer,
-                self.indexer.index_topk,
-                1,
-                self.softmax_scale,
-                self.indexer.softmax_scale,
-                self.indexer_loss_coeff,
-                sparse_loss=self.indexer_use_sparse_loss,
-                kv_offset=0,
-                calculate_per_token_loss=self.calculate_per_token_loss,
-                value_dim=self.kv_lora_rank,
+        topk_indices: torch.Tensor | None = None
+        q_indexer = k_indexer = weights_indexer = None
+        if self.skip_topk:
+            if index_share_state is None:
+                raise AssertionError(
+                    "DSA IndexShare shared layers require a per-forward " "DSAIndexShareState."
+                )
+            topk_indices = index_share_state.get_topk(
+                self.layer_number,
+                self.index_share_source_layer,
+                sequence_key=index_share_cache_key,
+                device=x.device,
             )
+        else:
+            assert self.indexer is not None
+            q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
+                x.detach(), q_resid.detach(), cos, sin, position_ids
+            )
+        effective_indexer_topk = min(self.index_topk, seq_len)
+
+        if self.training and torch.is_grad_enabled() and not self.skip_topk:
+            window_idxs = torch.empty(batch, seq_len, 0, device=x.device, dtype=torch.int32)
+            assert q_indexer is not None and k_indexer is not None and weights_indexer is not None
+            if self.index_share_enabled:
+                out, indexer_loss, topk_indices = _fused_indexer_sparse_attn_with_topk(
+                    query_states,
+                    kv_full,
+                    self.attn_sink.float(),
+                    window_idxs,
+                    q_indexer,
+                    k_indexer,
+                    weights_indexer,
+                    self.index_topk,
+                    1,
+                    self.softmax_scale,
+                    self.indexer_softmax_scale,
+                    self.indexer_loss_coeff,
+                    sparse_loss=self.indexer_use_sparse_loss,
+                    kv_offset=0,
+                    calculate_per_token_loss=self.calculate_per_token_loss,
+                    value_dim=self.kv_lora_rank,
+                )
+                if index_share_state is not None:
+                    index_share_state.save_topk(
+                        self.layer_number,
+                        topk_indices,
+                        sequence_key=index_share_cache_key,
+                    )
+            else:
+                out, indexer_loss = _fused_indexer_sparse_attn(
+                    query_states,
+                    kv_full,
+                    self.attn_sink.float(),
+                    window_idxs,
+                    q_indexer,
+                    k_indexer,
+                    weights_indexer,
+                    self.index_topk,
+                    1,
+                    self.softmax_scale,
+                    self.indexer_softmax_scale,
+                    self.indexer_loss_coeff,
+                    sparse_loss=self.indexer_use_sparse_loss,
+                    kv_offset=0,
+                    calculate_per_token_loss=self.calculate_per_token_loss,
+                    value_dim=self.kv_lora_rank,
+                )
             if self.indexer_loss_coeff > 0:
                 out = DSAIndexerLossAutoScaler.apply(out, indexer_loss)
         else:
-            topk_indices, _ = _dsa_kernels.indexer_topk(
-                q_indexer,
-                k_indexer,
-                weights_indexer,
-                effective_indexer_topk,
-                1,
-                indexer_softmax_scale=self.indexer.softmax_scale,
-            )
+            if topk_indices is None:
+                assert (
+                    q_indexer is not None and k_indexer is not None and weights_indexer is not None
+                )
+                topk_indices, _ = _dsa_kernels.indexer_topk(
+                    q_indexer,
+                    k_indexer,
+                    weights_indexer,
+                    effective_indexer_topk,
+                    1,
+                    indexer_softmax_scale=self.indexer_softmax_scale,
+                )
+                if self.index_share_enabled and index_share_state is not None:
+                    index_share_state.save_topk(
+                        self.layer_number,
+                        topk_indices,
+                        sequence_key=index_share_cache_key,
+                    )
             flat_idxs, flat_tlen = _dsa_kernels.build_flat_topk_idxs(
                 topk_indices, batch_size=batch, seqlen_kv=seq_len, compact=True
             )
@@ -590,6 +867,27 @@ class DynamicSparseAttention(nn.Module):
                     f"full sequence {expected}, got {tuple(attention_mask.shape)}."
                 )
         return full_x, full_position_ids, attention_mask
+
+    def _gather_dense_cp_rotary(
+        self, cos: torch.Tensor, sin: torch.Tensor, *, full_seq: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.dim() != 3 or sin.dim() != 3:
+            return cos, sin
+        if cos.shape[1] == full_seq and sin.shape[1] == full_seq:
+            return cos, sin
+        expected_local_seq = full_seq // self.cp_size
+        if cos.shape[1] != expected_local_seq or sin.shape[1] != expected_local_seq:
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP rotary caches must be either local or full sequence "
+                f"length, got cos={tuple(cos.shape)} sin={tuple(sin.shape)} for "
+                f"local_seq={expected_local_seq}, full_seq={full_seq}."
+            )
+        cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
+        sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
+        return (
+            zigzag_reconstruct_from_cp_parts(cos_parts, seq_dim=1),
+            zigzag_reconstruct_from_cp_parts(sin_parts, seq_dim=1),
+        )
 
     def _full_cp_position_ids(
         self,
@@ -684,6 +982,7 @@ class DynamicSparseAttention(nn.Module):
 
 
 __all__ = [
+    "DSAIndexShareState",
     "DSAIndexer",
     "DSAIndexerLossAutoScaler",
     "DynamicSparseAttention",
@@ -694,4 +993,5 @@ __all__ = [
     "build_rotary_embeddings",
     "rotate_activation",
     "rotate_half",
+    "validate_dsa_index_share_pipeline_split",
 ]

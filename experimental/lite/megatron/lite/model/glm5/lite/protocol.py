@@ -210,6 +210,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         use_deepep=impl_cfg.use_deepep,
         fp8=False,
         recompute_modules=recompute_spec,
+        offload_modules=list(impl_cfg.offload),
         deterministic=impl_cfg.deterministic,
     )
     model_kwargs: dict[str, Any] = dict(
