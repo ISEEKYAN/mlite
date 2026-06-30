@@ -159,7 +159,7 @@ class Glm5DSAAttention(nn.Module):
     The Kimi skeleton therefore never observes the batch-first interior.
     """
 
-    def __init__(self, config: Glm5Config, ps: ParallelState):
+    def __init__(self, config: Glm5Config, ps: ParallelState, *, apply_rope_fusion: bool = True):
         super().__init__()
         self.ps = ps
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -188,6 +188,8 @@ class Glm5DSAAttention(nn.Module):
             cp_size=ps.cp_size,
             cp_rank=ps.cp_rank,
             cp_group=ps.cp_group,
+            rope_theta=config.rope_theta,
+            apply_rope_fusion=apply_rope_fusion,
         )
 
     def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
@@ -446,6 +448,7 @@ class Glm5Layer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -454,7 +457,7 @@ class Glm5Layer(nn.Module):
         # The wrapper preserves the SBHD self_attention(x, packed_seq_params=)
         # contract so this layer's forward stays identical to Kimi's.
         del use_thd  # DSA derives its own THD handling from packed_seq_params.
-        self.self_attention = Glm5DSAAttention(config, ps)
+        self.self_attention = Glm5DSAAttention(config, ps, apply_rope_fusion=apply_rope_fusion)
         if config.is_moe_layer(layer_idx):
             self.mlp_norm: nn.Module | None = te.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -511,6 +514,7 @@ class Glm5MTPLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
+        apply_rope_fusion: bool,
     ):
         super().__init__()
         self.ps = ps
@@ -534,6 +538,7 @@ class Glm5MTPLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
+            apply_rope_fusion=apply_rope_fusion,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -583,6 +588,7 @@ class Glm5MTPBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
+        apply_rope_fusion: bool,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -601,6 +607,7 @@ class Glm5MTPBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -674,6 +681,7 @@ class Glm5Model(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         del hf_path
@@ -719,6 +727,7 @@ class Glm5Model(nn.Module):
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in self.layer_indices
             ]
@@ -748,6 +757,7 @@ class Glm5Model(nn.Module):
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
+                apply_rope_fusion=apply_rope_fusion,
             )
 
         self.sp_params: list[nn.Parameter] = []

@@ -75,6 +75,7 @@ class ImplConfig:
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
     use_thd: bool = False
+    apply_rope_fusion: bool = True
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
     router_bias_rate: float = 0.0
@@ -179,6 +180,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         recompute_modules=recompute_spec,
         router_bias_rate=impl_cfg.router_bias_rate,
         use_thd=impl_cfg.use_thd,
+        apply_rope_fusion=impl_cfg.apply_rope_fusion,
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,

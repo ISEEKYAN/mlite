@@ -9,6 +9,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
+from megatron.lite.primitive.kernels.rope import (
+    apply_fused_mla_rotary_for_kv, apply_fused_mla_rotary_for_q,
+)
 from megatron.lite.primitive.utils.rope import (
     _apply_rotary_pos_emb_bshd,
     _apply_rotary_pos_emb_thd,
@@ -90,6 +93,7 @@ class MultiLatentAttention(nn.Module):
         rope_theta: float = 10_000.0,
         rope_scaling: dict | None = None,
         use_thd: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         if num_attention_heads % ps.tp_size != 0:
@@ -102,6 +106,7 @@ class MultiLatentAttention(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.q_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.apply_rope_fusion = apply_rope_fusion
 
         self.linear_proj = RowParallelLinear(
             num_attention_heads * v_head_dim,
@@ -210,26 +215,27 @@ class MultiLatentAttention(nn.Module):
             self.num_heads_local,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-        q_nope, q_pos = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_nope, value = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pos = k_pos_emb.unsqueeze(-2)
 
         is_thd = packed_seq_params is not None
         if is_thd:
-            q_nope = q_nope.squeeze(1)
-            q_pos = q_pos.squeeze(1)
-            k_nope = k_nope.squeeze(1)
-            value = value.squeeze(1)
+            q = q.squeeze(1)
+            kv = kv.squeeze(1)
             k_pos = k_pos.squeeze(1)
 
-        q_pos, k_pos = self._apply_rope(q_pos, k_pos, packed_seq_params)
-        if k_pos.dim() == q_nope.dim():
-            k_pos = k_pos.expand(*q_nope.shape[:-1], self.qk_rope_head_dim)
+        if self.apply_rope_fusion:
+            query, key, value = self._apply_fused_rope(q, kv, k_pos, packed_seq_params)
         else:
-            k_pos = k_pos.expand(-1, -1, self.num_heads_local, -1)
-        query = torch.cat([q_nope, q_pos], dim=-1).contiguous()
-        key = torch.cat([k_nope, k_pos], dim=-1).contiguous()
-        value = value.contiguous()
+            q_nope, q_pos = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            k_nope, value = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            q_pos, k_pos = self._apply_rope(q_pos, k_pos, packed_seq_params)
+            if k_pos.dim() == q_nope.dim():
+                k_pos = k_pos.expand(*q_nope.shape[:-1], self.qk_rope_head_dim)
+            else:
+                k_pos = k_pos.expand(-1, -1, self.num_heads_local, -1)
+            query = torch.cat([q_nope, q_pos], dim=-1).contiguous()
+            key = torch.cat([k_nope, k_pos], dim=-1).contiguous()
+            value = value.contiguous()
         if self._query_scale != 1.0:
             query = query * self._query_scale
 
@@ -413,6 +419,38 @@ class MultiLatentAttention(nn.Module):
             _apply_mla_rope_bshd(q_pos, freqs, mscale=mscale),
             _apply_mla_rope_bshd(k_pos, freqs, mscale=mscale),
         )
+
+    def _apply_fused_rope(self, q, kv, k_pos, packed_seq_params):
+        is_thd = packed_seq_params is not None
+        if is_thd:
+            max_q = getattr(packed_seq_params, "max_seqlen_q", None)
+            max_kv = getattr(packed_seq_params, "max_seqlen_kv", None)
+            seq_len = int(max(max_q, max_kv)) if max_q is not None and max_kv is not None else int(packed_seq_params.cu_seqlens_q[-1])
+            freqs = self.rotary(seq_len, packed_seq=True)
+        else:
+            freqs = self.rotary(q.size(0) * self.ps.cp_size)
+        if isinstance(freqs, tuple):
+            freqs, mscale = freqs
+        else:
+            mscale = 1.0
+        cos = (freqs.cos() * mscale).to(dtype=q.dtype).contiguous()
+        sin = (freqs.sin() * mscale).to(dtype=q.dtype).contiguous()
+        q_cu = kv_cu = None
+        cp_rank, cp_size = 0, 1
+        if is_thd:
+            q_cu = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+            q_cu = packed_seq_params.cu_seqlens_q if q_cu is None else q_cu
+            kv_cu = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+            kv_cu = packed_seq_params.cu_seqlens_kv if kv_cu is None else kv_cu
+            cp_rank, cp_size = self.ps.cp_rank, self.ps.cp_size
+        query = apply_fused_mla_rotary_for_q(q.contiguous().clone(), cos, sin,
+            nope_dim=self.qk_nope_head_dim, rope_dim=self.qk_rope_head_dim,
+            cu_seqlens=q_cu, cp_rank=cp_rank, cp_size=cp_size)
+        key, value = apply_fused_mla_rotary_for_kv(kv.contiguous(), k_pos.contiguous(), cos, sin,
+            rope_dim=self.qk_rope_head_dim, key_nope_dim=self.qk_nope_head_dim,
+            value_dim=self.v_head_dim, cu_seqlens_kv=kv_cu,
+            cp_rank=cp_rank, cp_size=cp_size)
+        return query, key, value
 
 
 __all__ = ["MultiLatentAttention"]
