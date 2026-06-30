@@ -8,6 +8,8 @@ grad_offload: false
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
+seed: 42
+full_determinism: false
 
 model_name: auto
 impl: lite
