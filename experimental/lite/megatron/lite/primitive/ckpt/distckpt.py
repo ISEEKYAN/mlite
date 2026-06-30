@@ -267,8 +267,7 @@ def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
     dist_opts = tuple(_iter_distributed_optimizers(optimizer))
     return {
         **_DISTOPT_METADATA,
-        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts)
-        and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
+        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts) and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
     }
 
 

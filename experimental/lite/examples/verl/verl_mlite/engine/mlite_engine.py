@@ -673,17 +673,9 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
-        reduced_outputs = (
-            []
-            if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs()
-            else None
-        )
+        reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(
-                loss_function,
-                num_microbatches=num_micro_batches,
-                output_lst=reduced_outputs,
-            )
+            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
         result = self.runtime.forward_backward(
             self.handle,
@@ -793,7 +785,7 @@ class MegatronLiteEngine(BaseEngine):
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
-    def _make_runtime_loss_fn(self, loss_function, *, num_microbatches: int, output_lst=None):
+    def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -830,8 +822,7 @@ class MegatronLiteEngine(BaseEngine):
                         "metrics": metrics,
                     }
                 )
-            backward_loss = loss * num_microbatches if loss_function is not None else loss
-            return backward_loss, metrics
+            return (loss * num_microbatches if loss_function is not None else loss), metrics
 
         return _loss_fn
 

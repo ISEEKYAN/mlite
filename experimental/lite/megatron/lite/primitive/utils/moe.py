@@ -34,8 +34,7 @@ def _te_general_gemm(
     bias: torch.Tensor | None = None,
     grad: bool = False,
 ):
-    get_workspace = getattr(te_module_base, "get_workspace", None)
-    if get_workspace is None:
+    if (get_workspace := getattr(te_module_base, "get_workspace", None)) is None:
         return None
     kwargs = dict(
         workspace=get_workspace(),

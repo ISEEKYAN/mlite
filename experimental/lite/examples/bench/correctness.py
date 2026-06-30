@@ -310,7 +310,8 @@ def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
         num_microbatches=1,
         forward_only=True,
     )
-    return result.model_output.vocab_parallel_logits
+    output = result.model_output
+    return output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None)
 
 
 def run_backend(
@@ -347,7 +348,8 @@ def run_backend(
                     handle, data_iter, loss_fn=None, num_microbatches=session_cfg.num_microbatches
                 )
                 _sync(session_cfg.device)
-                logits = _hash_tensor(result.model_output.vocab_parallel_logits)
+                output = result.model_output
+                logits = _hash_tensor(output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None))
                 grads = _grad_fingerprint(handle)
 
                 if session_cfg.no_optimizer:

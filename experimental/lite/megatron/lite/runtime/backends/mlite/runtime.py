@@ -430,6 +430,7 @@ class MegatronLiteRuntime(RuntimeBase):
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
+            from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
             from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 
             first_item = next(data_iter)
@@ -438,10 +439,12 @@ class MegatronLiteRuntime(RuntimeBase):
             tensor_shape = _infer_pipeline_tensor_shape(
                 first_batch, handle._extras.get("model_cfg"), ps
             )
+            model_chunks = handle._extras.get("model_chunks", [handle._model])
+            pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             outputs = forward_backward_pipelining(
                 pipeline_forward_step,
-                handle._extras.get("model_chunks", [handle._model]),
+                pipeline_chunks,
                 data_iter,
                 SimpleNamespace(num_microbatches=num_microbatches),
                 ps,

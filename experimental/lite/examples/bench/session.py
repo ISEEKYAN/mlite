@@ -204,12 +204,9 @@ def run_pretrain_session(
                 step_s=elapsed_ms / 1000,
                 world_size=world_size,
             )
-            loss = result.metrics.get("loss")
-            if loss is None:
-                loss = result.model_output.loss
             trace = StepTrace(
                 step=step,
-                loss=float(0.0 if loss is None else loss),
+                loss=float(result.metrics.get("loss", result.model_output.loss) or 0.0),
                 grad_norm=float(grad_norm),
                 step_ms=elapsed_ms,
                 peak_mem_gb=_peak_memory_gb(cfg.device),

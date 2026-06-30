@@ -577,23 +577,16 @@ def _gather_expert_group(
                 ).cpu()
                 return
 
-            # Bound transient GPU memory while assembling the packed CPU result.
             sample = prepared[0][2]
-            packed = torch.empty(
-                (spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu"
-            )
-            n_local = spec.num_experts // ps.ep_size
-            expert_batch_size = 4
-            for batch_start in range(0, len(prepared), expert_batch_size):
-                batch = prepared[batch_start : batch_start + expert_batch_size]
+            packed = torch.empty((spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu")
+            for batch_start in range(0, len(prepared), 4):
+                batch = prepared[batch_start : batch_start + 4]
                 stacked = torch.stack([tensor.contiguous() for _, _, tensor in batch], dim=0)
                 ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
                 dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
                 for ep_rank, ep_tensor in enumerate(ep_gathered):
                     for batch_idx, (local_idx, _, _) in enumerate(batch):
-                        global_idx = ep_rank * n_local + local_idx
-                        packed[global_idx].copy_(ep_tensor[batch_idx])
-                del ep_gathered, stacked
+                        packed[ep_rank * (spec.num_experts // ps.ep_size) + local_idx].copy_(ep_tensor[batch_idx])
             out[packed_name] = packed
             return
 
