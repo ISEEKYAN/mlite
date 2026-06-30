@@ -94,6 +94,7 @@ def build_mfsdp_stack(
 
     if skip_fsdp_wrap:
         wrapped_chunks = list(model_chunks)
+        expert_deferred_scale = None
     else:
         ddp_config = build_mfsdp_ddp_config(DistributedDataParallelConfig, ddp_overrides)
         wrapped_chunks = []
@@ -117,6 +118,9 @@ def build_mfsdp_stack(
                     pg_collection=pg_collection,
                 )
             )
+        expert_deferred_scale = _defer_expert_grad_microbatch_scaling(
+            wrapped_chunks, ddp_config
+        )
 
     opt_config = build_mc_optimizer_config(
         opt,
@@ -140,6 +144,11 @@ def build_mfsdp_stack(
         if not hasattr(optimizer_owner, "model_chunks"):
             optimizer_owner.model_chunks = wrapped_chunks  # pyright: ignore[reportAttributeAccessIssue]
     attach_mfsdp_checkpoint_metadata(optimizer, ps=ps, is_expert=is_expert_param)
+    if expert_deferred_scale is not None:
+        # The per-microbatch scaling was neutralized on the unsharded expert grad
+        # buffers (see _defer_expert_grad_microbatch_scaling); re-apply it exactly
+        # once per step in grad_norm._scale_mfsdp_expert_grads via _expert_grad_scale.
+        optimizer._mlite_mfsdp_expert_deferred_scale = expert_deferred_scale
     param_is_expert, param_names = _build_wrapped_param_metadata(wrapped_chunks, is_expert_param)
     optimizer = CanonicalGradNormMegatronFSDPOptimizer(
         optimizer,
@@ -210,6 +219,61 @@ def finalize_mfsdp_grads(model_chunks: list[nn.Module], optimizer) -> None:
     )
 
     finalize_model_grads(model_chunks, pg_collection=optimizer._mc_pg_collection)
+
+
+def _defer_expert_grad_microbatch_scaling(model_chunks, ddp_config) -> float | None:
+    """Work around a Megatron-FSDP multi-microbatch bug for unsharded expert grads.
+
+    For expert params whose grad buffer is *unsharded* (expert-DP size == 1), the
+    Megatron-FSDP grad-reduce pipeline pre-scales the *entire* accumulator by
+    ``gradient_scaling_factor`` on every microbatch's reduce
+    (``gradient_reduce_preprocessing`` -> ``grad_data.mul_(scaling_factor)``).
+    Because an unsharded buffer accumulates across microbatches in place
+    (``main_grad.add_``), each earlier microbatch is re-scaled once per subsequent
+    microbatch, yielding ``0.5*g_mb0 + g_mb1`` instead of ``0.5*(g_mb0 + g_mb1)``
+    for NUM_MB=2. Sharded (dense) buffers are unaffected because each microbatch's
+    contribution is reduce-scattered into a separate persistent shard.
+
+    Fix (contained in the M-FSDP primitive): null the per-microbatch scaling on
+    these buffers so they accumulate an unscaled SUM (the size-1 collective is a
+    no-op anyway), and re-apply the factor exactly once per step in
+    ``grad_norm._scale_mfsdp_expert_grads`` via ``_expert_grad_scale``. Returns the
+    (single, shared) deferred factor, or ``None`` if nothing needed neutralizing.
+    """
+    if getattr(ddp_config, "average_in_collective", False):
+        # ReduceOp.AVG path does not use the in-place pre-scale; not affected.
+        return None
+    deferred: float | None = None
+    for chunk in model_chunks:
+        buffer = getattr(chunk, "param_and_grad_buffer", None)
+        if buffer is None:
+            continue
+        for group in getattr(buffer, "parameter_groups", ()):
+            if not getattr(group, "is_expert_param", False):
+                continue
+            gbuf = getattr(group, "main_grad_buffer", None)
+            if gbuf is None or getattr(gbuf, "is_data_distributed", False):
+                # Sharded expert buffers reduce-scatter correctly; leave them alone.
+                continue
+            stashed = getattr(gbuf, "_mlite_deferred_grad_scale", None)
+            if stashed is not None:
+                factor = stashed  # Idempotent: already neutralized on a prior build.
+            else:
+                factor = getattr(gbuf, "gradient_scaling_factor", None)
+                if factor is None or factor == 1.0:
+                    # No scaling applied per microbatch -> nothing to defer.
+                    continue
+                gbuf._mlite_deferred_grad_scale = float(factor)
+                gbuf.gradient_scaling_factor = None
+            if deferred is None:
+                deferred = float(factor)
+            elif abs(deferred - float(factor)) > 1e-12:
+                raise ValueError(
+                    "Megatron-FSDP expert grad buffers have inconsistent "
+                    f"gradient_scaling_factor ({deferred} vs {factor}); "
+                    "deferred expert grad scaling assumes a single shared factor."
+                )
+    return deferred
 
 
 def _build_wrapped_param_metadata(

@@ -135,7 +135,7 @@ class CanonicalGradNormMegatronFSDPOptimizer:
             _phase_debug("mcore_get_grad_norm:start")
             mcore_norm_before_scale = self._inner_optimizer.get_grad_norm()
             _phase_debug("mcore_get_grad_norm:end")
-        expert_scale = _expert_grad_scale(self.ps)
+        expert_scale = _expert_grad_scale(self.ps, self._inner_optimizer)
         _phase_debug("expert_grad_scale:start")
         _scale_mfsdp_expert_grads(
             self._inner_optimizer,
@@ -680,10 +680,18 @@ def _scale_mfsdp_expert_grads(
                     _scale_grad_in_place(grad, scale)
 
 
-def _expert_grad_scale(ps: ParallelState) -> float:
+def _expert_grad_scale(ps: ParallelState, optimizer: Any = None) -> float:
     override = os.environ.get("MLITE_MFSDP_EXPERT_GRAD_SCALE")
     if override is not None:
         return float(override)
+    if optimizer is not None:
+        # When the unsharded expert grad buffers had their per-microbatch
+        # gradient_scaling_factor neutralized at build time (see
+        # optimizer._defer_expert_grad_microbatch_scaling), re-apply that factor
+        # exactly once here so the expert grad becomes scale*(g_mb0 + g_mb1).
+        deferred = getattr(optimizer, "_mlite_mfsdp_expert_deferred_scale", None)
+        if deferred is not None:
+            return float(deferred)
     return 1.0
 
 
