@@ -16,11 +16,7 @@ from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import (
-    get_loss_context,
-    split_loss_context,
-    use_loss_context,
-)
+from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -137,28 +133,7 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
     )
 
 
-def _merge_microbatch_metrics(metrics_by_microbatch: list[dict]) -> dict:
-    """Preserve every microbatch value while honoring metric accumulator objects."""
-    merged: dict = {}
-    for micro_metrics in metrics_by_microbatch:
-        for key, value in micro_metrics.items():
-            if key not in merged:
-                init_list = getattr(value, "init_list", None)
-                if callable(init_list):
-                    accumulator = init_list()
-                    accumulator.append(value)
-                    merged[key] = accumulator
-                else:
-                    merged[key] = [value]
-                continue
-            accumulator = merged[key]
-            accumulator.append(value)
-    return merged
-
-
 def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
-    """Adapt connector batches to every pipeline schedule without changing the primitive."""
-
     def wrapped_forward_step(model, item):
         batch, loss_context = split_loss_context(item)
         if loss_context is None:
@@ -488,8 +463,7 @@ class MegatronLiteRuntime(RuntimeBase):
             )
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
                 dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
-            loss_tensor = loss_payload[1] if bool(loss_payload[0].item()) else None
-            out = {} if loss_tensor is None else {"loss": loss_tensor}
+            out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
             out = run_microbatch_loop(
                 handle._model,
@@ -509,16 +483,13 @@ class MegatronLiteRuntime(RuntimeBase):
                 finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
-        metrics: dict = {}
-        all_loss_fn_metrics = out.get("_loss_fn_metrics", []) if out else []
-        metrics.update(_merge_microbatch_metrics(all_loss_fn_metrics))
+        metric_rows = out.get("_loss_fn_metrics", []) if out else []
         if ps.pp_size > 1:
-            metrics.update(
-                _merge_microbatch_metrics(
-                    [item["metrics"] for item in outputs if item.get("metrics")]
-                )
-            )
-            metrics["_micro_outputs"] = outputs
+            metric_rows += [item["metrics"] for item in outputs if item.get("metrics")]
+        metrics: dict = {}
+        for row in metric_rows:
+            for key, value in row.items():
+                metrics.setdefault(key, []).append(value)
 
         return ForwardResult(
             model_output=ModelOutputs(

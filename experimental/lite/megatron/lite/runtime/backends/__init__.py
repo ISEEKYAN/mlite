@@ -89,10 +89,6 @@ class Runtime(ABC):
 
                 loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)
 
-            The runtime always averages the returned loss tensor across
-            ``num_microbatches`` before backward; reporting data stays separate
-            in ``metrics`` or in the calling framework's reduction store.
-
             When ``loss_fn`` is None, the model computes loss internally
             (standard pretrain/SFT path).  When provided, ``model_output``
             is the dict returned by the model's forward (logits, log_probs, etc.)

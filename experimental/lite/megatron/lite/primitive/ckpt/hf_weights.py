@@ -577,10 +577,7 @@ def _gather_expert_group(
                 ).cpu()
                 return
 
-            # Keep the packed result on CPU and gather a bounded expert batch at a time.
-            # The previous implementation simultaneously materialized the local
-            # stack, every EP peer's stack, and the concatenated CPU result.
-            # That transient GPU peak can fail colocated actor-to-rollout sync.
+            # Bound transient GPU memory while assembling the packed CPU result.
             sample = prepared[0][2]
             packed = torch.empty(
                 (spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu"

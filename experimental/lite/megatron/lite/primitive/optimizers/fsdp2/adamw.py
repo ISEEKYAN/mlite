@@ -289,9 +289,6 @@ class FP32AdamW:
                 group["weight_decay"] = float(loaded_weight_decays[idx])
                 idx += len(group["params"])
 
-        # The FP32 master is authoritative after resume. Propagate it through
-        # the same BF16/model-param path used after every optimizer step so a
-        # pre-update export cannot observe the model view from initialization.
         for param in self.params:
             self._copy_master_to_param(param, self.state[param]["master_param"])
 

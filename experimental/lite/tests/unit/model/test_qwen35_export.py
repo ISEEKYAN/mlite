@@ -174,6 +174,7 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
                 )
 
     cfg = _tiny_config()
+    cfg.num_experts = 16
     model = TinyQwen35Module(cfg)
     ps = SimpleNamespace(
         pp_size=1,
@@ -196,19 +197,13 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
 
     exported = dict(export_hf_weights(model, cfg, ps))
 
-    assert len(gather_calls) == 1
-    assert gather_calls[0].shape == (
-        cfg.num_experts // ps.ep_size,
-        *model.layers[0].moe.experts.fc1.weight0.shape,
-    )
+    assert len(gather_calls) == 2
+    assert all(call.shape[0] <= 4 for call in gather_calls)
     local_tensors = [
-        model.layers[0].moe.experts.fc1.weight0.detach(),
-        model.layers[0].moe.experts.fc1.weight1.detach(),
+        getattr(model.layers[0].moe.experts.fc1, f"weight{i}").detach()
+        for i in range(cfg.num_experts // ps.ep_size)
     ]
-    expected = torch.stack(
-        [local_tensors[0], local_tensors[1], local_tensors[0] + 2000, local_tensors[1] + 2000],
-        dim=0,
-    )
+    expected = torch.stack(local_tensors + [tensor + 2000 for tensor in local_tensors])
     assert torch.equal(exported["model.language_model.layers.0.mlp.experts.gate_up_proj"], expected)
 
 

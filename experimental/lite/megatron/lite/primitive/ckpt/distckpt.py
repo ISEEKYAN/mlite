@@ -264,13 +264,12 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
 
 
 def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
-    metadata = _DISTOPT_METADATA.copy()
     dist_opts = tuple(_iter_distributed_optimizers(optimizer))
-    metadata["distrib_optim_fully_reshardable_mem_efficient"] = bool(dist_opts) and all(
-        getattr(dist_opt, "data_parallel_group_gloo", None) is not None
-        for dist_opt in dist_opts
-    )
-    return metadata
+    return {
+        **_DISTOPT_METADATA,
+        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts)
+        and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
+    }
 
 
 def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:

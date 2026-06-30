@@ -49,17 +49,15 @@ except ImportError:
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
-_INITIAL_SYNC_CACHE_CLEARED = False
 
 
 def _isolate_compile_cache_per_rank() -> None:
-    """Avoid torchinductor/triton cache races between distributed ranks."""
-    rank = str(dist.get_rank()) if dist.is_initialized() else os.environ.get("RANK")
-    rank = rank or os.environ.get("LOCAL_RANK")
+    """Avoid torchinductor/triton cache races between local torchrun ranks."""
+    rank = os.environ.get("LOCAL_RANK") or os.environ.get("RANK")
     if rank is None:
         return
     for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
-        base = os.environ.get(f"VERL_MLITE_{var}") or os.environ.get(var)
+        base = os.environ.get(var)
         if not base:
             continue
         base_var = f"VERL_MLITE_BASE_{var}"
@@ -370,13 +368,12 @@ class MegatronLiteEngine(BaseEngine):
         )
 
     def get_per_tensor_param(self, **kwargs):
-        global _INITIAL_SYNC_CACHE_CLEARED
         self._require_initialized()
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
-        if not _INITIAL_SYNC_CACHE_CLEARED:
+        if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
-            _INITIAL_SYNC_CACHE_CLEARED = True
+            self._initial_sync_cache_cleared = True
         export_kwargs = {
             key: kwargs[key]
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
@@ -678,14 +675,12 @@ class MegatronLiteEngine(BaseEngine):
         runtime_loss_fn = None
         reduced_outputs = (
             []
-            if (loss_function is not None or forward_only)
-            and self.is_mp_src_rank_with_outputs()
+            if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs()
             else None
         )
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(
                 loss_function,
-                forward_only=forward_only,
                 num_microbatches=num_micro_batches,
                 output_lst=reduced_outputs,
             )
@@ -698,26 +693,10 @@ class MegatronLiteEngine(BaseEngine):
             forward_only=forward_only,
         )
         if reduced_outputs is not None:
-            if (
-                forward_only
-                and self.engine_config.pp == 1
-                and result.model_output.log_probs is None
-            ):
-                raise ValueError("Megatron Lite forward-only result must contain token log_probs.")
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
-        micro_outputs = metrics.pop("_micro_outputs", None)
-        if micro_outputs is not None and self.is_mp_src_rank_with_outputs():
-            return postprocess_batch_func(output_lst=micro_outputs, indices=indices, data=data)
         loss = result.model_output.loss
-        if isinstance(loss, torch.Tensor):
-            losses = [float(value) for value in loss.detach().reshape(-1).cpu().tolist()]
-        elif isinstance(loss, list | tuple):
-            losses = [float(value) for value in loss]
-        elif loss is None:
-            losses = []
-        else:
-            losses = [float(loss)]
+        losses = [] if loss is None else torch.as_tensor(loss).detach().flatten().cpu().tolist()
         return {
             "model_output": {},
             "loss": losses,
@@ -814,14 +793,7 @@ class MegatronLiteEngine(BaseEngine):
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
-    def _make_runtime_loss_fn(
-        self,
-        loss_function,
-        *,
-        forward_only: bool,
-        num_microbatches: int,
-        output_lst: list[dict[str, Any]] | None = None,
-    ):
+    def _make_runtime_loss_fn(self, loss_function, *, num_microbatches: int, output_lst=None):
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -858,11 +830,6 @@ class MegatronLiteEngine(BaseEngine):
                         "metrics": metrics,
                     }
                 )
-            # Megatron schedules always average the backward tensor across
-            # microbatches. VERL losses are already contributions normalized
-            # against the logical global batch, so mirror VERL's Megatron
-            # postprocess hook: compensate the schedule while reporting the
-            # original loss and metrics through ``output_lst`` above.
             backward_loss = loss * num_microbatches if loss_function is not None else loss
             return backward_loss, metrics
 
