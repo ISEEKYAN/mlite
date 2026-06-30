@@ -16,7 +16,11 @@ from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    get_loss_context,
+    split_loss_context,
+    use_loss_context,
+)
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -153,22 +157,24 @@ def _merge_microbatch_metrics(metrics_by_microbatch: list[dict]) -> dict:
 
 
 def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
-    """Keep connector-owned loss context out of pipeline primitives."""
+    """Adapt connector batches to every pipeline schedule without changing the primitive."""
 
     def wrapped_forward_step(model, item):
         batch, loss_context = split_loss_context(item)
+        if loss_context is None:
+            return forward_step(model, batch)
         with use_loss_context(loss_context):
             return forward_step(model, batch)
 
     if loss_fn is None:
         return wrapped_forward_step, None
 
-    def wrapped_loss_fn(output, item):
-        batch, loss_context = split_loss_context(item)
-        with use_loss_context(loss_context):
-            if loss_context is None:
-                return loss_fn(output, batch)
-            return loss_fn(output, batch, loss_context)
+    def wrapped_loss_fn(output, item, loss_context=None):
+        batch, item_loss_context = split_loss_context(item)
+        loss_context = loss_context or item_loss_context or get_loss_context()
+        if loss_context is None:
+            return loss_fn(output, batch)
+        return loss_fn(output, batch, loss_context)
 
     return wrapped_forward_step, wrapped_loss_fn
 

@@ -14,7 +14,7 @@ from megatron.lite.runtime.backends.mlite import runtime as runtime_module
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context
+from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
 
 
 pytestmark = pytest.mark.mlite
@@ -246,7 +246,7 @@ def test_pipeline_schedule_averages_external_loss(
     ]
 
 
-def test_runtime_keeps_loss_context_outside_pipeline_primitive(monkeypatch):
+def test_runtime_adapts_loss_context_for_unchanged_pipeline(monkeypatch):
     model = _PipelineLastStageModel()
     original_empty = torch.empty
     seen_contexts = []
@@ -309,3 +309,28 @@ def test_runtime_keeps_loss_context_outside_pipeline_primitive(monkeypatch):
 
     assert seen_contexts == [loss_context]
     assert outputs == [{"loss": 3.0, "metrics": {"micro": 1}}]
+
+
+def test_runtime_callbacks_accept_pipeline_presplit_context():
+    loss_context = LossContext(source_batch={"micro": 2})
+    batch = object()
+    seen_contexts = []
+
+    def forward_fn(_model, actual_batch):
+        assert actual_batch is batch
+        seen_contexts.append(get_loss_context())
+        return {"value": torch.tensor(2.0)}
+
+    def loss_fn(output, actual_batch, context):
+        assert actual_batch is batch
+        assert context is loss_context
+        return output["value"], {"micro": context.source_batch["micro"]}
+
+    pipeline_forward_fn, pipeline_loss_fn = runtime_module._pipeline_callbacks(forward_fn, loss_fn)
+    with use_loss_context(loss_context):
+        output = pipeline_forward_fn(None, batch)
+    loss, metrics = pipeline_loss_fn(output, batch, loss_context)
+
+    assert seen_contexts == [loss_context]
+    torch.testing.assert_close(loss, torch.tensor(2.0))
+    assert metrics == {"micro": 2}
