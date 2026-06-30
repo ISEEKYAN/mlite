@@ -577,10 +577,17 @@ def _gather_expert_group(
                 ).cpu()
                 return
 
-            stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
-            ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-            dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
-            out[packed_name] = torch.cat(ep_gathered, dim=0).cpu()
+            sample = prepared[0][2]
+            packed = torch.empty((spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu")
+            for batch_start in range(0, len(prepared), 4):
+                batch = prepared[batch_start : batch_start + 4]
+                stacked = torch.stack([tensor.contiguous() for _, _, tensor in batch], dim=0)
+                ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
+                dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+                for ep_rank, ep_tensor in enumerate(ep_gathered):
+                    for batch_idx, (local_idx, _, _) in enumerate(batch):
+                        packed[ep_rank * (spec.num_experts // ps.ep_size) + local_idx].copy_(ep_tensor[batch_idx])
+            out[packed_name] = packed
             return
 
     if ps.ep_size <= 1 or ps.ep_group is None:

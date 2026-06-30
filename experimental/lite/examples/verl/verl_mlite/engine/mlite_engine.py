@@ -23,6 +23,7 @@ from tensordict import TensorDict
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import load_verl_engine_api
 
@@ -370,6 +371,9 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
+        if not getattr(self, "_initial_sync_cache_cleared", False):
+            aggressive_empty_cache(force_sync=True)
+            self._initial_sync_cache_cleared = True
         export_kwargs = {
             key: kwargs[key]
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
@@ -669,8 +673,9 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
+        reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, forward_only=forward_only)
+            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
         result = self.runtime.forward_backward(
             self.handle,
@@ -679,19 +684,20 @@ class MegatronLiteEngine(BaseEngine):
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
         )
+        if reduced_outputs is not None:
+            return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
-        micro_outputs = metrics.pop("_micro_outputs", None)
-        if micro_outputs is not None and self.is_mp_src_rank_with_outputs():
-            return postprocess_batch_func(output_lst=micro_outputs, indices=indices, data=data)
-        loss = float(metrics.get("loss", 0.0))
+        loss = result.model_output.loss
+        losses = [] if loss is None else torch.as_tensor(loss).detach().flatten().cpu().tolist()
         return {
             "model_output": {},
-            "loss": [loss],
+            "loss": losses,
             # Pass Metric aggregators through unchanged (reduce_metrics folds them);
             # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
                 key: value
-                if (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                if isinstance(value, list)
+                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
                 else [value]
                 for key, value in metrics.items()
             },
@@ -779,7 +785,7 @@ class MegatronLiteEngine(BaseEngine):
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
-    def _make_runtime_loss_fn(self, loss_function, *, forward_only: bool):
+    def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -808,7 +814,15 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
-            return loss, metrics
+            if output_lst is not None:
+                output_lst.append(
+                    {
+                        "model_output": model_output,
+                        "loss": float(loss.detach().item()),
+                        "metrics": metrics,
+                    }
+                )
+            return (loss * num_microbatches if loss_function is not None else loss), metrics
 
         return _loss_fn
 
