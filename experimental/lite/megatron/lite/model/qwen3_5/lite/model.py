@@ -15,7 +15,6 @@ import torch.nn as nn
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
@@ -267,6 +266,7 @@ class Qwen35Layer(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 ps=ps,
                 deterministic=deterministic,
+                cp_mode=gdn_cp_mode,
             )
         self.mlp_norm = te.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True

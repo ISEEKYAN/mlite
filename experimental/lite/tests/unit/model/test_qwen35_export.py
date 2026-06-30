@@ -13,6 +13,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import (
     _merge_linear_attn_in_proj_tp_shards,
     export_hf_weights,
 )
+from megatron.lite.model.qwen3_5.lite.protocol import ImplConfig
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
 
 
@@ -50,6 +51,11 @@ def test_qwen35_protocol_registers_vllm_export_entrypoint() -> None:
 
     assert key == "qwen3_5"
     assert callable(module.export_hf_weights)
+
+
+def test_qwen35_gdn_cp_mode_is_configurable() -> None:
+    assert ImplConfig().gdn_cp_mode == "fla_allgather"
+    assert ImplConfig(gdn_cp_mode="legacy_full_gather").gdn_cp_mode == "legacy_full_gather"
 
 
 def test_qwen35_export_uses_hf_checkpoint_names_without_module_prefix() -> None:

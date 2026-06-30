@@ -118,7 +118,7 @@ def test_runtime_aggregates_every_external_loss_metric(num_microbatches):
     assert result.metrics["loss"] == list(map(float, range(1, num_microbatches + 1)))
 
 
-def test_pipeline_runtime_aggregates_every_external_metric(monkeypatch):
+def test_pipeline_runtime_keeps_loss_out_of_generic_metrics(monkeypatch):
     micro_losses = [1.0, 2.0, 3.0, 4.0]
     original_tensor = torch.tensor
 
@@ -166,7 +166,8 @@ def test_pipeline_runtime_aggregates_every_external_metric(monkeypatch):
         num_microbatches=len(micro_losses),
     )
 
-    assert result.metrics["loss"] == sum(micro_losses) / len(micro_losses)
+    assert "loss" not in result.metrics
+    torch.testing.assert_close(result.model_output.loss, torch.tensor(micro_losses[-1]))
     assert result.metrics["plain_metric"] == list(range(1, len(micro_losses) + 1))
 
 
@@ -245,7 +246,7 @@ def test_pipeline_schedule_averages_external_loss(
     ]
 
 
-def test_pipeline_forward_only_preserves_loss_context(monkeypatch):
+def test_runtime_keeps_loss_context_outside_pipeline_primitive(monkeypatch):
     model = _PipelineLastStageModel()
     original_empty = torch.empty
     seen_contexts = []
@@ -294,14 +295,15 @@ def test_pipeline_forward_only_preserves_loss_context(monkeypatch):
         assert context is loss_context
         return output["value"], {"micro": context.source_batch["micro"]}
 
+    pipeline_forward_fn, pipeline_loss_fn = runtime_module._pipeline_callbacks(forward_fn, loss_fn)
     outputs = parallel_primitives.forward_backward_pipelining(
-        forward_fn,
+        pipeline_forward_fn,
         [model],
         iter([(runtime_batch, loss_context)]),
         SimpleNamespace(num_microbatches=1),
         ps,
         tensor_shape=(1,),
-        loss_fn=loss_fn,
+        loss_fn=pipeline_loss_fn,
         forward_only=True,
     )
 

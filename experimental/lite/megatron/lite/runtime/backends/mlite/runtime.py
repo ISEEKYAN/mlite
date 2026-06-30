@@ -16,7 +16,7 @@ from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import split_loss_context
+from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -150,6 +150,27 @@ def _merge_microbatch_metrics(metrics_by_microbatch: list[dict]) -> dict:
             accumulator = merged[key]
             accumulator.append(value)
     return merged
+
+
+def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
+    """Keep connector-owned loss context out of pipeline primitives."""
+
+    def wrapped_forward_step(model, item):
+        batch, loss_context = split_loss_context(item)
+        with use_loss_context(loss_context):
+            return forward_step(model, batch)
+
+    if loss_fn is None:
+        return wrapped_forward_step, None
+
+    def wrapped_loss_fn(output, item):
+        batch, loss_context = split_loss_context(item)
+        with use_loss_context(loss_context):
+            if loss_context is None:
+                return loss_fn(output, batch)
+            return loss_fn(output, batch, loss_context)
+
+    return wrapped_forward_step, wrapped_loss_fn
 
 
 class MegatronLiteRuntime(RuntimeBase):
@@ -436,32 +457,34 @@ class MegatronLiteRuntime(RuntimeBase):
             tensor_shape = _infer_pipeline_tensor_shape(
                 first_batch, handle._extras.get("model_cfg"), ps
             )
+            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             outputs = forward_backward_pipelining(
-                forward_step,
+                pipeline_forward_step,
                 handle._extras.get("model_chunks", [handle._model]),
                 data_iter,
                 SimpleNamespace(num_microbatches=num_microbatches),
                 ps,
                 tensor_shape=tensor_shape,
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=loss_fn,
+                loss_fn=pipeline_loss_fn,
                 forward_only=forward_only,
             )
-            pipeline_loss_values = [item["loss"] for item in outputs if "loss" in item]
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
                 loss_float = float(loss_obj.detach().item())
             elif loss_obj is not None:
                 loss_float = float(loss_obj)
-            else:
-                loss_float = 0.0
-            loss_t = torch.tensor([loss_float], device="cuda")
+            loss_payload = torch.tensor(
+                [loss_obj is not None, loss_float if loss_obj is not None else 0.0],
+                device="cuda",
+                dtype=torch.float32,
+            )
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
-                dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
-            out = {"loss": loss_t.squeeze(0)}
+                dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
+            loss_tensor = loss_payload[1] if bool(loss_payload[0].item()) else None
+            out = {} if loss_tensor is None else {"loss": loss_tensor}
         else:
-            pipeline_loss_values = []
             out = run_microbatch_loop(
                 handle._model,
                 data_iter,
@@ -480,20 +503,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
-        loss_values = pipeline_loss_values or (out.get("_loss_fn_losses", []) if out else [])
-        if loss_values:
-            micro_losses = [
-                value.item() if isinstance(value, torch.Tensor) else float(value)
-                for value in loss_values
-            ]
-            loss_metric: float | list[float] = sum(micro_losses) / num_microbatches
-        else:
-            loss_metric = (
-                loss_tensor.item()
-                if isinstance(loss_tensor, torch.Tensor)
-                else float(loss_tensor or 0.0)
-            )
-        metrics: dict = {"loss": loss_metric}
+        metrics: dict = {}
         all_loss_fn_metrics = out.get("_loss_fn_metrics", []) if out else []
         metrics.update(_merge_microbatch_metrics(all_loss_fn_metrics))
         if ps.pp_size > 1:

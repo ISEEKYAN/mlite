@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import gc
 import math
 import os
 from enum import Enum
@@ -24,6 +23,7 @@ from tensordict import TensorDict
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import load_verl_engine_api
 
@@ -375,12 +375,7 @@ class MegatronLiteEngine(BaseEngine):
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not _INITIAL_SYNC_CACHE_CLEARED:
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            aggressive_empty_cache(force_sync=True)
             _INITIAL_SYNC_CACHE_CLEARED = True
         export_kwargs = {
             key: kwargs[key]
@@ -714,8 +709,15 @@ class MegatronLiteEngine(BaseEngine):
         micro_outputs = metrics.pop("_micro_outputs", None)
         if micro_outputs is not None and self.is_mp_src_rank_with_outputs():
             return postprocess_batch_func(output_lst=micro_outputs, indices=indices, data=data)
-        loss = metrics.pop("loss", 0.0)
-        losses = [float(value) for value in loss] if isinstance(loss, list) else [float(loss)]
+        loss = result.model_output.loss
+        if isinstance(loss, torch.Tensor):
+            losses = [float(value) for value in loss.detach().reshape(-1).cpu().tolist()]
+        elif isinstance(loss, list | tuple):
+            losses = [float(value) for value in loss]
+        elif loss is None:
+            losses = []
+        else:
+            losses = [float(loss)]
         return {
             "model_output": {},
             "loss": losses,
