@@ -72,6 +72,7 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # Optimizer backend:
 # - distopt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
+# - mfsdp: Megatron-FSDP wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-distopt}"
 
 LR="${LR:-1e-5}"
@@ -108,8 +109,11 @@ case "${MLITE_OPTIMIZER_BACKEND}" in
   fsdp2)
     MLITE_IMPL_OPTIMIZER="fsdp2"
     ;;
+  mfsdp)
+    MLITE_IMPL_OPTIMIZER="mfsdp"
+    ;;
   *)
-    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected distopt or fsdp2." >&2
+    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected distopt, fsdp2, or mfsdp." >&2
     exit 1
     ;;
 esac
