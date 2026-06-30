@@ -232,7 +232,7 @@ class Qwen35Layer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         deterministic: bool = False,
-        gdn_cp_mode: str = "fla_allgather",
+        gdn_cp_mode: str = "replicated",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -335,7 +335,7 @@ class Qwen35Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
-        gdn_cp_mode: str = "fla_allgather",
+        gdn_cp_mode: str = "replicated",
     ):
         super().__init__()
         del attention_backend_override

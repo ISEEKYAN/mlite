@@ -54,8 +54,8 @@ def test_qwen35_protocol_registers_vllm_export_entrypoint() -> None:
 
 
 def test_qwen35_gdn_cp_mode_is_configurable() -> None:
-    assert ImplConfig().gdn_cp_mode == "fla_allgather"
-    assert ImplConfig(gdn_cp_mode="legacy_full_gather").gdn_cp_mode == "legacy_full_gather"
+    assert ImplConfig().gdn_cp_mode == "replicated"
+    assert ImplConfig(gdn_cp_mode="sharded").gdn_cp_mode == "sharded"
 
 
 def test_qwen35_export_uses_hf_checkpoint_names_without_module_prefix() -> None:
