@@ -235,6 +235,8 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
 
 
 def _update_hash_with_tensor(h: Any, name: str, tensor: torch.Tensor) -> None:
+    if hasattr(tensor, "to_local"):
+        tensor = tensor.to_local()
     t = tensor.detach().contiguous().cpu()
     h.update(name.encode("utf-8"))
     h.update(b"\0")
@@ -286,7 +288,7 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
     count = 0
     details = []
     include_details = os.environ.get("MLITE_CORRECTNESS_WEIGHT_DETAILS") == "1"
-    for name, tensor in sorted(rt.export_weights(handle, cpu=True), key=lambda item: item[0]):
+    for name, tensor in sorted(rt.export_weights(handle), key=lambda item: item[0]):
         _update_hash_with_tensor(h, str(name), tensor)
         if include_details:
             detail = _hash_tensor(tensor)
@@ -354,11 +356,14 @@ def run_backend(
                     update_successful, grad_norm, num_zeros = rt.optimizer_step(handle)
                     rt.lr_scheduler_step(handle)
                 _sync(session_cfg.device)
+                loss = result.metrics.get("loss")
+                if loss is None:
+                    loss = result.model_output.loss
 
             steps.append(
                 {
                     "step": step,
-                    "loss": _scalar(result.metrics.get("loss", 0.0)),
+                    "loss": _scalar(0.0 if loss is None else loss),
                     "logits": logits,
                     "grad_fingerprint": grads,
                     "grad_norm": _scalar(grad_norm),
