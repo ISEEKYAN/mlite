@@ -261,7 +261,12 @@ class FP32AdamW:
             if not isinstance(loaded, list) or len(loaded) != len(self.params):
                 raise ValueError(f"Invalid FP32 AdamW {target_name} state.")
             for param, src in zip(self.params, loaded, strict=True):
-                self.state[param][key].copy_(src)
+                target = self.state[param][key]
+                local_target = to_local_tensor(target)
+                local_src = to_local_tensor(src).to(
+                    device=local_target.device, dtype=local_target.dtype
+                )
+                local_target.copy_(local_src)
         loaded_steps = state_dict.get("steps")
         if loaded_steps is not None:
             if not isinstance(loaded_steps, list) or len(loaded_steps) != len(self.params):

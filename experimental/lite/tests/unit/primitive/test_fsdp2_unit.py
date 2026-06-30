@@ -473,3 +473,33 @@ def test_fp32_adamw_load_matches_uninterrupted_next_step_cpu(cpu_update: bool):
     for key in ("master_params", "exp_avgs", "exp_avg_sqs"):
         torch.testing.assert_close(loaded_state[key][0], direct_state[key][0], atol=0.0, rtol=0.0)
     assert loaded_state["steps"] == direct_state["steps"]
+
+
+def test_fp32_adamw_cpu_update_loads_dtensor_like_local_state():
+    param = nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.bfloat16))
+    optimizer = build_adamw_optimizer(
+        [{"params": [param], "weight_decay": 0.0}],
+        all_params=[param],
+        lr=0.1,
+        weight_decay=0.0,
+        betas=(0.9, 0.99),
+        eps=1.0e-8,
+        foreach=False,
+        use_fp32_master=True,
+        cpu_update=True,
+        model_param_dtypes={id(param): torch.bfloat16},
+        opt=SimpleNamespace(),
+    )
+    state = copy.deepcopy(optimizer.state_dict())
+    expected = {}
+    for name in ("master_params", "exp_avgs", "exp_avg_sqs"):
+        expected[name] = state[name][0].clone()
+        state[name][0] = SimpleNamespace(_local_tensor=state[name][0].clone())
+
+    optimizer.load_state_dict(state)
+    loaded = optimizer.state_dict()
+
+    for name, value in expected.items():
+        torch.testing.assert_close(loaded[name][0], value, atol=0.0, rtol=0.0)
+        assert loaded[name][0].device.type == "cpu"
+        assert loaded[name][0].dtype == torch.float32

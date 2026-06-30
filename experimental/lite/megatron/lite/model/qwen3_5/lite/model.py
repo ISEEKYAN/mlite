@@ -267,7 +267,6 @@ class Qwen35Layer(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 ps=ps,
                 deterministic=deterministic,
-                cp_mode=gdn_cp_mode,
             )
         self.mlp_norm = te.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True

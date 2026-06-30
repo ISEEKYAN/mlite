@@ -577,10 +577,27 @@ def _gather_expert_group(
                 ).cpu()
                 return
 
-            stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
-            ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-            dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
-            out[packed_name] = torch.cat(ep_gathered, dim=0).cpu()
+            # Keep the packed result on CPU and gather a bounded expert batch at a time.
+            # The previous implementation simultaneously materialized the local
+            # stack, every EP peer's stack, and the concatenated CPU result.
+            # That transient GPU peak can fail colocated actor-to-rollout sync.
+            sample = prepared[0][2]
+            packed = torch.empty(
+                (spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu"
+            )
+            n_local = spec.num_experts // ps.ep_size
+            expert_batch_size = 4
+            for batch_start in range(0, len(prepared), expert_batch_size):
+                batch = prepared[batch_start : batch_start + expert_batch_size]
+                stacked = torch.stack([tensor.contiguous() for _, _, tensor in batch], dim=0)
+                ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
+                dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+                for ep_rank, ep_tensor in enumerate(ep_gathered):
+                    for batch_idx, (local_idx, _, _) in enumerate(batch):
+                        global_idx = ep_rank * n_local + local_idx
+                        packed[global_idx].copy_(ep_tensor[batch_idx])
+                del ep_gathered, stacked
+            out[packed_name] = packed
             return
 
     if ps.ep_size <= 1 or ps.ep_group is None:

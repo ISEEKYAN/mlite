@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 from enum import Enum
@@ -48,15 +49,17 @@ except ImportError:
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
+_INITIAL_SYNC_CACHE_CLEARED = False
 
 
 def _isolate_compile_cache_per_rank() -> None:
-    """Avoid torchinductor/triton cache races between local torchrun ranks."""
-    rank = os.environ.get("LOCAL_RANK") or os.environ.get("RANK")
+    """Avoid torchinductor/triton cache races between distributed ranks."""
+    rank = str(dist.get_rank()) if dist.is_initialized() else os.environ.get("RANK")
+    rank = rank or os.environ.get("LOCAL_RANK")
     if rank is None:
         return
     for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
-        base = os.environ.get(var)
+        base = os.environ.get(f"VERL_MLITE_{var}") or os.environ.get(var)
         if not base:
             continue
         base_var = f"VERL_MLITE_BASE_{var}"
@@ -367,9 +370,18 @@ class MegatronLiteEngine(BaseEngine):
         )
 
     def get_per_tensor_param(self, **kwargs):
+        global _INITIAL_SYNC_CACHE_CLEARED
         self._require_initialized()
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
+        if not _INITIAL_SYNC_CACHE_CLEARED:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            _INITIAL_SYNC_CACHE_CLEARED = True
         export_kwargs = {
             key: kwargs[key]
             for key in ("limit", "include_mtp_only", "include_local_prefixes")

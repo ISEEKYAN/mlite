@@ -191,7 +191,10 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
     exported = dict(export_hf_weights(model, cfg, ps))
 
     assert len(gather_calls) == 1
-    assert gather_calls[0].shape[0] == cfg.num_experts // ps.ep_size
+    assert gather_calls[0].shape == (
+        cfg.num_experts // ps.ep_size,
+        *model.layers[0].moe.experts.fc1.weight0.shape,
+    )
     local_tensors = [
         model.layers[0].moe.experts.fc1.weight0.detach(),
         model.layers[0].moe.experts.fc1.weight1.detach(),
