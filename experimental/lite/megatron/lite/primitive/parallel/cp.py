@@ -102,6 +102,48 @@ def contiguous_slice_for_cp(
     return tensor.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
 
 
+def roll_contiguous_left_for_cp(
+    tensor: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    cp_group: Optional[dist.ProcessGroup] = None,
+    seq_dim: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Roll a contiguously-CP-sliced tensor one position left, crossing the
+    CP-rank boundary correctly.
+
+    Each CP rank holds a contiguous slice of the global sequence (rank ``r`` owns
+    tokens ``[r * L, (r + 1) * L)``). A purely local ``torch.roll`` would wrap a
+    rank's final token back onto its own first token; the next-token target
+    instead needs the *first token of rank ``r + 1``'s slice*. This gathers the
+    full sequence across the CP group, rolls once globally (zeroing the final
+    global position), and returns this rank's contiguous slice.
+
+    The second return value is the CP-*local* token sum of the rolled tensor: the
+    model normalizes its per-rank loss locally (``loss.mean()``) and the CP
+    reduction happens in the gradient all-reduce, so the denominator stays local
+    to remain consistent with the main cross-entropy loss.
+
+    Targets (input_ids / labels / loss_mask) are non-differentiable, so a plain
+    (non-autograd) all-gather is sufficient.
+    """
+    dim = seq_dim if seq_dim >= 0 else tensor.dim() + seq_dim
+    if cp_size <= 1:
+        rolled = torch.roll(tensor, shifts=-1, dims=dim)
+        rolled.select(dim, -1).zero_()
+        return rolled, rolled.sum()
+    if cp_group is None:
+        raise ValueError("Contiguous CP roll requires cp_group when cp_size > 1.")
+    parts = [torch.empty_like(tensor) for _ in range(cp_size)]
+    dist.all_gather(parts, tensor.contiguous(), group=cp_group)
+    full = torch.cat(parts, dim=dim)
+    rolled_full = torch.roll(full, shifts=-1, dims=dim)
+    rolled_full.select(dim, -1).zero_()
+    local = contiguous_slice_for_cp(rolled_full, cp_rank, cp_size, seq_dim=dim)
+    return local, local.sum()
+
+
 def contiguous_position_ids_for_cp(
     seq_len: int,
     cp_rank: int,
@@ -354,6 +396,7 @@ __all__ = [
     "contiguous_position_ids_for_cp",
     "contiguous_slice_for_cp",
     "contiguous_to_zigzag_chunks",
+    "roll_contiguous_left_for_cp",
     "split_packed_for_cp",
     "zigzag_to_contiguous_chunks",
     "zigzag_reconstruct_from_cp_parts",

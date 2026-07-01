@@ -54,6 +54,7 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     scatter_to_sequence_parallel,
 )
+from megatron.lite.primitive.parallel.cp import roll_contiguous_left_for_cp
 from megatron.lite.primitive.parallel.mhc import (
     contract_mhc_hidden_for_pipeline,
     expand_mhc_hidden_for_pipeline,
@@ -66,14 +67,28 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 def _roll_mtp_left(
     tensor: torch.Tensor,
     *,
+    ps: ParallelState | None = None,
     dims: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shift labels/ids one position left (next-token target for MTP depth d).
 
-    DS4 inputs are dense ``[B, S]`` (TP=1, MTP runs only at CP==1), so -- unlike
-    Kimi -- there is no packed-THD branch here; a plain ``torch.roll`` on the
-    sequence dim suffices.
+    DS4 inputs are dense ``[B, S]`` (TP=1; there is no packed-THD MTP branch).
+    Under CP>1 each rank holds a contiguous sequence slice, so the roll must
+    cross the CP-rank boundary -- a plain local ``torch.roll`` would wrap a
+    rank's last token onto its own first token instead of the first token of the
+    next rank. The shared ``roll_contiguous_left_for_cp`` primitive gathers the
+    full sequence, rolls once globally, and re-slices, mirroring how GLM-5's
+    ``roll_packed_thd_left`` handles the CP boundary. At CP==1 it is the same
+    plain ``torch.roll``.
     """
+    if ps is not None and ps.cp_size > 1:
+        return roll_contiguous_left_for_cp(
+            tensor,
+            cp_rank=ps.cp_rank,
+            cp_size=ps.cp_size,
+            cp_group=ps.cp_group,
+            seq_dim=dims,
+        )
     dim = dims if dims >= 0 else tensor.dim() + dims
     rolled = torch.roll(tensor, shifts=-1, dims=dim)
     rolled.select(dim, -1).zero_()
@@ -449,14 +464,10 @@ class DeepseekV4Model(nn.Module):
 
         # MTP runs on the head stage (where self.mtp is built with a valid bound
         # embedding -- self.embed_tokens when present, else the self.mtp_embed
-        # fallback, mirroring Kimi).  Disabled at CP>1 (the rolled MTP targets are
-        # not CP-sliced) and when no input_ids are available.
-        run_mtp = (
-            enable_mtp
-            and input_ids is not None
-            and len(self.mtp) > 0
-            and self.ps.cp_size == 1
-        )
+        # fallback, mirroring Kimi).  Under CP>1 the rolled MTP targets cross the
+        # CP-rank boundary via ``roll_contiguous_left_for_cp`` (see
+        # ``_roll_mtp_left``), so CP is supported; only requires input_ids.
+        run_mtp = enable_mtp and input_ids is not None and len(self.mtp) > 0
         mtp_hidden_states = self._apply_mtp(
             mtp_source, input_ids=input_ids, position_ids=position_ids, run_mtp=run_mtp
         )
@@ -528,7 +539,7 @@ class DeepseekV4Model(nn.Module):
         source = mtp_source
         outputs: list[torch.Tensor] = []
         for mtp_layer in self.mtp:
-            mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, dims=-1)
+            mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, ps=self.ps, dims=-1)
             source = mtp_layer(
                 input_ids=mtp_input_ids,
                 hidden_states=source,
@@ -557,8 +568,8 @@ class DeepseekV4Model(nn.Module):
 
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
-            mtp_labels, _ = _roll_mtp_left(mtp_labels, dims=-1)
-            mtp_loss_mask, num_tokens = _roll_mtp_left(mtp_loss_mask, dims=-1)
+            mtp_labels, _ = _roll_mtp_left(mtp_labels, ps=self.ps, dims=-1)
+            mtp_loss_mask, num_tokens = _roll_mtp_left(mtp_loss_mask, ps=self.ps, dims=-1)
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
 
