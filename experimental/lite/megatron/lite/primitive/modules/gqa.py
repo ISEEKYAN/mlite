@@ -14,6 +14,7 @@ import transformer_engine.pytorch as te
 from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
+from megatron.lite.primitive.kernels.rope import apply_fused_rotary
 from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
@@ -59,6 +60,7 @@ class GQAttention(nn.Module):
         qkv_layout: str = "flat",
         lora_config: LoraConfig | dict | None = None,
         mrope_section: list[int] | None = None,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
@@ -73,6 +75,7 @@ class GQAttention(nn.Module):
             raise ValueError(f"Unsupported qkv_layout={qkv_layout!r}")
         self._qkv_layout = qkv_layout
         self._mrope_section = list(mrope_section) if mrope_section is not None else None
+        self.apply_rope_fusion = apply_rope_fusion
 
         # Declaration order follows MC's `SelfAttention` submodule order
         # (linear_proj → linear_qkv → q_layernorm → k_layernorm). `named_
@@ -195,7 +198,19 @@ class GQAttention(nn.Module):
             # Packed THD position_ids are already CP-local after protocol.forward
             # prepares the VERL batch; avoid slicing MRoPE frequencies twice.
             freqs = self.rotary(position_ids, self._mrope_section, packed_seq=is_thd)
-            if is_thd:
+            if self.apply_rope_fusion and is_thd:
+                cu = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+                cu = packed_seq_params.cu_seqlens_q if cu is None else cu
+                q = apply_fused_rotary(q.contiguous(), freqs, cu_seqlens=cu,
+                    cp_rank=self.ps.cp_rank, cp_size=self.ps.cp_size)
+                k = apply_fused_rotary(k.contiguous(), freqs, cu_seqlens=cu,
+                    cp_rank=self.ps.cp_rank, cp_size=self.ps.cp_size)
+            elif self.apply_rope_fusion:
+                if q.size(1) != 1:
+                    raise ValueError("Fused SBHD MRoPE supports batch size 1 only")
+                q = apply_fused_rotary(q.contiguous(), freqs)
+                k = apply_fused_rotary(k.contiguous(), freqs)
+            elif is_thd:
                 q = _apply_rotary_pos_emb_bshd(q[:, None], freqs).squeeze(1)
                 k = _apply_rotary_pos_emb_bshd(k[:, None], freqs).squeeze(1)
             else:
@@ -211,7 +226,17 @@ class GQAttention(nn.Module):
             # Packed THD uses max per-sequence padded length, not total packed tokens.
             # The THD apply helper handles CP-zigzag frequency slicing per sequence.
             freqs = self.rotary(seq_len_for_rope, packed_seq=True)
-            q = _apply_rotary_pos_emb_thd(
+            q_cu = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+            q_cu = packed_seq_params.cu_seqlens_q if q_cu is None else q_cu
+            kv_cu = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+            kv_cu = packed_seq_params.cu_seqlens_kv if kv_cu is None else kv_cu
+            if self.apply_rope_fusion:
+                q = apply_fused_rotary(q.contiguous(), freqs, cu_seqlens=q_cu,
+                    cp_rank=self.ps.cp_rank, cp_size=self.ps.cp_size)
+                k = apply_fused_rotary(k.contiguous(), freqs, cu_seqlens=kv_cu,
+                    cp_rank=self.ps.cp_rank, cp_size=self.ps.cp_size)
+            else:
+                q = _apply_rotary_pos_emb_thd(
                 q,
                 packed_seq_params.cu_seqlens_q,
                 freqs,
@@ -219,22 +244,20 @@ class GQAttention(nn.Module):
                 mscale=1.0,
                 cp_group=self.ps.cp_group,
             )
-            k = _apply_rotary_pos_emb_thd(
-                k,
-                packed_seq_params.cu_seqlens_kv,
-                freqs,
-                rotary_interleaved=False,
-                mscale=1.0,
-                cp_group=self.ps.cp_group,
-            )
+                k = _apply_rotary_pos_emb_thd(k, packed_seq_params.cu_seqlens_kv, freqs,
+                    rotary_interleaved=False, mscale=1.0, cp_group=self.ps.cp_group)
         else:
             # q is CP-zigzag pre-sliced; rotary needs FULL seq len,
             # its internal get_pos_emb_on_this_cp_rank re-slices to local len.
             local_seq_len = q.size(0)
             seq_len_for_rope = local_seq_len * self.ps.cp_size
             freqs = self.rotary(seq_len_for_rope)
-            q = _apply_rotary_pos_emb_bshd(q, freqs, rotary_interleaved=False, mscale=1.0)
-            k = _apply_rotary_pos_emb_bshd(k, freqs, rotary_interleaved=False, mscale=1.0)
+            if self.apply_rope_fusion:
+                q = apply_fused_rotary(q.contiguous(), freqs)
+                k = apply_fused_rotary(k.contiguous(), freqs)
+            else:
+                q = _apply_rotary_pos_emb_bshd(q, freqs, rotary_interleaved=False, mscale=1.0)
+                k = _apply_rotary_pos_emb_bshd(k, freqs, rotary_interleaved=False, mscale=1.0)
         if self._use_fp32_rope:
             q, k = q.to(orig_dtype), k.to(orig_dtype)
 

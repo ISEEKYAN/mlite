@@ -331,6 +331,7 @@ class KimiK2Layer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -348,6 +349,7 @@ class KimiK2Layer(nn.Module):
             rope_theta=config.rope_theta,
             rope_scaling=config.rope_scaling,
             use_thd=use_thd,
+            apply_rope_fusion=apply_rope_fusion,
         )
         if config.is_moe_layer(layer_idx):
             self.mlp_norm: nn.Module | None = te.RMSNorm(
@@ -405,6 +407,7 @@ class KimiK2MTPLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
+        apply_rope_fusion: bool,
     ):
         super().__init__()
         self.ps = ps
@@ -428,6 +431,7 @@ class KimiK2MTPLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
+            apply_rope_fusion=apply_rope_fusion,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -477,6 +481,7 @@ class KimiK2MTPBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
+        apply_rope_fusion: bool,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -495,6 +500,7 @@ class KimiK2MTPBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -568,6 +574,7 @@ class KimiK2Model(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         del hf_path
@@ -609,6 +616,7 @@ class KimiK2Model(nn.Module):
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in self.layer_indices
             ]
@@ -638,6 +646,7 @@ class KimiK2Model(nn.Module):
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
+                apply_rope_fusion=apply_rope_fusion,
             )
 
         self.sp_params: list[nn.Parameter] = []

@@ -148,6 +148,7 @@ class _FakeImplConfig:
     hf_path: str = ""
     optimizer_config: object = None
     attention_backend_override: str | None = None
+    apply_rope_fusion: bool = True
 
 
 def test_build_impl_cfg_backfills_top_level_hf_path_and_runtime_fields():
@@ -173,6 +174,19 @@ def test_build_impl_cfg_preserves_explicit_impl_hf_path():
     impl_cfg = _build_impl_cfg(proto, cfg)
 
     assert impl_cfg.hf_path == "/models/impl"
+
+
+def test_build_impl_cfg_defaults_and_forwards_typed_rope_fusion():
+    proto = type("Proto", (), {"ImplConfig": _FakeImplConfig})
+
+    default_cfg = _build_impl_cfg(proto, MegatronLiteConfig(model_name="qwen3"))
+    disabled_cfg = _build_impl_cfg(
+        proto,
+        MegatronLiteConfig(model_name="qwen3", impl_cfg={"apply_rope_fusion": False}),
+    )
+
+    assert default_cfg.apply_rope_fusion is True
+    assert disabled_cfg.apply_rope_fusion is False
 
 
 @pytest.mark.parametrize(

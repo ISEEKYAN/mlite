@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
+from megatron.lite.primitive.kernels.rope import apply_fused_mla_rotary_for_q
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.modules.attention.cp import (
     compress_contiguous_chunks_for_cp,
@@ -122,8 +123,29 @@ def apply_partial_rope(
     return torch.cat([tail, rope_out], dim=-1)
 
 
+def _apply_partial_rope_dispatch(x, cos, sin, rope_head_dim, *, fused, inverse=False):
+    if not fused:
+        return apply_partial_rope(x, cos, -sin if inverse else sin, rope_head_dim)
+    if rope_head_dim == 0:
+        return x
+    if x.ndim != 4 or cos.ndim != 3 or sin.ndim != 3:
+        raise ValueError("Fused CSA RoPE expects BHSD tensors and BSD cosine/sine tables")
+    if cos.size(0) != 1 and not torch.equal(cos, cos[:1].expand_as(cos)):
+        raise ValueError("Fused CSA RoPE requires identical positions across the batch")
+    if sin.size(0) != 1 and not torch.equal(sin, sin[:1].expand_as(sin)):
+        raise ValueError("Fused CSA RoPE requires identical positions across the batch")
+    sbhd = x.permute(2, 0, 1, 3).contiguous().clone()
+    cos = cos[0].view(cos.size(1), 1, 1, cos.size(2)).contiguous()
+    sin = sin[0].view(sin.size(1), 1, 1, sin.size(2)).contiguous()
+    out = apply_fused_mla_rotary_for_q(sbhd, cos, sin,
+        nope_dim=x.size(-1) - rope_head_dim, rope_dim=rope_head_dim,
+        inverse=inverse, remove_interleaving=True)
+    return out.permute(1, 2, 0, 3).contiguous()
+
+
 class CompressedSequenceCompressor(nn.Module):
-    def __init__(self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False):
+    def __init__(self, config: Any, compress_ratio: int, head_dim: int, *,
+        rotate: bool = False, apply_rope_fusion: bool = True):
         super().__init__()
         self.config = config
         self.compress_ratio = compress_ratio
@@ -132,6 +154,7 @@ class CompressedSequenceCompressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.coff = 2 if self.overlap else 1
         self.rotate = rotate
+        self.apply_rope_fusion = apply_rope_fusion
         self.wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.ape = nn.Parameter(
@@ -179,7 +202,8 @@ class CompressedSequenceCompressor(nn.Module):
             device=x.device,
             dtype=compressed.dtype,
         )
-        compressed = apply_partial_rope(compressed, cos, sin, self.rope_head_dim)
+        compressed = _apply_partial_rope_dispatch(compressed, cos, sin,
+            self.rope_head_dim, fused=self.apply_rope_fusion)
         return rotate_activation(compressed) if self.rotate else compressed
 
 
@@ -217,7 +241,7 @@ def _load_dsa_kernels():
 
 
 class CompressedSparseAttentionIndexer(nn.Module):
-    def __init__(self, config, compress_ratio: int):
+    def __init__(self, config, compress_ratio: int, *, apply_rope_fusion: bool = True):
         super().__init__()
         self.config = config
         self.index_n_heads = config.index_n_heads
@@ -225,12 +249,14 @@ class CompressedSparseAttentionIndexer(nn.Module):
         self.index_topk = config.index_topk
         self.rope_head_dim = min(config.qk_rope_head_dim, config.index_head_dim)
         self.softmax_scale = self.index_head_dim**-0.5
+        self.apply_rope_fusion = apply_rope_fusion
         self.wq_b = nn.Linear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
         self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
         self.compressor = CompressedSequenceCompressor(
-            config, compress_ratio, config.index_head_dim, rotate=True
+            config, compress_ratio, config.index_head_dim, rotate=True,
+            apply_rope_fusion=apply_rope_fusion
         )
 
 
@@ -241,6 +267,7 @@ class CompressedSparseAttention(nn.Module):
         *,
         layer_idx: int,
         ps: ParallelState,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -249,6 +276,7 @@ class CompressedSparseAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
+        self.apply_rope_fusion = apply_rope_fusion
         self.num_heads_per_group = config.num_attention_heads // config.o_groups
         # MTP layers use layer_idx == num_hidden_layers (+i), which is past the
         # per-decoder-layer compress_ratios list (length num_hidden_layers); fall
@@ -271,12 +299,14 @@ class CompressedSparseAttention(nn.Module):
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
-            CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
+            CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim,
+                apply_rope_fusion=apply_rope_fusion)
             if self.compress_ratio > 1
             else None
         )
         self.indexer = (
-            CompressedSparseAttentionIndexer(config, self.compress_ratio)
+            CompressedSparseAttentionIndexer(config, self.compress_ratio,
+                apply_rope_fusion=apply_rope_fusion)
             if self.compress_ratio == 4
             else None
         )
@@ -309,8 +339,10 @@ class CompressedSparseAttention(nn.Module):
             q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         ).to(dtype=q.dtype)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-        q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
-        kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
+        q = _apply_partial_rope_dispatch(q, cos, sin, self.rope_head_dim,
+            fused=self.apply_rope_fusion)
+        kv = _apply_partial_rope_dispatch(kv, cos, sin, self.rope_head_dim,
+            fused=self.apply_rope_fusion)
         use_sparse_backend = self.attention_backend not in {"local", "eager", "torch"}
         if (
             use_sparse_backend
@@ -425,7 +457,8 @@ class CompressedSparseAttention(nn.Module):
                         )
                         .transpose(1, 2)
                     )
-                    q_idx = apply_partial_rope(q_idx, idx_cos, idx_sin, self.indexer.rope_head_dim)
+                    q_idx = _apply_partial_rope_dispatch(q_idx, idx_cos, idx_sin,
+                        self.indexer.rope_head_dim, fused=self.apply_rope_fusion)
                     index_weights = (
                         self.indexer.weights_proj(x).float()
                         * (self.indexer.index_n_heads**-0.5)
@@ -476,7 +509,8 @@ class CompressedSparseAttention(nn.Module):
     def _project_context(
         self, context: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(1, 2)
+        context = _apply_partial_rope_dispatch(context, cos, sin, self.rope_head_dim,
+            fused=self.apply_rope_fusion, inverse=True).transpose(1, 2)
         batch, seq_len = context.shape[:2]
         grouped = context.reshape(
             batch, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
@@ -638,7 +672,8 @@ class CompressedSparseAttention(nn.Module):
             batch, seq_len, self.indexer.index_n_heads, self.indexer.index_head_dim
         )
         q_indexer = q_indexer.transpose(1, 2)
-        q_indexer = apply_partial_rope(q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim)
+        q_indexer = _apply_partial_rope_dispatch(q_indexer, idx_cos, idx_sin,
+            self.indexer.rope_head_dim, fused=self.apply_rope_fusion)
         q_indexer = rotate_activation(q_indexer)
         q_indexer = q_indexer.transpose(1, 2).transpose(0, 1).contiguous()
         weights_indexer = (

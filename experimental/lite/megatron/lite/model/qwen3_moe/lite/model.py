@@ -51,6 +51,7 @@ class MoELayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
@@ -126,6 +127,7 @@ class TransformerLayer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -146,6 +148,7 @@ class TransformerLayer(nn.Module):
             use_thd=use_thd,
             qkv_layout="mcore",
             lora_config=lora_config,
+            apply_rope_fusion=apply_rope_fusion,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -213,6 +216,7 @@ class MultiTokenPredictionLayer(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         lora_config: LoraConfig | dict | None,
+        apply_rope_fusion: bool,
     ):
         super().__init__()
         self.ps = ps
@@ -233,6 +237,7 @@ class MultiTokenPredictionLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
             lora_config=lora_config,
+            apply_rope_fusion=apply_rope_fusion,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -287,6 +292,7 @@ class MultiTokenPredictionBlock(nn.Module):
         detach_encoder: bool,
         repeated_layer: bool,
         lora_config: LoraConfig | dict | None,
+        apply_rope_fusion: bool,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -306,6 +312,7 @@ class MultiTokenPredictionBlock(nn.Module):
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -361,6 +368,7 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -395,6 +403,7 @@ class Qwen3MoEModel(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     lora_config=lora_config,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in self.layer_indices
             ]
@@ -425,6 +434,7 @@ class Qwen3MoEModel(nn.Module):
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,
+                apply_rope_fusion=apply_rope_fusion,
             )
 
         self.sp_params: list[nn.Parameter] = []

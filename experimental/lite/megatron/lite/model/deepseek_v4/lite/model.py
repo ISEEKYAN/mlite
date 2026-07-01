@@ -95,10 +95,12 @@ class DeepseekV4CSAAttention(nn.Module):
     observes the batch-first interior.
     """
 
-    def __init__(self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState):
+    def __init__(self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState,
+        apply_rope_fusion: bool = True):
         super().__init__()
         self.ps = ps
-        self.self_attn = CompressedSparseAttention(config, layer_idx=layer_idx, ps=ps)
+        self.self_attn = CompressedSparseAttention(config, layer_idx=layer_idx, ps=ps,
+            apply_rope_fusion=apply_rope_fusion)
 
     def forward(self, x: torch.Tensor, *, position_ids: torch.Tensor) -> torch.Tensor:
         # Skeleton feeds SBHD [S, B, H]; CSA needs batch-first [B, S, H].
@@ -127,6 +129,7 @@ class DeepseekV4Layer(nn.Module):
         layer_idx: int,
         *,
         use_deepep: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -134,7 +137,8 @@ class DeepseekV4Layer(nn.Module):
         self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
-        self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
+        self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps,
+            apply_rope_fusion=apply_rope_fusion)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
         self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep)
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
@@ -191,8 +195,10 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         embedding: VocabParallelEmbedding,
         use_deepep: bool,
         detach_encoder: bool,
+        apply_rope_fusion: bool,
     ):
-        super().__init__(config, ps, layer_idx, use_deepep=use_deepep)
+        super().__init__(config, ps, layer_idx, use_deepep=use_deepep,
+            apply_rope_fusion=apply_rope_fusion)
         self.config = config
         object.__setattr__(self, "embedding", embedding)
         self.detach_encoder = detach_encoder
@@ -286,6 +292,7 @@ class DeepseekV4Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         use_deepep: bool = False,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         del hf_path, use_thd  # DS4 CSA derives its own masking from position_ids.
@@ -327,7 +334,8 @@ class DeepseekV4Model(nn.Module):
         # for its dense-vs-MoE / per-layer logic.
         self.layers = nn.ModuleDict(
             {
-                str(local): DeepseekV4Layer(config, ps, global_idx, use_deepep=use_deepep)
+                str(local): DeepseekV4Layer(config, ps, global_idx, use_deepep=use_deepep,
+                    apply_rope_fusion=apply_rope_fusion)
                 for local, global_idx in enumerate(self.layer_indices)
             }
         )
@@ -358,6 +366,7 @@ class DeepseekV4Model(nn.Module):
                         embedding=mtp_embedding,
                         use_deepep=use_deepep,
                         detach_encoder=mtp_detach_encoder,
+                        apply_rope_fusion=apply_rope_fusion,
                     )
                     for idx in range(config.num_nextn_predict_layers)
                 ]

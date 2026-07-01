@@ -47,6 +47,7 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_thd: bool = False
+    apply_rope_fusion: bool = True
     use_deepep: bool = False
     attention_backend_override: str | None = None
     deterministic: bool = True
@@ -381,6 +382,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 mtp_enable=mtp_enable,
                 mtp_enable_train=mtp_enable_train,
                 mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+                apply_rope_fusion=impl_cfg.apply_rope_fusion,
             )
             .to(torch.bfloat16)
             .cuda()

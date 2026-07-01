@@ -23,6 +23,7 @@ from megatron.lite.primitive.parallel.thd import (
 )
 
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
+from megatron.lite.primitive.kernels.rope import apply_fused_rotary
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
@@ -111,8 +112,9 @@ def build_rope_cache(
 
 
 def build_rotary_embeddings(
-    *, position_ids: torch.Tensor, dim: int, rope_theta: float, dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *, position_ids: torch.Tensor, dim: int, rope_theta: float, dtype: torch.dtype,
+    return_freqs: bool = False,
+) -> tuple[torch.Tensor, ...]:
     device = position_ids.device
     inv_freq = 1.0 / (
         rope_theta
@@ -126,7 +128,17 @@ def build_rotary_embeddings(
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
-    return cos.to(dtype=dtype), sin.to(dtype=dtype)
+    result = (cos.to(dtype=dtype), sin.to(dtype=dtype))
+    return (*result, emb) if return_freqs else result
+
+
+def _apply_fused_dsa_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 4 or freqs.ndim != 3:
+        raise ValueError("Fused DSA RoPE expects BSHD tensors and BSD phase tables")
+    if freqs.size(0) != 1 and not torch.equal(freqs, freqs[:1].expand_as(freqs)):
+        raise ValueError("Fused DSA RoPE requires identical positions across the batch")
+    phase = freqs[0].view(freqs.size(1), 1, 1, freqs.size(2)).contiguous()
+    return apply_fused_rotary(x.permute(1, 0, 2, 3).contiguous(), phase).permute(1, 0, 2, 3).contiguous()
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -224,6 +236,7 @@ class DSAIndexer(nn.Module):
         layer_norm_eps: float = 1e-5,
         rope_first: bool = False,
         use_hadamard: bool = True,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         if index_head_dim < qk_rope_head_dim:
@@ -236,6 +249,7 @@ class DSAIndexer(nn.Module):
         self.rope_interleaved = rope_interleaved
         self.rope_first = rope_first
         self.use_hadamard = use_hadamard
+        self.apply_rope_fusion = apply_rope_fusion
 
         self.wq_b = nn.Linear(q_lora_rank, index_n_heads * index_head_dim, bias=False)
         self.wk = nn.Linear(hidden_size, index_head_dim, bias=False)
@@ -250,6 +264,7 @@ class DSAIndexer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         position_ids: torch.Tensor,
+        freqs: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project GLM5 indexer inputs for Megatron's fused DSA kernels."""
@@ -272,8 +287,14 @@ class DSAIndexer(nn.Module):
         else:
             q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_pe = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
+        if self.apply_rope_fusion:
+            if freqs is None:
+                raise ValueError("Fused DSA indexer RoPE requires phase frequencies")
+            q_pe = _apply_fused_dsa_rope(q_pe, freqs)
+            k_pe = _apply_fused_dsa_rope(k_pe.unsqueeze(2), freqs)
+        else:
+            q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
+            k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
         k_pe = k_pe.squeeze(2)
 
         if self.rope_first:
@@ -300,10 +321,11 @@ class DSAIndexer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         position_ids: torch.Tensor,
+        freqs: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q, k, weights = self.forward_before_topk(
-            x, q_resid, cos, sin, position_ids, attention_mask=attention_mask
+            x, q_resid, cos, sin, position_ids, freqs, attention_mask=attention_mask
         )
         topk_indices, _ = _dsa_kernels.indexer_topk(
             q,
@@ -351,6 +373,8 @@ class DynamicSparseAttention(nn.Module):
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_group=None,
+        rope_theta: float = 10_000.0,
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         if cp_size < 1:
@@ -372,6 +396,8 @@ class DynamicSparseAttention(nn.Module):
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_group = cp_group
+        self.rope_theta = rope_theta
+        self.apply_rope_fusion = apply_rope_fusion
         latent_rms_norm_eps = rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
         indexer_rope_interleaved = (
             rope_interleaved if indexer_rope_interleaved is None else indexer_rope_interleaved
@@ -399,6 +425,7 @@ class DynamicSparseAttention(nn.Module):
             layer_norm_eps=indexer_layer_norm_eps,
             rope_first=indexer_rope_first,
             use_hadamard=indexer_use_hadamard,
+            apply_rope_fusion=apply_rope_fusion,
         )
         self.register_buffer(
             "attn_sink",
@@ -494,11 +521,16 @@ class DynamicSparseAttention(nn.Module):
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
         q = self.q_b_proj(q_resid).view(batch, seq_len, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        cos, sin = _rotary_embeddings_from_cache(
-            cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
-        )
+        if self.apply_rope_fusion:
+            cos, sin, freqs = build_rotary_embeddings(position_ids=position_ids,
+                dim=self.qk_rope_head_dim, rope_theta=self.rope_theta,
+                dtype=x.dtype, return_freqs=True)
+        else:
+            cos, sin = _rotary_embeddings_from_cache(cos, sin, position_ids,
+                device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim)
+            freqs = None
 
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
+        q_pe = _apply_fused_dsa_rope(q_pe, freqs) if self.apply_rope_fusion else apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
         k_up_weight, v_up_weight = self._split_kv_b_weights()
         q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
         query_states = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
@@ -507,11 +539,12 @@ class DynamicSparseAttention(nn.Module):
             self.kv_a_proj_with_mqa(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         kv_latent = self.kv_a_layernorm(kv_latent)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
+        k_pe = (_apply_fused_dsa_rope(k_pe.unsqueeze(2), freqs) if self.apply_rope_fusion
+            else apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
         q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-            x.detach(), q_resid.detach(), cos, sin, position_ids
+            x.detach(), q_resid.detach(), cos, sin, position_ids, freqs
         )
         effective_indexer_topk = min(self.indexer.index_topk, seq_len)
 

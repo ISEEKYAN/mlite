@@ -29,6 +29,18 @@ RUNTIME_ROOT = LITE_ROOT / "megatron" / "lite" / "runtime"
 MODEL_ROOT = LITE_ROOT / "megatron" / "lite" / "model"
 PRIMITIVE_ROOT = LITE_ROOT / "megatron" / "lite" / "primitive"
 BRIDGE_RUNTIME = RUNTIME_ROOT / "backends" / "bridge" / "runtime.py"
+ROPE_KERNEL = PRIMITIVE_ROOT / "kernels" / "rope.py"
+
+ROPE_PROVIDER_MODULES = {
+    "megatron.core.extensions.transformer_engine": {
+        "fused_apply_rotary_pos_emb",
+        "fused_apply_rotary_pos_emb_thd",
+    },
+    "megatron.core.fusions.fused_mla_yarn_rope_apply": {
+        "fused_mla_rope_inplace",
+        "fused_mla_rope_kv_split",
+    },
+}
 
 ALLOW_BEGIN = "MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN"
 ALLOW_END = "MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END"
@@ -103,6 +115,37 @@ def _imported_modules(path: Path) -> list[tuple[int, str]]:
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             imports.append((node.lineno, node.module))
     return imports
+
+
+def _rope_provider_imports(path: Path) -> list[tuple[int, str]]:
+    """Return static and lazy mcore RoPE provider imports."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imports = _imported_modules(path)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if isinstance(node.func, ast.Name):
+            is_import_module = node.func.id == "import_module"
+        else:
+            is_import_module = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "importlib"
+                and node.func.attr == "import_module"
+            )
+        if is_import_module and isinstance(node.args[0], ast.Constant):
+            module = node.args[0].value
+            if isinstance(module, str):
+                imports.append((node.lineno, module))
+    return [
+        (lineno, module)
+        for lineno, module in imports
+        if module == "megatron.core.extensions.transformer_engine"
+        or (
+            module.startswith("megatron.core")
+            and ("rope" in module.lower() or "rotary" in module.lower())
+        )
+    ]
 
 
 def _code_lines(path: Path) -> list[str]:
@@ -233,3 +276,30 @@ def test_runtime_packed_seq_params_is_bridge_forward_transient_only() -> None:
 def test_primitive_layer_is_model_name_agnostic() -> None:
     violations = _violations(_python_files(PRIMITIVE_ROOT), MODEL_NAME_TERMS)
     assert violations == []
+
+
+def test_rope_providers_are_isolated_to_kernel_adapter() -> None:
+    violations: list[str] = []
+    for path in _python_files(LITE_ROOT / "megatron" / "lite"):
+        for lineno, module in _rope_provider_imports(path):
+            if path != ROPE_KERNEL or module not in ROPE_PROVIDER_MODULES:
+                rel = path.relative_to(LITE_ROOT)
+                violations.append(f"{rel}:{lineno}: disallowed RoPE provider {module}")
+    assert violations == []
+
+
+def test_rope_kernel_uses_only_canonical_fused_symbols() -> None:
+    tree = ast.parse(ROPE_KERNEL.read_text(encoding="utf-8"))
+    provider_imports = {module for _, module in _rope_provider_imports(ROPE_KERNEL)}
+    fused_symbols = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and (
+            node.attr.startswith("fused_apply_rotary_pos_emb")
+            or node.attr.startswith("fused_mla_rope_")
+        )
+    }
+
+    assert provider_imports == set(ROPE_PROVIDER_MODULES)
+    assert fused_symbols == set().union(*ROPE_PROVIDER_MODULES.values())
